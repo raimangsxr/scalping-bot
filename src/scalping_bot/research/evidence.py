@@ -118,6 +118,7 @@ class ScalpResult:
     fold: int
     trace_event_ids: tuple[str, ...] = ()
     risk_compliant: bool = True
+    market_fidelity: str = "aggTrades"
 
     @property
     def net_pnl(self) -> Decimal:
@@ -200,6 +201,7 @@ class EvidenceProtocol:
             and lower >= 0
             and not concentration_failed
             and all(trade.risk_compliant for trade in trades)
+            and all(trade.market_fidelity == "aggTrades" for trade in trades)
         )
         return EvidenceResult(
             metrics=metrics,

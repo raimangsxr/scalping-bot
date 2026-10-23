@@ -44,7 +44,14 @@ class PlaceProtection:
     stop_price: Decimal
 
 
-Command = SubmitEntry | PlaceProtection
+@dataclass(frozen=True)
+class ExitMarket:
+    client_order_id: str
+    quantity: Decimal
+    reason: str
+
+
+Command = SubmitEntry | PlaceProtection | ExitMarket
 
 
 @dataclass(frozen=True)

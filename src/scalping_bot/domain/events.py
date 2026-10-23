@@ -32,4 +32,17 @@ class FillReceived(Event):
     commission_asset: str
 
 
-MarketEvent = CandleClosed | MarketTick | FillReceived
+@dataclass(frozen=True, kw_only=True)
+class ExitFillReceived(Event):
+    client_order_id: str
+    price: Decimal
+    quantity: Decimal
+    commission: Decimal
+
+
+@dataclass(frozen=True, kw_only=True)
+class OperatorConfirmedNewDay(Event):
+    utc_day: int
+
+
+EngineEvent = CandleClosed | MarketTick | FillReceived | ExitFillReceived | OperatorConfirmedNewDay

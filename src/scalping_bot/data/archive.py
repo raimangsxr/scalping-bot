@@ -14,7 +14,7 @@ from typing import TypedDict
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from scalping_bot.data.storage import LocalObjectStore
+from scalping_bot.data.storage import ObjectStore
 
 KLINE_COLUMNS = (
     "open_time",
@@ -74,7 +74,7 @@ class DatasetManifest:
 
 
 class BinanceArchivePipeline:
-    def __init__(self, store: LocalObjectStore) -> None:
+    def __init__(self, store: ObjectStore) -> None:
         self.store = store
 
     def ingest_file(

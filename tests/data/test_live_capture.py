@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import gzip
+import json
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+from scalping_bot.data.book import BookGap, LocalOrderBook
+from scalping_bot.data.capture import CaptureHealth, RawSegmentWriter
+from scalping_bot.data.storage import LocalObjectStore
+
+
+def test_local_book_follows_snapshot_and_sequence_rules() -> None:
+    book = LocalOrderBook("BTCUSDT")
+    book.apply_snapshot(
+        last_update_id=100,
+        bids=(("90000", "1.5"), ("89990", "2")),
+        asks=(("90010", "1"), ("90020", "3")),
+        exchange_time_ms=1_000,
+        receipt_time_ms=1_010,
+    )
+
+    book.apply_depth(
+        first_update_id=99,
+        final_update_id=101,
+        bids=(("90000", "0"), ("90005", "2.1")),
+        asks=(("90010", "0.5"),),
+        exchange_time_ms=1_020,
+        receipt_time_ms=1_025,
+    )
+
+    assert book.valid
+    assert book.best_bid == (Decimal("90005"), Decimal("2.1"))
+    assert book.best_ask == (Decimal("90010"), Decimal("0.5"))
+    assert book.latency_ms == 5
+
+
+def test_depth_gap_invalidates_segment_and_requires_new_snapshot() -> None:
+    book = LocalOrderBook("BTCUSDT")
+    book.apply_snapshot(
+        last_update_id=100,
+        bids=(("90000", "1"),),
+        asks=(("90010", "1"),),
+        exchange_time_ms=1_000,
+        receipt_time_ms=1_000,
+    )
+
+    with pytest.raises(BookGap, match="snapshot"):
+        book.apply_depth(
+            first_update_id=102,
+            final_update_id=103,
+            bids=(),
+            asks=(),
+            exchange_time_ms=1_100,
+            receipt_time_ms=1_101,
+        )
+
+    assert not book.valid
+    with pytest.raises(BookGap, match="snapshot"):
+        _ = book.best_bid
+
+
+def test_raw_events_are_compressed_checksummed_and_immutable(tmp_path: Path) -> None:
+    store = LocalObjectStore(tmp_path / "objects")
+    writer = RawSegmentWriter(store, stream="aggTrade", segment_started_ms=1_000)
+    writer.append(
+        {
+            "event_type": "aggTrade",
+            "exchange_time_ms": 1_001,
+            "receipt_time_ms": 1_004,
+            "price": "90000",
+            "quantity": "0.01",
+            "buyer_maker": False,
+        }
+    )
+
+    segment = writer.close(valid=True)
+    repeated = writer.close(valid=True)
+
+    assert segment == repeated
+    compressed = store.read(segment.object_key)
+    assert segment.sha256 == __import__("hashlib").sha256(compressed).hexdigest()
+    events = [json.loads(line) for line in gzip.decompress(compressed).splitlines()]
+    assert events[0]["receipt_time_ms"] == 1_004
+    assert json.loads(store.read(segment.manifest_key))["valid"] is True
+
+
+def test_capture_health_reports_gaps_drift_storage_and_reconnects() -> None:
+    health = CaptureHealth()
+    health.record_event(exchange_time_ms=1_000, receipt_time_ms=1_025)
+    health.record_gap()
+    health.record_reconnect()
+    health.record_storage_failure()
+
+    assert health.snapshot(now_ms=1_100) == {
+        "freshness_ms": 75,
+        "clock_drift_ms": 25,
+        "gaps": 1,
+        "reconnects": 1,
+        "storage_failures": 1,
+    }

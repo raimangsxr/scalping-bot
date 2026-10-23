@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Protocol
+
+import boto3
+from botocore.exceptions import ClientError
 
 
 class ImmutableObjectError(RuntimeError):
     pass
+
+
+class ObjectStore(Protocol):
+    def put_immutable(self, key: str, content: bytes) -> object: ...
+
+    def read(self, key: str) -> bytes: ...
 
 
 class LocalObjectStore:
@@ -32,3 +42,43 @@ class LocalObjectStore:
 
     def read(self, key: str) -> bytes:
         return self.path(key).read_bytes()
+
+
+class S3ObjectStore:
+    """S3-compatible immutable storage using conditional object creation."""
+
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        prefix: str = "",
+        endpoint_url: str | None = None,
+        region_name: str | None = None,
+    ) -> None:
+        self.bucket = bucket
+        self.prefix = prefix.strip("/")
+        self.client = boto3.client("s3", endpoint_url=endpoint_url, region_name=region_name)
+
+    def _key(self, key: str) -> str:
+        return f"{self.prefix}/{key}" if self.prefix else key
+
+    def put_immutable(self, key: str, content: bytes) -> None:
+        object_key = self._key(key)
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=object_key,
+                Body=content,
+                IfNoneMatch="*",
+                ChecksumSHA256=__import__("base64")
+                .b64encode(__import__("hashlib").sha256(content).digest())
+                .decode(),
+            )
+        except ClientError as error:
+            status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status not in (409, 412) or self.read(key) != content:
+                raise ImmutableObjectError(f"immutable S3 object differs: {object_key}") from error
+
+    def read(self, key: str) -> bytes:
+        response = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
+        return bytes(response["Body"].read())

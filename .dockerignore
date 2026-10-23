@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.venv
+venv
+.DS_Store
+._*
+__pycache__
+**/__pycache__
+.pytest_cache
+.coverage
+state/*
+tests
+*.tgz
+*.patch

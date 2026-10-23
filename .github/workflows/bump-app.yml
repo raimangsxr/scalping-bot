@@ -1,0 +1,186 @@
+name: Bump argocd-apps images
+
+on:
+  workflow_run:
+    workflows: ["Release Images"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  APP_NAME: mean-reversion-bot
+  BACKEND_IMAGE: mean-reversion-bot
+
+jobs:
+  open-bump-pr:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release tag artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-tag
+          path: release-info
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Read and normalise release tag
+        id: tag
+        run: |
+          RAW=$(cat release-info/tag.txt | tr -d '\n')
+          VERSION="${RAW#v}"
+          echo "raw=${RAW}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${RAW} (manifest version: ${VERSION})"
+
+      - name: Check out argocd-apps
+        uses: actions/checkout@v4
+        with:
+          repository: raimangsxr/argocd-apps
+          token: ${{ secrets.ARGOCD_APPS_TOKEN }}
+          path: argocd-apps
+
+      - name: Detect auto-merge
+        id: release-class
+        working-directory: argocd-apps
+        run: |
+          NEW="${{ steps.tag.outputs.version }}"
+          CUR=$(grep -oE "${BACKEND_IMAGE}:[0-9]+(\.[0-9]+)*" "manifests/${APP_NAME}/backend.yaml" | head -1 | cut -d: -f2)
+          echo "current=${CUR}" >> "$GITHUB_OUTPUT"
+
+          py_major() { echo "$1" | awk -F. '{print $1}'; }
+          py_minor() { echo "$1" | awk -F. '{print $2}'; }
+          NEW_MAJ=$(py_major "$NEW"); CUR_MAJ=$(py_major "$CUR")
+
+          if [[ -n "$NEW_MAJ" \
+                && "$NEW_MAJ" == "$CUR_MAJ" \
+                && "$NEW" != "$CUR" ]]; then
+            echo "is_auto_merge=true" >> "$GITHUB_OUTPUT"
+            echo "AUTO-MERGE: ${CUR} -> ${NEW} (same major)"
+          else
+            echo "is_auto_merge=false" >> "$GITHUB_OUTPUT"
+            echo "MAJOR BUMP: ${CUR} -> ${NEW} (requires manual review)"
+          fi
+
+      - name: Compute new image references
+        id: img
+        env:
+          OWNER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          V=${{ steps.tag.outputs.version }}
+          echo "backend=${OWNER}/${BACKEND_IMAGE}:${V}" >> "$GITHUB_OUTPUT"
+          echo "frontend=${OWNER}/${FRONTEND_IMAGE}:${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Patch app manifests
+        env:
+          BACKEND: ${{ steps.img.outputs.backend }}
+          FRONTEND: ${{ steps.img.outputs.frontend }}
+        working-directory: argocd-apps
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+          BACKEND, FRONTEND = os.environ["BACKEND"], os.environ["FRONTEND"]
+          APP_NAME = os.environ["APP_NAME"]
+          BACKEND_IMAGE = os.environ["BACKEND_IMAGE"]
+          FRONTEND_IMAGE = os.environ["FRONTEND_IMAGE"]
+          root = pathlib.Path(f"manifests/{APP_NAME}")
+          targets = {
+              root / "backend.yaml":       (rf"(image:\s*).*{BACKEND_IMAGE}:.*",  f"image: {BACKEND}"),
+              root / "frontend.yaml":      (rf"(image:\s*).*{FRONTEND_IMAGE}:.*", f"image: {FRONTEND}"),
+              root / "migration-job.yaml": (rf"(image:\s*).*{BACKEND_IMAGE}:.*",  f"image: {BACKEND}"),
+          }
+          changed = []
+          for f, (pat, repl) in targets.items():
+              txt = f.read_text()
+              new = re.sub(pat, repl, txt, count=1)
+              if new == txt:
+                  print(f"no change: {f}")
+              else:
+                  f.write_text(new)
+                  changed.append(str(f))
+          pathlib.Path("changed.txt").write_text("\n".join(changed))
+          PY
+
+      - name: Abort if no diff
+        working-directory: argocd-apps
+        run: |
+          if [ -z "$(cat changed.txt)" ]; then
+            echo "No image tag changes detected; skipping PR."
+            exit 0
+          fi
+
+      - name: Configure git
+        working-directory: argocd-apps
+        run: |
+          git config user.name  "argocd_apps-bump-bot"
+          git config user.email "argocd_apps-bump-bot@users.noreply.github.com"
+
+      - name: Create branch, commit, push
+        working-directory: argocd-apps
+        env:
+          TOKEN: ${{ secrets.ARGOCD_APPS_TOKEN }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          BRANCH="bump-${APP_NAME}-${VERSION}"
+          git checkout -b "${BRANCH}"
+          git add "manifests/${APP_NAME}"
+          git commit -m "chore: bump ${APP_NAME} to ${VERSION}"
+          git push "https://x-access-token:${TOKEN}@github.com/raimangsxr/argocd-apps.git" "${BRANCH}"
+
+      - name: Open PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.ARGOCD_APPS_TOKEN }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          RAW_TAG: ${{ steps.tag.outputs.raw }}
+          IS_AUTO_MERGE: ${{ steps.release-class.outputs.is_auto_merge }}
+          CURRENT: ${{ steps.release-class.outputs.current }}
+        run: |
+          BODY="$(cat <<EOF
+          Bumps ${APP_NAME} images to \`${RAW_TAG}\` released via [${APP_NAME}#${VERSION}](https://github.com/raimangsxr/${APP_NAME}/releases/tag/${RAW_TAG}).
+
+          Updated images:
+          - \`rromani/${BACKEND_IMAGE}:${VERSION}\`
+          - \`rromani/${FRONTEND_IMAGE}:${VERSION}\`
+
+          $([ "$IS_AUTO_MERGE" = "true" ] && echo "**Same major as previous** (was \`${CURRENT}\`) — this PR will be auto-merged." || echo "**Major version bump** (was \`${CURRENT}\`) — manual review and merge required.")
+
+          Triggered automatically by the \`Release Images\` workflow.
+          EOF
+          )"
+
+          PR_URL=$(gh pr create \
+            --repo raimangsxr/argocd-apps \
+            --base main \
+            --head "bump-${APP_NAME}-${VERSION}" \
+            --title "chore: bump ${APP_NAME} to ${VERSION}" \
+            --body "${BODY}" \
+            --label "${APP_NAME}" \
+            | tail -n 1)
+          echo "url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "Opened PR: ${PR_URL}"
+
+      - name: Merge PR (same major)
+        if: steps.release-class.outputs.is_auto_merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ARGOCD_APPS_TOKEN }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          set +e
+          echo "Same major — attempting auto-merge on ${PR_URL}"
+
+          gh pr merge --squash --delete-branch "${PR_URL}"
+          if [ $? -ne 0 ]; then
+            echo "WARN: auto-merge failed. PR remains open for manual action."
+            exit 0
+          fi
+
+          echo "PR merged successfully."
+
+      - name: Notify major-bump PR
+        if: steps.release-class.outputs.is_auto_merge != 'true'
+        run: |
+          echo "Major version bump — PR left open for manual review and merge."

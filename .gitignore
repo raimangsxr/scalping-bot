@@ -1,0 +1,17 @@
+.venv/
+venv/
+.env
+.DS_Store
+._*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+state/*
+!state/.gitkeep
+
+# Kubernetes local secrets
+deploy/k8s/secret.yaml

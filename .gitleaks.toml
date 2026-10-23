@@ -1,0 +1,5 @@
+title = "scalping-bot secret detection"
+
+[extend]
+useDefault = true
+

@@ -1,0 +1,3 @@
+# Use one event-driven engine for replay and Testnet
+
+Research validation and Testnet execution will drive the same deterministic engine through immutable market, exchange, clock, and operator events, observing its commands and audit decisions through one small interface. Live and replay market adapters, Binance and simulated exchange adapters, and SQLite and in-memory state adapters keep infrastructure replaceable while centralizing strategy proposals, sizing, risk, positions, circuit breakers, and order lifecycle; vectorized screening may reject candidates quickly but cannot provide promotion evidence.

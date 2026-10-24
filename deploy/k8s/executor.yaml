@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: scalping-bot-metrics
+  namespace: scalping-bot
+spec:
+  selector:
+    app.kubernetes.io/name: scalping-bot
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: scalping-bot
+  namespace: scalping-bot
+  annotations:
+    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-7ebc7371ef1286defcdd81867a8c7daab8525e88.spdx.json
+spec:
+  serviceName: scalping-bot-metrics
+  replicas: 1
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scalping-bot
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scalping-bot
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: executor
+          image: ghcr.io/raimangsxr/scalping-bot:git-7ebc7371ef1286defcdd81867a8c7daab8525e88
+          imagePullPolicy: IfNotPresent
+          args: ["run-testnet-executor"]
+          env:
+            - name: SCALPING_BINANCE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: binance-api-key
+            - name: SCALPING_BINANCE_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: binance-api-secret
+          ports:
+            - name: metrics
+              containerPort: 8000
+          volumeMounts:
+            - name: state
+              mountPath: /app/state
+          readinessProbe:
+            exec:
+              command: ["python", "-m", "scalping_bot.health", "/app/state/scalping-bot.db"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["python", "-m", "scalping_bot.health", "/app/state/scalping-bot.db"]
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

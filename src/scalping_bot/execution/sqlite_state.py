@@ -58,6 +58,21 @@ MIGRATIONS = (
         exchange_snapshot_json TEXT NOT NULL
     );
     """,
+    """
+    ALTER TABLE runtime_state ADD COLUMN operating_mode TEXT NOT NULL DEFAULT 'RUNNING';
+    ALTER TABLE order_intents ADD COLUMN candidate_version TEXT;
+    ALTER TABLE order_intents ADD COLUMN invalidation_price TEXT;
+    ALTER TABLE order_intents ADD COLUMN executed_quantity TEXT NOT NULL DEFAULT '0';
+    CREATE TABLE protections (
+        client_order_id TEXT PRIMARY KEY,
+        entry_client_order_id TEXT NOT NULL REFERENCES order_intents(client_order_id),
+        exchange_order_id TEXT NOT NULL,
+        quantity TEXT NOT NULL,
+        stop_price TEXT NOT NULL,
+        take_profit_price TEXT NOT NULL,
+        created_ms INTEGER NOT NULL
+    );
+    """,
 )
 
 
@@ -113,6 +128,19 @@ class SQLiteState:
             (int(allowed),),
         )
 
+    @property
+    def operating_mode(self) -> str:
+        row = self.connection.execute(
+            "SELECT operating_mode FROM runtime_state WHERE singleton = 1"
+        ).fetchone()
+        return str(row[0])
+
+    def set_operating_mode(self, mode: str) -> None:
+        self.connection.execute(
+            "UPDATE runtime_state SET operating_mode = ?, entries_allowed = 0 WHERE singleton = 1",
+            (mode,),
+        )
+
     def pragma(self, name: str) -> str | int:
         if name not in {"journal_mode", "foreign_keys", "synchronous", "busy_timeout"}:
             raise ValueError("pragma is not allowlisted")
@@ -136,12 +164,119 @@ class SQLiteState:
         quantity: str,
         status: str,
         created_ms: int,
+        candidate_version: str | None = None,
+        invalidation_price: str | None = None,
     ) -> None:
         self.connection.execute(
-            "INSERT INTO order_intents(client_order_id, side, quantity, status, created_ms) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (client_order_id, side, quantity, status, created_ms),
+            "INSERT INTO order_intents(client_order_id, side, quantity, status, created_ms, "
+            "candidate_version, invalidation_price) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                client_order_id,
+                side,
+                quantity,
+                status,
+                created_ms,
+                candidate_version,
+                invalidation_price,
+            ),
         )
+
+    def order_intent(self, client_order_id: str) -> dict[str, object]:
+        row = self.connection.execute(
+            "SELECT * FROM order_intents WHERE client_order_id = ?", (client_order_id,)
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"unknown order intent: {client_order_id}")
+        return dict(row)
+
+    def update_order_intent(
+        self,
+        client_order_id: str,
+        *,
+        status: str,
+        exchange_order_id: str | None = None,
+        executed_quantity: str | None = None,
+    ) -> None:
+        self.connection.execute(
+            "UPDATE order_intents SET status = ?, "
+            "exchange_order_id = COALESCE(?, exchange_order_id), "
+            "executed_quantity = COALESCE(?, executed_quantity) WHERE client_order_id = ?",
+            (status, exchange_order_id, executed_quantity, client_order_id),
+        )
+
+    def record_fill(
+        self,
+        *,
+        fill_id: str,
+        client_order_id: str,
+        price: str,
+        quantity: str,
+        commission: str,
+        commission_asset: str,
+        event_time_ms: int,
+    ) -> None:
+        self.connection.execute(
+            "INSERT OR IGNORE INTO fills(fill_id, client_order_id, price, quantity, commission, "
+            "commission_asset, event_time_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                fill_id,
+                client_order_id,
+                price,
+                quantity,
+                commission,
+                commission_asset,
+                event_time_ms,
+            ),
+        )
+
+    def record_protection(
+        self,
+        *,
+        client_order_id: str,
+        entry_client_order_id: str,
+        exchange_order_id: str,
+        quantity: str,
+        stop_price: str,
+        take_profit_price: str,
+        created_ms: int,
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO protections(client_order_id, entry_client_order_id, exchange_order_id, "
+            "quantity, stop_price, take_profit_price, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                client_order_id,
+                entry_client_order_id,
+                exchange_order_id,
+                quantity,
+                stop_price,
+                take_profit_price,
+                created_ms,
+            ),
+        )
+
+    def audit_kinds(self) -> tuple[str, ...]:
+        rows = self.connection.execute("SELECT kind FROM audit_events ORDER BY id").fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def reconstruct_order(self, client_order_id: str) -> dict[str, object]:
+        intent = self.order_intent(client_order_id)
+        fills = tuple(
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM fills WHERE client_order_id = ? ORDER BY event_time_ms, fill_id",
+                (client_order_id,),
+            ).fetchall()
+        )
+        protection_row = self.connection.execute(
+            "SELECT * FROM protections WHERE entry_client_order_id = ? "
+            "ORDER BY created_ms DESC LIMIT 1",
+            (client_order_id,),
+        ).fetchone()
+        return {
+            "intent": intent,
+            "fills": fills,
+            "protection": dict(protection_row) if protection_row is not None else None,
+        }
 
     def active_intents(self) -> tuple[dict[str, object], ...]:
         rows = self.connection.execute(

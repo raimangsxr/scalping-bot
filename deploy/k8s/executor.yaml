@@ -17,7 +17,7 @@ metadata:
   name: scalping-bot
   namespace: scalping-bot
   annotations:
-    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-86f9bbe0120d74e00dc55587d50cf339d42d7ebf.spdx.json
+    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-a291d3bab87325875a88492af3462791e6bf707b.spdx.json
 spec:
   serviceName: scalping-bot-metrics
   replicas: 1
@@ -38,7 +38,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: executor
-          image: ghcr.io/raimangsxr/scalping-bot:git-86f9bbe0120d74e00dc55587d50cf339d42d7ebf
+          image: ghcr.io/raimangsxr/scalping-bot:git-a291d3bab87325875a88492af3462791e6bf707b
           imagePullPolicy: IfNotPresent
           args: ["run-testnet-executor"]
           env:

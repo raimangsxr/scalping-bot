@@ -37,10 +37,7 @@ class RegimeVwapPolicy:
         if len(self._history) == self.window:
             closes = [item.candle.close for item in self._history]
             path = sum(
-                (
-                    abs(current - previous)
-                    for previous, current in pairwise(closes)
-                ),
+                (abs(current - previous) for previous, current in pairwise(closes)),
                 Decimal(0),
             )
             efficiency = abs(closes[-1] - closes[0]) / path if path else Decimal(0)

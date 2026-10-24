@@ -87,7 +87,12 @@ class BinancePublicCollector:
             "payload": data,
         }
         writer = self._writer(stream, receipt_time_ms)
-        writer.append(raw)
+        try:
+            writer.append(raw)
+        except (OSError, RuntimeError):
+            self.health.record_storage_failure()
+            self._rotate(stream, valid=False)
+            raise
         self._counts[stream] += 1
         if "@depth" in stream:
             try:

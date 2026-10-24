@@ -44,6 +44,20 @@ class ExecutionCostBucket:
     slippage_rate: Decimal
     observations: int
 
+    def __post_init__(self) -> None:
+        if (
+            (self.hour_utc is not None and not 0 <= self.hour_utc <= 23)
+            or not self.volatility_bucket
+            or self.minimum_notional < 0
+            or (
+                self.maximum_notional is not None and self.maximum_notional <= self.minimum_notional
+            )
+            or self.half_spread_rate < 0
+            or self.slippage_rate < 0
+            or self.observations < 1
+        ):
+            raise ValueError("execution cost bucket is invalid")
+
     def matches(self, *, hour_utc: int, volatility: str, notional: Decimal) -> bool:
         return (
             (self.hour_utc is None or self.hour_utc == hour_utc)
@@ -68,34 +82,44 @@ class ExecutionCostSnapshot:
         if not isinstance(value, dict) or not isinstance(value.get("buckets"), list):
             raise ValueError("execution cost snapshot is malformed")
         expected = value.get("sha256")
+        if not isinstance(expected, str):
+            raise ValueError("execution cost snapshot has no checksum")
         canonical_value = {key: item for key, item in value.items() if key != "sha256"}
         canonical = json.dumps(canonical_value, sort_keys=True, separators=(",", ":")).encode()
         identity = hashlib.sha256(canonical).hexdigest()
         if expected != identity:
             raise ValueError("execution cost snapshot checksum is invalid")
-        buckets = tuple(
-            ExecutionCostBucket(
-                hour_utc=(int(item["hour_utc"]) if item.get("hour_utc") is not None else None),
-                volatility_bucket=str(item["volatility_bucket"]),
-                minimum_notional=Decimal(str(item["minimum_notional"])),
-                maximum_notional=(
-                    Decimal(str(item["maximum_notional"]))
-                    if item.get("maximum_notional") is not None
-                    else None
-                ),
-                half_spread_rate=Decimal(str(item["half_spread_rate"])),
-                slippage_rate=Decimal(str(item["slippage_rate"])),
-                observations=int(item["observations"]),
+        if not all(isinstance(item, dict) for item in value["buckets"]):
+            raise ValueError("execution cost snapshot contains a malformed bucket")
+        try:
+            buckets = tuple(
+                ExecutionCostBucket(
+                    hour_utc=(int(item["hour_utc"]) if item.get("hour_utc") is not None else None),
+                    volatility_bucket=str(item["volatility_bucket"]),
+                    minimum_notional=Decimal(str(item["minimum_notional"])),
+                    maximum_notional=(
+                        Decimal(str(item["maximum_notional"]))
+                        if item.get("maximum_notional") is not None
+                        else None
+                    ),
+                    half_spread_rate=Decimal(str(item["half_spread_rate"])),
+                    slippage_rate=Decimal(str(item["slippage_rate"])),
+                    observations=int(item["observations"]),
+                )
+                for item in value["buckets"]
             )
-            for item in value["buckets"]
-            if isinstance(item, dict)
-        )
+            commission_rate = Decimal(str(value["commission_rate"]))
+            captured_ms = int(value["captured_ms"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("execution cost snapshot contains invalid values") from error
         if not buckets or any(item.observations < 1 for item in buckets):
             raise ValueError("execution cost snapshot has unevidenced buckets")
+        if commission_rate < 0 or captured_ms < 0:
+            raise ValueError("execution cost snapshot has invalid commission or timestamp")
         return cls(
             snapshot_id=identity,
-            captured_ms=int(value["captured_ms"]),
-            commission_rate=Decimal(str(value["commission_rate"])),
+            captured_ms=captured_ms,
+            commission_rate=commission_rate,
             buckets=buckets,
         )
 

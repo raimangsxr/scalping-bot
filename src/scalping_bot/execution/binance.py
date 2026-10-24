@@ -165,6 +165,163 @@ class OfficialSpotTransport:
         ).data()
 
 
+class InMemorySpotTransport:
+    """Deterministic SpotTransport for adapter and reconciliation contract tests."""
+
+    def __init__(
+        self,
+        *,
+        initial_usdt: Decimal = Decimal("10000"),
+        reference_price: Decimal = Decimal("90000"),
+    ) -> None:
+        if initial_usdt <= 0 or reference_price <= 0:
+            raise ValueError("in-memory account values must be positive")
+        self._usdt = initial_usdt
+        self._btc = Decimal(0)
+        self._reference_price = reference_price
+        self._next_order_id = 1
+        self._next_trade_id = 1
+        self._next_list_id = 1
+        self._results: dict[str, OrderResult] = {}
+        self._open_orders: dict[str, dict[str, object]] = {}
+        self._trades: list[dict[str, object]] = []
+
+    def exchange_info(self, symbol: str) -> dict[str, object]:
+        self._check_symbol(symbol)
+        return {
+            "rateLimits": [{"rateLimitType": "REQUEST_WEIGHT", "limit": 6000}],
+            "symbols": [
+                {
+                    "symbol": symbol,
+                    "status": "TRADING",
+                    "orderTypes": ["MARKET", "LIMIT", "STOP_LOSS_LIMIT"],
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.00001000", "maxQty": "100"},
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                        {"filterType": "NOTIONAL", "minNotional": "5", "maxNotional": "1000000"},
+                    ],
+                }
+            ],
+        }
+
+    def account_commission(self, symbol: str) -> dict[str, object]:
+        self._check_symbol(symbol)
+        return {"standardCommission": {"maker": "0.001", "taker": "0.001"}}
+
+    def account(self) -> dict[str, object]:
+        return {
+            "balances": [
+                {"asset": "USDT", "free": str(self._usdt), "locked": "0"},
+                {"asset": "BTC", "free": str(self._btc), "locked": "0"},
+            ]
+        }
+
+    def open_orders(self, symbol: str) -> list[dict[str, object]]:
+        self._check_symbol(symbol)
+        return list(self._open_orders.values())
+
+    def trades(self, symbol: str) -> list[dict[str, object]]:
+        self._check_symbol(symbol)
+        return list(self._trades)
+
+    def submit_market_buy(self, symbol: str, client_order_id: str, quantity: str) -> OrderResult:
+        self._check_symbol(symbol)
+        return self._market_order(symbol, client_order_id, quantity, side="BUY")
+
+    def query_order(self, symbol: str, client_order_id: str) -> OrderResult:
+        self._check_symbol(symbol)
+        try:
+            return self._results[client_order_id]
+        except KeyError as error:
+            raise LookupError(f"unknown in-memory order: {client_order_id}") from error
+
+    def place_oco_protection(
+        self,
+        symbol: str,
+        client_order_id: str,
+        quantity: str,
+        stop_price: str,
+        take_profit_price: str,
+    ) -> str:
+        self._check_symbol(symbol)
+        existing = self._open_orders.get(client_order_id)
+        if existing is not None:
+            return str(existing["orderListId"])
+        list_id = str(self._next_list_id)
+        self._next_list_id += 1
+        self._open_orders[client_order_id] = {
+            "symbol": symbol,
+            "orderListId": list_id,
+            "listClientOrderId": client_order_id,
+            "origQty": quantity,
+            "stopPrice": stop_price,
+            "price": take_profit_price,
+            "status": "EXEC_STARTED",
+        }
+        return list_id
+
+    def flatten_market_sell(self, symbol: str, client_order_id: str, quantity: str) -> OrderResult:
+        self._check_symbol(symbol)
+        return self._market_order(symbol, client_order_id, quantity, side="SELL")
+
+    def cancel_protection(self, symbol: str, client_order_id: str) -> None:
+        self._check_symbol(symbol)
+        self._open_orders.pop(client_order_id, None)
+
+    def _market_order(
+        self, symbol: str, client_order_id: str, quantity: str, *, side: str
+    ) -> OrderResult:
+        existing = self._results.get(client_order_id)
+        if existing is not None:
+            return existing
+        amount = Decimal(quantity)
+        if amount <= 0:
+            raise ValueError("in-memory order quantity must be positive")
+        notional = amount * self._reference_price
+        commission = notional * Decimal("0.001")
+        if side == "BUY":
+            if self._usdt < notional + commission:
+                raise ValueError("in-memory account has insufficient USDT")
+            self._usdt -= notional + commission
+            self._btc += amount
+        else:
+            if self._btc < amount:
+                raise ValueError("in-memory account has insufficient BTC")
+            self._btc -= amount
+            self._usdt += notional - commission
+        order_id = str(self._next_order_id)
+        self._next_order_id += 1
+        trade_id = str(self._next_trade_id)
+        self._next_trade_id += 1
+        fill = ExecutionFill(
+            fill_id=trade_id,
+            price=self._reference_price,
+            quantity=amount,
+            commission=commission,
+            commission_asset="USDT",
+        )
+        result = OrderResult(status="FILLED", exchange_order_id=order_id, fills=(fill,))
+        self._results[client_order_id] = result
+        self._trades.append(
+            {
+                "id": trade_id,
+                "orderId": order_id,
+                "clientOrderId": client_order_id,
+                "price": str(self._reference_price),
+                "qty": str(amount),
+                "commission": str(commission),
+                "commissionAsset": "USDT",
+                "time": 0,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _check_symbol(symbol: str) -> None:
+        if symbol != "BTCUSDT":
+            raise ValueError("in-memory transport only supports BTCUSDT")
+
+
 @dataclass(frozen=True)
 class BinanceCapabilities:
     symbol_status: str
@@ -196,15 +353,28 @@ class BinanceSpotTestnetAdapter:
         symbol = symbols[0]
         if not isinstance(symbol, dict) or symbol.get("symbol") != self.symbol:
             raise ValueError("unexpected exchange symbol")
+        raw_filters = symbol.get("filters")
+        if not isinstance(raw_filters, list):
+            raise ValueError("BTCUSDT exchange filters are missing")
         filters = {
-            item["filterType"]: item
-            for item in symbol.get("filters", [])
-            if isinstance(item, dict) and "filterType" in item
+            str(item["filterType"]): item
+            for item in raw_filters
+            if isinstance(item, dict) and item.get("filterType") is not None
         }
+        notional_filter = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL")
+        if notional_filter is None:
+            raise ValueError("BTCUSDT notional filter is missing")
+        order_types = symbol.get("orderTypes")
+        if not isinstance(order_types, list):
+            raise ValueError("BTCUSDT order types are missing")
         limits = info.get("rateLimits")
         weight = (
             next(
-                (item["limit"] for item in limits if item.get("rateLimitType") == "REQUEST_WEIGHT"),
+                (
+                    item["limit"]
+                    for item in limits
+                    if isinstance(item, dict) and item.get("rateLimitType") == "REQUEST_WEIGHT"
+                ),
                 None,
             )
             if isinstance(limits, list)
@@ -214,19 +384,24 @@ class BinanceSpotTestnetAdapter:
         standard = commission.get("standardCommission")
         if not isinstance(standard, dict):
             raise ValueError("account commission response is missing standard rates")
-        if not isinstance(weight, int):
-            raise ValueError("request-weight limit is missing")
+        try:
+            request_weight_limit = int(str(weight))
+        except (TypeError, ValueError):
+            raise ValueError("request-weight limit is missing") from None
+        required_filters = {"LOT_SIZE", "PRICE_FILTER"}
+        if not required_filters.issubset(filters):
+            raise ValueError("BTCUSDT quantity or price filters are missing")
         return BinanceCapabilities(
             symbol_status=str(symbol["status"]),
-            order_types=tuple(str(item) for item in symbol["orderTypes"]),
+            order_types=tuple(str(item) for item in order_types),
             step_size=str(filters["LOT_SIZE"]["stepSize"]),
-            min_notional=str(filters["NOTIONAL"]["minNotional"]),
+            min_notional=str(notional_filter["minNotional"]),
             tick_size=str(filters["PRICE_FILTER"]["tickSize"]),
             max_quantity=str(filters.get("MARKET_LOT_SIZE", filters["LOT_SIZE"])["maxQty"]),
-            max_notional=str(filters["NOTIONAL"].get("maxNotional", "0")),
+            max_notional=str(notional_filter.get("maxNotional", "0")),
             maker_commission=str(standard["maker"]),
             taker_commission=str(standard["taker"]),
-            request_weight_limit=weight,
+            request_weight_limit=request_weight_limit,
         )
 
     def cancel_protection(self, *, client_order_id: str) -> None:

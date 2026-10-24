@@ -19,6 +19,7 @@ class LocalOrderBook:
         self._awaiting_first_update = True
         self.valid = False
         self.latency_ms: int | None = None
+        self.segment_id: str | None = None
 
     def apply_snapshot(
         self,
@@ -31,10 +32,14 @@ class LocalOrderBook:
     ) -> None:
         self._bids = _levels(bids)
         self._asks = _levels(asks)
+        if not self._bids or not self._asks:
+            self.valid = False
+            raise BookGap("a valid snapshot must contain both bid and ask levels")
         self._last_update_id = last_update_id
         self._awaiting_first_update = True
         self.valid = True
         self.latency_ms = max(0, receipt_time_ms - exchange_time_ms)
+        self.segment_id = f"{self.symbol}:{last_update_id}"
 
     def apply_depth(
         self,
@@ -61,6 +66,9 @@ class LocalOrderBook:
             raise BookGap(f"depth gap after {self._last_update_id}; a new snapshot is required")
         _apply_levels(self._bids, bids)
         _apply_levels(self._asks, asks)
+        if not self._bids or not self._asks:
+            self.valid = False
+            raise BookGap("depth update removed every bid or ask; a new snapshot is required")
         self._last_update_id = final_update_id
         self._awaiting_first_update = False
         self.latency_ms = max(0, receipt_time_ms - exchange_time_ms)
@@ -80,6 +88,10 @@ class LocalOrderBook:
     def _require_valid(self) -> None:
         if not self.valid:
             raise BookGap("book segment is invalid; a new snapshot is required")
+
+    @property
+    def market_data_quality(self) -> str:
+        return "valid" if self.valid else "invalid"
 
 
 def _levels(values: Iterable[tuple[str, str]]) -> dict[Decimal, Decimal]:

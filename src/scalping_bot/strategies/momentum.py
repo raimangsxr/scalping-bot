@@ -17,6 +17,8 @@ class MomentumPolicy:
     ) -> None:
         if window < 2:
             raise ValueError("momentum window must contain at least two complete bars")
+        if threshold < 0:
+            raise ValueError("momentum threshold cannot be negative")
         self.candidate_version = candidate_version
         self.window = window
         self.threshold = threshold

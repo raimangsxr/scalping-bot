@@ -3,22 +3,26 @@ from __future__ import annotations
 import itertools
 from collections import defaultdict, deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from itertools import pairwise
 from pathlib import Path
 
 import pyarrow.parquet as pq
 
+from scalping_bot.data.storage import ObjectStore
 from scalping_bot.domain.engine import Engine, StrategyPolicy
 from scalping_bot.domain.events import CandleClosed, ExitFillReceived, FillReceived, MarketTick
 from scalping_bot.domain.models import EntryProposal, ExecutionCosts, ExitMarket, SubmitEntry
 from scalping_bot.domain.state import InMemoryState
 from scalping_bot.research.candidates import CandidateBatch, first_batch
 from scalping_bot.research.evidence import (
+    CandidateLifecycle,
     CandidateRecord,
     EvidenceProtocol,
     EvidenceResult,
+    ExperimentManifest,
     ScalpResult,
 )
 from scalping_bot.research.execution import AggTrade
@@ -33,6 +37,8 @@ class BatchEvaluation:
     evidence: Mapping[str, EvidenceResult]
     ledger: AttemptLedger
     trades: Mapping[str, tuple[ScalpResult, ...]]
+    candidate_records: Mapping[str, CandidateRecord] = field(default_factory=dict)
+    manifest_keys: Mapping[str, str] = field(default_factory=dict)
 
 
 class ResearchBatchRunner:
@@ -43,10 +49,16 @@ class ResearchBatchRunner:
         *,
         execution_costs: ExecutionCosts,
         initial_equity: Decimal = Decimal("10000"),
+        manifest_store: ObjectStore | None = None,
+        code_commit: str = "working-tree",
+        dataset_checksums: tuple[str, ...] = (),
     ) -> None:
         self.execution_costs = execution_costs
         self.initial_equity = initial_equity
         self.protocol = EvidenceProtocol()
+        self.manifest_store = manifest_store
+        self.code_commit = code_commit
+        self.dataset_checksums = dataset_checksums
 
     def run(
         self, trades: tuple[AggTrade, ...], batch: CandidateBatch | None = None
@@ -55,11 +67,13 @@ class ResearchBatchRunner:
         ledger = AttemptLedger()
         evidence: dict[str, EvidenceResult] = {}
         evidence_trades: dict[str, tuple[ScalpResult, ...]] = {}
-        attempt_count = sum(
-            len(_parameter_sets(candidate)) for candidate in selected_batch.candidates
-        )
         for candidate in selected_batch.candidates:
             scenario_results: dict[Decimal, list[ScalpResult]] = {
+                Decimal("1"): [],
+                Decimal("1.5"): [],
+                Decimal("2"): [],
+            }
+            baseline_scenario_results: dict[Decimal, list[ScalpResult]] = {
                 Decimal("1"): [],
                 Decimal("1.5"): [],
                 Decimal("2"): [],
@@ -77,6 +91,27 @@ class ResearchBatchRunner:
                 )
                 if not development or not validation:
                     continue
+                baseline_development = self._evaluate_period(
+                    candidate,
+                    _baseline_parameters(candidate),
+                    development,
+                    fold=fold_index,
+                    stress=Decimal("1"),
+                    baseline=True,
+                )
+                baseline_expectancy = _expectancy(baseline_development)
+                ledger.record(
+                    candidate.identity,
+                    {
+                        **_baseline_parameters(candidate),
+                        "development_period": fold.development,
+                        "validation_period": fold.validation,
+                    },
+                    net_expectancy=baseline_expectancy,
+                    baseline=Decimal(0),
+                    is_baseline=True,
+                    fold=fold_index,
+                )
                 ranked: list[tuple[Decimal, Mapping[str, object]]] = []
                 for parameters in _parameter_sets(candidate):
                     development_results = self._evaluate_period(
@@ -86,12 +121,7 @@ class ResearchBatchRunner:
                         fold=fold_index,
                         stress=Decimal("1"),
                     )
-                    expectancy = (
-                        sum((trade.net_pnl for trade in development_results), Decimal(0))
-                        / len(development_results)
-                        if development_results
-                        else Decimal(0)
-                    )
+                    expectancy = _expectancy(development_results)
                     ledger.record(
                         candidate.identity,
                         {
@@ -100,10 +130,22 @@ class ResearchBatchRunner:
                             "validation_period": fold.validation,
                         },
                         net_expectancy=expectancy,
-                        baseline=Decimal(0),
+                        baseline=baseline_expectancy,
+                        fold=fold_index,
                     )
                     ranked.append((expectancy, parameters))
                 selected = max(ranked, key=lambda item: item[0])[1]
+                for multiplier in baseline_scenario_results:
+                    baseline_scenario_results[multiplier].extend(
+                        self._evaluate_period(
+                            candidate,
+                            _baseline_parameters(candidate),
+                            validation,
+                            fold=fold_index,
+                            stress=multiplier,
+                            baseline=True,
+                        )
+                    )
                 for multiplier in scenario_results:
                     scenario_results[multiplier].extend(
                         self._evaluate_period(
@@ -122,12 +164,46 @@ class ResearchBatchRunner:
             evidence[candidate.identity] = self.protocol.evaluate(
                 worst_results,
                 initial_equity=self.initial_equity,
-                attempts=attempt_count,
+                attempts=max(1, sum(not attempt.is_baseline for attempt in ledger.attempts)),
                 comparators=_comparators(trades, worst_results),
                 cost_stress_multipliers=tuple(scenarios),
                 cost_scenario_trades=scenarios,
+                baseline_trades=tuple(baseline_scenario_results[Decimal("2")]),
+                baseline_cost_scenario_trades={
+                    multiplier: tuple(results)
+                    for multiplier, results in baseline_scenario_results.items()
+                },
             )
-        return BatchEvaluation(evidence, ledger, evidence_trades)
+        records = {
+            candidate.identity: _evaluated_record(candidate, evidence[candidate.identity])
+            for candidate in selected_batch.candidates
+        }
+        manifest_keys: dict[str, str] = {}
+        if self.manifest_store is not None:
+            for candidate in selected_batch.candidates:
+                manifest = ExperimentManifest(
+                    code_commit=self.code_commit,
+                    candidate_identity=candidate.identity,
+                    configuration={
+                        "candidate_parameters": dict(candidate.parameters),
+                        "baseline": _baseline_parameters(candidate),
+                    },
+                    dataset_checksums=self.dataset_checksums,
+                    commission_snapshot={
+                        "taker": str(self.execution_costs.commission_rate),
+                    },
+                    execution_cost_model={
+                        "half_spread_rate": str(self.execution_costs.half_spread_rate),
+                        "slippage_rate": str(self.execution_costs.slippage_rate),
+                    },
+                    period=(
+                        f"{self.protocol.PRIMARY_START[0]:04d}-{self.protocol.PRIMARY_START[1]:02d}",
+                        f"{self.protocol.PRIMARY_END[0]:04d}-{self.protocol.PRIMARY_END[1]:02d}",
+                    ),
+                    random_seed=7,
+                )
+                manifest_keys[candidate.identity] = manifest.persist(self.manifest_store)
+        return BatchEvaluation(evidence, ledger, evidence_trades, records, manifest_keys)
 
     def _evaluate_period(
         self,
@@ -137,14 +213,20 @@ class ResearchBatchRunner:
         *,
         fold: int,
         stress: Decimal,
+        baseline: bool = False,
     ) -> tuple[ScalpResult, ...]:
         return _replay_fold(
             trades,
-            policy=build_policy(candidate, parameters),
+            policy=(
+                build_baseline_policy(candidate)
+                if baseline
+                else build_policy(candidate, parameters)
+            ),
             fold=fold,
             initial_equity=self.initial_equity,
             execution_costs=self.execution_costs,
             stress=stress,
+            regime=("lateral" if candidate.family == "regime-conditioned-mean-reversion" else None),
         )
 
 
@@ -176,7 +258,10 @@ def _replay_fold(
     initial_equity: Decimal,
     execution_costs: ExecutionCosts,
     stress: Decimal,
+    regime: str | None = None,
 ) -> tuple[ScalpResult, ...]:
+    if not _aggregate_trades_are_contiguous(trades):
+        return ()
     state = InMemoryState(initial_equity=initial_equity)
     stressed_costs = ExecutionCosts(
         commission_rate=execution_costs.commission_rate * stress,
@@ -243,6 +328,7 @@ def _replay_fold(
                         fold=fold,
                         trace_event_ids=(identity, command.client_order_id),
                         equity_marks=tuple(open_marks),
+                        regime=regime,
                     )
                 )
                 open_trade = None
@@ -303,6 +389,16 @@ def _minute_groups(
     return tuple(output)
 
 
+def _aggregate_trades_are_contiguous(trades: tuple[AggTrade, ...]) -> bool:
+    return all(
+        current.time_ms >= previous.time_ms
+        and current.aggregate_trade_id == previous.aggregate_trade_id + 1
+        and current.price > 0
+        and current.quantity > 0
+        for previous, current in pairwise(trades)
+    ) and all(item.price > 0 and item.quantity > 0 for item in trades)
+
+
 class _TradeFlowPolicy:
     def __init__(
         self,
@@ -318,6 +414,8 @@ class _TradeFlowPolicy:
         self.history: list[CandleClosed] = []
 
     def observe(self, event: CandleClosed) -> EntryProposal | None:
+        if not event.complete or event.volume < 0 or event.buy_volume < 0 or event.sell_volume < 0:
+            return None
         self.history.append(event)
         self.history = self.history[-self.window :]
         if len(self.history) < self.window:
@@ -325,6 +423,8 @@ class _TradeFlowPolicy:
         buy = sum((item.buy_volume for item in self.history), Decimal(0))
         sell = sum((item.sell_volume for item in self.history), Decimal(0))
         total = buy + sell
+        if total <= 0:
+            return None
         imbalance = (buy - sell) / total if total else Decimal(0)
         intensity = Decimal(sum(item.trade_count for item in self.history)) / Decimal(
             self.window * 60
@@ -461,6 +561,34 @@ def build_policy(candidate: CandidateRecord, parameters: Mapping[str, object]) -
     )
 
 
+def build_baseline_policy(candidate: CandidateRecord) -> StrategyPolicy:
+    """Build the fixed, unoptimised family comparator used before variants."""
+    if candidate.family == "momentum":
+        return MomentumPolicy(
+            candidate_version=f"{candidate.identity}-baseline",
+            window=3,
+            threshold=Decimal("0"),
+        )
+    if candidate.family == "volatility-breakout":
+        return BreakoutPolicy(
+            candidate_version=f"{candidate.identity}-baseline",
+            lookback=10,
+            buffer=Decimal("0"),
+        )
+    if candidate.family == "regime-conditioned-mean-reversion":
+        return RegimeVwapPolicy(
+            candidate_version=f"{candidate.identity}-baseline",
+            window=20,
+            max_efficiency_ratio=Decimal("0.40"),
+            deviation=Decimal("0.005"),
+        )
+    return MomentumPolicy(
+        candidate_version=f"{candidate.identity}-baseline",
+        window=3,
+        threshold=Decimal("0"),
+    )
+
+
 def _parameter_sets(candidate: CandidateRecord) -> tuple[dict[str, object], ...]:
     names = tuple(candidate.parameters)
     values = tuple(
@@ -468,6 +596,29 @@ def _parameter_sets(candidate: CandidateRecord) -> tuple[dict[str, object], ...]
     )
     return tuple(
         dict(zip(names, combination, strict=True)) for combination in itertools.product(*values)
+    )
+
+
+def _baseline_parameters(candidate: CandidateRecord) -> dict[str, object]:
+    return {"baseline_family": candidate.family, "unoptimised": True}
+
+
+def _expectancy(trades: tuple[ScalpResult, ...]) -> Decimal:
+    return (
+        sum((trade.net_pnl for trade in trades), Decimal(0)) / len(trades) if trades else Decimal(0)
+    )
+
+
+def _evaluated_record(candidate: CandidateRecord, evidence: EvidenceResult) -> CandidateRecord:
+    specified = candidate.transition(CandidateLifecycle.SPECIFIED, evidence="preregistered")
+    screened = specified.transition(
+        CandidateLifecycle.SCREENED, evidence="baseline and variants run"
+    )
+    if not evidence.promoted:
+        return screened.transition(CandidateLifecycle.REJECTED, evidence="promotion gates failed")
+    return screened.transition(
+        CandidateLifecycle.WALK_FORWARD_VALIDATED,
+        evidence="aggregate-trade walk-forward gates passed",
     )
 
 

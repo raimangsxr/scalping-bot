@@ -162,6 +162,8 @@ class SQLiteState:
         return bool(row[0])
 
     def set_entries_allowed(self, allowed: bool) -> None:
+        if allowed and self.operating_mode is not OperationalMode.RUNNING:
+            allowed = False
         self.connection.execute(
             "UPDATE runtime_state SET entries_allowed = ? WHERE singleton = 1",
             (int(allowed),),
@@ -257,8 +259,19 @@ class SQLiteState:
         commission_asset: str,
         event_time_ms: int,
     ) -> None:
+        existing = self.connection.execute(
+            "SELECT client_order_id, price, quantity, commission, commission_asset, event_time_ms "
+            "FROM fills WHERE fill_id = ?",
+            (fill_id,),
+        ).fetchone()
+        if existing is not None:
+            expected = (client_order_id, price, quantity, commission, commission_asset)
+            actual = tuple(existing[:5])
+            if actual != expected:
+                raise sqlite3.IntegrityError(f"fill {fill_id} was replayed with different data")
+            return
         self.connection.execute(
-            "INSERT OR IGNORE INTO fills(fill_id, client_order_id, price, quantity, commission, "
+            "INSERT INTO fills(fill_id, client_order_id, price, quantity, commission, "
             "commission_asset, event_time_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 fill_id,
@@ -269,6 +282,15 @@ class SQLiteState:
                 commission_asset,
                 event_time_ms,
             ),
+        )
+
+    def fills_for_order(self, client_order_id: str) -> tuple[dict[str, object], ...]:
+        return tuple(
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM fills WHERE client_order_id = ? ORDER BY event_time_ms, fill_id",
+                (client_order_id,),
+            ).fetchall()
         )
 
     def record_protection(
@@ -337,6 +359,38 @@ class SQLiteState:
     def position(self) -> dict[str, object] | None:
         row = self.connection.execute("SELECT * FROM positions WHERE singleton = 1").fetchone()
         return dict(row) if row is not None else None
+
+    def rebuild_position_from_order(self, client_order_id: str) -> bool:
+        """Reconstruct a filled BUY position after a crash between durable writes."""
+        intent = self.order_intent(client_order_id)
+        if intent["side"] != "BUY":
+            return False
+        candidate_version = intent["candidate_version"]
+        source_event_id = intent["source_event_id"]
+        invalidation_price = intent["invalidation_price"]
+        if candidate_version is None or source_event_id is None or invalidation_price is None:
+            return False
+        fills = self.fills_for_order(client_order_id)
+        if not fills:
+            return False
+        quantity = sum((Decimal(str(item["quantity"])) for item in fills), Decimal(0))
+        notional = sum(
+            (Decimal(str(item["price"])) * Decimal(str(item["quantity"])) for item in fills),
+            Decimal(0),
+        )
+        commission = sum((Decimal(str(item["commission"])) for item in fills), Decimal(0))
+        self.upsert_position(
+            candidate_version=str(candidate_version),
+            source_event_id=str(source_event_id),
+            entry_fill_id=str(fills[0]["fill_id"]),
+            entry_time_ms=int(str(fills[0]["event_time_ms"])),
+            entry_price=str(notional / quantity),
+            quantity=str(quantity),
+            invalidation_price=str(invalidation_price),
+            commission=str(commission),
+            protected=self.protection(client_order_id) is not None,
+        )
+        return True
 
     def position_entry_client_order_id(self) -> str:
         row = self.connection.execute(
@@ -435,15 +489,28 @@ class SQLiteState:
         rows = self.connection.execute("SELECT kind FROM audit_events ORDER BY id").fetchall()
         return tuple(str(row[0]) for row in rows)
 
+    def audit_events(self, client_order_id: str | None = None) -> tuple[dict[str, object], ...]:
+        rows = self.connection.execute(
+            "SELECT id, kind, event_time_ms, details_json FROM audit_events ORDER BY id"
+        ).fetchall()
+        events: list[dict[str, object]] = []
+        for row in rows:
+            details = json.loads(str(row["details_json"]))
+            if client_order_id is not None and not _details_reference(details, client_order_id):
+                continue
+            events.append(
+                {
+                    "id": int(row["id"]),
+                    "kind": str(row["kind"]),
+                    "event_time_ms": int(row["event_time_ms"]),
+                    "details": details,
+                }
+            )
+        return tuple(events)
+
     def reconstruct_order(self, client_order_id: str) -> dict[str, object]:
         intent = self.order_intent(client_order_id)
-        fills = tuple(
-            dict(row)
-            for row in self.connection.execute(
-                "SELECT * FROM fills WHERE client_order_id = ? ORDER BY event_time_ms, fill_id",
-                (client_order_id,),
-            ).fetchall()
-        )
+        fills = self.fills_for_order(client_order_id)
         protection_row = self.connection.execute(
             "SELECT * FROM protections WHERE entry_client_order_id = ? "
             "ORDER BY created_ms DESC LIMIT 1",
@@ -453,6 +520,76 @@ class SQLiteState:
             "intent": intent,
             "fills": fills,
             "protection": dict(protection_row) if protection_row is not None else None,
+            "audit": self.audit_events(client_order_id),
+        }
+
+    def reconstruct_scalp(self, entry_client_order_id: str) -> dict[str, object]:
+        """Return the durable proposal-to-P&L trace for one entry intent."""
+        entry = self.order_intent(entry_client_order_id)
+        exit_rows = self.connection.execute(
+            "SELECT * FROM order_intents WHERE side = 'SELL' AND source_event_id = ? "
+            "ORDER BY created_ms, client_order_id",
+            (entry["source_event_id"],),
+        ).fetchall()
+        exit_orders = tuple(dict(row) for row in exit_rows)
+        order_ids = (
+            entry_client_order_id,
+            *tuple(str(row["client_order_id"]) for row in exit_rows),
+        )
+        placeholders = ",".join("?" for _ in order_ids)
+        fills = tuple(
+            dict(row)
+            for row in self.connection.execute(
+                f"SELECT * FROM fills WHERE client_order_id IN ({placeholders}) "
+                "ORDER BY event_time_ms, fill_id",
+                order_ids,
+            ).fetchall()
+        )
+        entry_fills = tuple(
+            item for item in fills if item["client_order_id"] == entry_client_order_id
+        )
+        exit_fills = tuple(
+            item for item in fills if item["client_order_id"] != entry_client_order_id
+        )
+        commission_by_asset: dict[str, Decimal] = {}
+        for fill in fills:
+            asset = str(fill["commission_asset"])
+            commission_by_asset[asset] = commission_by_asset.get(asset, Decimal(0)) + Decimal(
+                str(fill["commission"])
+            )
+        entry_notional = sum(
+            (Decimal(str(item["price"])) * Decimal(str(item["quantity"])) for item in entry_fills),
+            Decimal(0),
+        )
+        exit_notional = sum(
+            (Decimal(str(item["price"])) * Decimal(str(item["quantity"])) for item in exit_fills),
+            Decimal(0),
+        )
+        pnl: dict[str, object] = {
+            "entry_notional": str(entry_notional),
+            "exit_notional": str(exit_notional),
+            "commission_by_asset": {key: str(value) for key, value in commission_by_asset.items()},
+            "gross_pnl": str(exit_notional - entry_notional),
+        }
+        if set(commission_by_asset) <= {"USDT"}:
+            pnl["net_pnl"] = str(
+                exit_notional - entry_notional - sum(commission_by_asset.values(), Decimal(0))
+            )
+        else:
+            pnl["net_pnl"] = "non-evaluable: commission assets require conversion"
+        trace_ids = {entry_client_order_id, *(str(row["client_order_id"]) for row in exit_rows)}
+        audit = tuple(
+            item
+            for item in self.audit_events()
+            if any(_details_reference(item["details"], identity) for identity in trace_ids)
+        )
+        return {
+            "entry": entry,
+            "exit_orders": exit_orders,
+            "fills": fills,
+            "protection": self.protection(entry_client_order_id),
+            "audit": audit,
+            "pnl": pnl,
         }
 
     def active_intents(self) -> tuple[dict[str, object], ...]:
@@ -467,7 +604,7 @@ class SQLiteState:
         return tuple(
             intent
             for intent in self.active_intents()
-            if intent["status"] in {"SUBMITTING", "UNKNOWN", "PARTIALLY_FILLED"}
+            if intent["status"] in {"SUBMITTING", "UNKNOWN", "NEW", "PARTIALLY_FILLED"}
         )
 
     def partial_entry_intents(self) -> tuple[dict[str, object], ...]:
@@ -491,7 +628,8 @@ class SQLiteState:
         rows = self.connection.execute(
             "SELECT exchange_order_id FROM protections "
             "WHERE entry_client_order_id IN "
-            "(SELECT client_order_id FROM order_intents WHERE status = 'PROTECTED')"
+            "(SELECT client_order_id FROM order_intents "
+            "WHERE status IN ('PROTECTED', 'PARTIALLY_FILLED'))"
         ).fetchall()
         return frozenset(str(row[0]) for row in rows)
 
@@ -542,3 +680,14 @@ class SQLiteState:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+def _details_reference(details: object, client_order_id: str) -> bool:
+    if isinstance(details, dict):
+        return any(
+            value == client_order_id or _details_reference(value, client_order_id)
+            for value in details.values()
+        )
+    if isinstance(details, (list, tuple)):
+        return any(_details_reference(value, client_order_id) for value in details)
+    return False

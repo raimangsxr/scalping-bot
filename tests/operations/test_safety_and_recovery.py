@@ -35,6 +35,13 @@ def test_structured_logs_redact_credentials_and_nested_secrets() -> None:
     assert "symbol=BTCUSDT" in redacted["url"]
 
 
+def test_structured_logs_redact_telegram_bot_tokens_in_url_paths() -> None:
+    redacted = redact_event({"url": "https://api.telegram.org/bot123456:secret-token/sendMessage"})
+
+    assert "secret-token" not in redacted["url"]
+    assert "bot[REDACTED]" in redacted["url"]
+
+
 def test_degraded_pause_and_flatten_lock_block_entries_but_preserve_exits() -> None:
     controller = OperationalController()
     assert controller.allowed(ActionKind.ENTRY)
@@ -103,9 +110,11 @@ def test_encrypted_backup_restores_in_isolation_and_passes_integrity_drill(
     backup = EncryptedSQLiteBackup(Fernet.generate_key())
 
     artifact = backup.create(database, destination=tmp_path / "backups", created_ms=2)
+    latest = backup.publish_latest(artifact)
     restored = backup.restore_and_verify(artifact, destination=tmp_path / "restore")
 
     assert restored.exists()
+    assert latest.read_bytes() == artifact.read_bytes()
     restored_state = SQLiteState(restored)
     try:
         assert restored_state.audit_kinds() == ("heartbeat",)

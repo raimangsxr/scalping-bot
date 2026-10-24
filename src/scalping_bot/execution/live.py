@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from decimal import Decimal
 from urllib.parse import urlparse
 
@@ -19,7 +20,7 @@ from scalping_bot.domain.events import (
     FillReceived,
     MarketTick,
 )
-from scalping_bot.domain.models import ExitMarket, PlaceProtection, SubmitEntry
+from scalping_bot.domain.models import ExitMarket, PlaceProtection, Position, SubmitEntry
 from scalping_bot.execution.executor import ExecutionService, OrderResult
 from scalping_bot.execution.sqlite_state import SQLiteState
 
@@ -118,9 +119,32 @@ class LiveEngineRunner:
                 self.execution.place_protection(command, event_time_ms=event.event_time_ms)
             else:
                 raise TypeError(f"unsupported engine command: {type(command).__name__}")
+        self._sync_position_from_durable_state()
         self.durable_state.persist_engine_state(
             self.engine.state, event_time_ms=event.event_time_ms
         )
+
+    def _sync_position_from_durable_state(self) -> None:
+        durable = self.durable_state.position()
+        if durable is None:
+            self.engine.state.position = None
+            self.engine.state.pending_exit = None
+            return
+        self.engine.state.position = Position(
+            candidate_version=str(durable["candidate_version"]),
+            source_event_id=str(durable["source_event_id"]),
+            entry_fill_id=str(durable["entry_fill_id"]),
+            entry_time_ms=int(str(durable["entry_time_ms"])),
+            entry_price=Decimal(str(durable["entry_price"])),
+            quantity=Decimal(str(durable["quantity"])),
+            invalidation_price=Decimal(str(durable["invalidation_price"])),
+            commission=Decimal(str(durable["commission"])),
+            protected=bool(durable["protected"]),
+        )
+        if self.engine.state.pending_exit is not None:
+            self.engine.state.pending_exit = replace(
+                self.engine.state.pending_exit, quantity=self.engine.state.position.quantity
+            )
 
 
 def _parse_market_message(message: str) -> EngineEvent | None:

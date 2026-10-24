@@ -48,6 +48,20 @@ class CandidateRecord:
     history: tuple[LifecycleTransition, ...] = ()
     frozen: bool = False
 
+    def __post_init__(self) -> None:
+        if self.version < 1:
+            raise ValueError("candidate versions must be positive")
+        if not self.candidate_id or not self.family:
+            raise ValueError("candidate identity and strategy family are required")
+        if not self.source_uri.startswith(("https://", "http://", "test://")):
+            raise ValueError("candidate source provenance must be an HTTP(S) URI")
+        if not self.source_license or not self.thesis:
+            raise ValueError("candidate provenance and causal thesis are required")
+        if not self.original_rules or not self.parameters or not self.rejection_criteria:
+            raise ValueError(
+                "candidate rules, preregistered parameters, and rejection criteria are required"
+            )
+
     @property
     def identity(self) -> str:
         return f"{self.candidate_id}-v{self.version}"
@@ -120,6 +134,7 @@ class ScalpResult:
     risk_compliant: bool = True
     market_fidelity: str = "aggTrades"
     equity_marks: tuple[tuple[int, Decimal], ...] = ()
+    regime: str | None = None
 
     @property
     def net_pnl(self) -> Decimal:
@@ -154,6 +169,12 @@ class EvidenceResult:
     comparators: Mapping[str, Decimal | None] = field(
         default_factory=lambda: {"no_trade": Decimal(0), "buy_and_hold": None, "momentum": None}
     )
+    baseline_metrics: EvidenceMetrics | None = None
+    incremental_net_return: Decimal | None = None
+    fold_metrics: Mapping[int, EvidenceMetrics] = field(default_factory=dict)
+    regime_metrics: Mapping[str, EvidenceMetrics] = field(default_factory=dict)
+    market_fidelity_verified: bool = False
+    baseline_cost_scenario_metrics: Mapping[Decimal, EvidenceMetrics] = field(default_factory=dict)
 
 
 class EvidenceProtocol:
@@ -184,6 +205,8 @@ class EvidenceProtocol:
         comparators: Mapping[str, Decimal | None] | None = None,
         cost_stress_multipliers: tuple[Decimal, ...] = (),
         cost_scenario_trades: Mapping[Decimal, tuple[ScalpResult, ...]] | None = None,
+        baseline_trades: tuple[ScalpResult, ...] | None = None,
+        baseline_cost_scenario_trades: Mapping[Decimal, tuple[ScalpResult, ...]] | None = None,
     ) -> EvidenceResult:
         if attempts < 1:
             raise ValueError("selection attempt count must be positive")
@@ -198,6 +221,19 @@ class EvidenceProtocol:
             sum(by_fold.get(index, Decimal(0)) > 0 for index in range(fold_count))
         ) / Decimal(fold_count)
         concentration_failed = _concentration_failed(trades)
+        baseline_metrics = (
+            _metrics(baseline_trades, initial_equity) if baseline_trades is not None else None
+        )
+        fold_metrics = {
+            fold: _metrics(tuple(trade for trade in trades if trade.fold == fold), initial_equity)
+            for fold in sorted({trade.fold for trade in trades})
+        }
+        regime_metrics = {
+            regime: _metrics(
+                tuple(trade for trade in trades if trade.regime == regime), initial_equity
+            )
+            for regime in sorted({trade.regime for trade in trades if trade.regime is not None})
+        }
         required_stress = {Decimal("1"), Decimal("1.5"), Decimal("2")}
         promoted = (
             len(trades) >= 300
@@ -205,6 +241,8 @@ class EvidenceProtocol:
             and lower is not None
             and lower >= 0
             and not concentration_failed
+            and metrics.max_drawdown <= Decimal("0.10")
+            and metrics.maximum_daily_loss <= Decimal("0.02")
             and all(trade.risk_compliant for trade in trades)
             and all(trade.market_fidelity == "aggTrades" for trade in trades)
             and required_stress.issubset(cost_stress_multipliers)
@@ -224,6 +262,20 @@ class EvidenceProtocol:
             },
             comparators=comparators
             or {"no_trade": Decimal(0), "buy_and_hold": None, "momentum": None},
+            baseline_metrics=baseline_metrics,
+            incremental_net_return=(
+                metrics.net_return - baseline_metrics.net_return
+                if baseline_metrics is not None
+                else None
+            ),
+            fold_metrics=fold_metrics,
+            regime_metrics=regime_metrics,
+            market_fidelity_verified=bool(trades)
+            and all(trade.market_fidelity == "aggTrades" for trade in trades),
+            baseline_cost_scenario_metrics={
+                multiplier: _metrics(scenario, initial_equity)
+                for multiplier, scenario in (baseline_cost_scenario_trades or {}).items()
+            },
         )
 
 
@@ -257,6 +309,7 @@ class HoldoutRegistry:
         audit = {
             "actor": actor,
             "candidate_identity": candidate.identity,
+            "candidate_sha256": _candidate_sha256(candidate),
             "command": command,
             "period": self.PERIOD,
         }
@@ -264,6 +317,21 @@ class HoldoutRegistry:
             key, (json.dumps(audit, sort_keys=True, separators=(",", ":")) + "\n").encode()
         )
         return key
+
+    def was_revealed(self, candidate: CandidateRecord) -> bool:
+        """Return whether this exact frozen candidate version has an audited reveal."""
+        key = f"holdout-access/{candidate.identity}.json"
+        try:
+            audit = json.loads(self.store.read(key))
+        except FileNotFoundError:
+            return False
+        if not isinstance(audit, dict):
+            raise HoldoutAccessError("Final Holdout audit is malformed")
+        if audit.get("candidate_sha256") != _candidate_sha256(candidate):
+            raise HoldoutAccessError(
+                "Final Holdout audit does not match the frozen candidate version"
+            )
+        return True
 
 
 def _metrics(trades: tuple[ScalpResult, ...], initial_equity: Decimal) -> EvidenceMetrics:
@@ -325,6 +393,26 @@ def _metrics(trades: tuple[ScalpResult, ...], initial_equity: Decimal) -> Eviden
         turnover=turnover / initial_equity,
         trade_count=len(trades),
     )
+
+
+def _candidate_sha256(candidate: CandidateRecord) -> str:
+    canonical = json.dumps(
+        {
+            "candidate_id": candidate.candidate_id,
+            "version": candidate.version,
+            "family": candidate.family,
+            "source_uri": candidate.source_uri,
+            "source_license": candidate.source_license,
+            "thesis": candidate.thesis,
+            "original_rules": dict(candidate.original_rules),
+            "modifications": dict(candidate.modifications),
+            "parameters": dict(candidate.parameters),
+            "rejection_criteria": candidate.rejection_criteria,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _daily_block_bootstrap(

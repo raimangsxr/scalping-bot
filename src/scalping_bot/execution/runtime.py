@@ -5,10 +5,12 @@ import signal
 import threading
 import time
 from decimal import Decimal
+from pathlib import Path
 
 from prometheus_client import start_http_server
 
 from scalping_bot.config import Settings
+from scalping_bot.domain.costs import ExecutionCostSnapshot
 from scalping_bot.domain.engine import Engine
 from scalping_bot.domain.models import ExecutionCosts
 from scalping_bot.execution.binance import (
@@ -27,8 +29,12 @@ from scalping_bot.operations.safety import OperationalMode
 
 
 def run_executor(settings: Settings) -> None:
-    if settings.binance_api_key is None or settings.binance_api_secret is None:
+    if not settings.binance_api_key or not settings.binance_api_secret:
         raise RuntimeError("Binance Testnet credentials are required by the executor")
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        raise RuntimeError("Telegram credentials are required for critical executor alerts")
+    if not settings.backup_encryption_key:
+        raise RuntimeError("an encrypted SQLite backup key is required by the executor")
     if settings.candidate_manifest is None:
         raise RuntimeError("a promoted immutable candidate manifest is required by the executor")
     if (
@@ -37,6 +43,7 @@ def run_executor(settings: Settings) -> None:
         or settings.cost_model_snapshot is None
     ):
         raise RuntimeError("a versioned calibrated execution cost snapshot is required")
+    cost_snapshot = ExecutionCostSnapshot.load(Path(settings.cost_model_snapshot))
     candidate = PromotedCandidateManifest.load(settings.candidate_manifest)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_args: stop.set())
@@ -48,11 +55,7 @@ def run_executor(settings: Settings) -> None:
         if settings.telegram_bot_token and settings.telegram_chat_id
         else None
     )
-    backup = (
-        EncryptedSQLiteBackup(settings.backup_encryption_key.encode())
-        if settings.backup_encryption_key
-        else None
-    )
+    backup = EncryptedSQLiteBackup(settings.backup_encryption_key.encode())
     with SQLiteState(settings.state_path) as state:
         transport = OfficialSpotTransport(
             api_key=settings.binance_api_key, api_secret=settings.binance_api_secret
@@ -70,6 +73,12 @@ def run_executor(settings: Settings) -> None:
         )
         metrics.reconciliation_divergences.set(len(reconciliation.divergences))
         metrics.sqlite_health.set(1)
+        metrics.entries_allowed.set(int(state.entries_allowed))
+        state.append_audit(
+            kind="cost-model-loaded",
+            event_time_ms=time.time_ns() // 1_000_000,
+            details={"snapshot_id": cost_snapshot.snapshot_id},
+        )
         last_backup_ms = 0
         last_heartbeat_ms = 0
         engine_state = state.restore_engine_state(initial_equity=settings.initial_equity)
@@ -94,6 +103,7 @@ def run_executor(settings: Settings) -> None:
                     max_quantity=Decimal(capabilities.max_quantity),
                     max_notional=Decimal(capabilities.max_notional),
                 ),
+                metrics=metrics,
             ),
             durable_state=state,
         )
@@ -118,15 +128,24 @@ def run_executor(settings: Settings) -> None:
                 },
             )
             metrics.heartbeat_timestamp_seconds.set(now_ms / 1000)
-            if backup is not None and now_ms - last_backup_ms >= backup.RPO_SECONDS * 1000:
-                artifact = backup.create(
-                    settings.state_path,
-                    destination=settings.state_path.parent / "backups",
-                    created_ms=now_ms,
-                )
-                latest = artifact.parent / "latest.sqlite.fernet"
-                latest.write_bytes(artifact.read_bytes())
-                last_backup_ms = now_ms
+            if now_ms - last_backup_ms >= backup.RPO_SECONDS * 1000:
+                try:
+                    artifact = backup.create(
+                        settings.state_path,
+                        destination=settings.state_path.parent / "backups",
+                        created_ms=now_ms,
+                    )
+                    backup.publish_latest(artifact)
+                    metrics.storage_health.set(1)
+                    last_backup_ms = now_ms
+                except (OSError, ValueError) as error:
+                    metrics.storage_health.set(0)
+                    state.set_operating_mode(OperationalMode.DEGRADED)
+                    state.append_audit(
+                        kind="backup-failed",
+                        event_time_ms=now_ms,
+                        details={"error_type": type(error).__name__},
+                    )
             if notifier is not None and now_ms - last_heartbeat_ms >= 24 * 60 * 60 * 1000:
                 try:
                     asyncio.run(
@@ -137,4 +156,7 @@ def run_executor(settings: Settings) -> None:
                     )
                 except CriticalAlertFailure:
                     state.set_operating_mode(OperationalMode.DEGRADED)
+                    metrics.alert_failures_total.inc()
                 last_heartbeat_ms = now_ms
+            metrics.entries_allowed.set(int(state.entries_allowed))
+            metrics.operating_mode.set(float(list(OperationalMode).index(state.operating_mode)))

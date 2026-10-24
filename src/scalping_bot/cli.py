@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from dataclasses import asdict
 from decimal import Decimal
@@ -68,14 +69,16 @@ def evaluate_first_batch(
 ) -> None:
     """Evaluate all preregistered variants with aggregate trades and shared engine."""
     trades = load_aggtrades(tuple(parquet))
+    output.mkdir(parents=True, exist_ok=True)
     evaluation = ResearchBatchRunner(
         execution_costs=ExecutionCosts(
             commission_rate=Decimal(commission_rate),
             half_spread_rate=Decimal(half_spread_rate),
             slippage_rate=Decimal(slippage_rate),
-        )
+        ),
+        manifest_store=LocalObjectStore(output / "artifacts"),
+        dataset_checksums=tuple(hashlib.sha256(path.read_bytes()).hexdigest() for path in parquet),
     ).run(trades)
-    output.mkdir(parents=True, exist_ok=True)
     for identity, evidence in evaluation.evidence.items():
         (output / f"{identity}.md").write_text(
             render_evidence_markdown(identity, evidence, evaluation.trades[identity]),
@@ -89,10 +92,14 @@ def evaluate_first_batch(
             "baseline_expectancy": str(attempt.baseline_expectancy),
             "incremental_expectancy": str(attempt.incremental_expectancy),
         }
-        for attempt in evaluation.ledger.attempts
+        for attempt in evaluation.ledger.all_attempts
     ]
     (output / "attempts.json").write_text(
         json.dumps(attempts, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    (output / "manifests.json").write_text(
+        json.dumps(dict(evaluation.manifest_keys), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
     )
     typer.echo(f"evaluated {len(evaluation.evidence)} candidates into {output}")
 

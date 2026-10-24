@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from prometheus_client import CollectorRegistry, Gauge, Histogram
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 SENSITIVE_FRAGMENTS = ("api_key", "apikey", "secret", "signature", "token", "authorization")
 
@@ -26,11 +26,23 @@ def _redact(key: str, value: object) -> Any:
     if isinstance(value, str) and value.startswith(("https://", "http://")):
         parts = urlsplit(value)
         query = [
-            (name, "[REDACTED]" if name.lower() in {"signature", "token", "apikey"} else item)
+            (
+                name,
+                "[REDACTED]"
+                if any(
+                    fragment in name.lower().replace("-", "_") for fragment in SENSITIVE_FRAGMENTS
+                )
+                else item,
+            )
             for name, item in parse_qsl(parts.query, keep_blank_values=True)
         ]
+        path_parts = parts.path.split("/")
+        path_parts = [
+            "bot[REDACTED]" if part.startswith("bot") and len(part) > 3 else part
+            for part in path_parts
+        ]
         return urlunsplit(
-            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+            (parts.scheme, parts.netloc, "/".join(path_parts), urlencode(query), parts.fragment)
         )
     return value
 
@@ -70,6 +82,28 @@ class OperationalMetrics:
         self.heartbeat_timestamp_seconds = Gauge(
             "heartbeat_timestamp_seconds", "Last successful heartbeat", registry=self.registry
         )
+        self.entries_allowed = Gauge(
+            "entries_allowed", "Whether new entries are currently permitted", registry=self.registry
+        )
+        self.operating_mode = Gauge(
+            "operating_mode", "Current safe operating mode code", registry=self.registry
+        )
+        self.unknown_order_outcomes_total = Counter(
+            "unknown_order_outcomes_total",
+            "Submitted orders requiring reconciliation",
+            registry=self.registry,
+        )
+        self.rate_limit_events_total = Counter(
+            "rate_limit_events_total", "Exchange rate-limit responses", registry=self.registry
+        )
+        self.alert_failures_total = Counter(
+            "alert_failures_total", "Notification delivery failures", registry=self.registry
+        )
+        self.backup_age_seconds = Gauge(
+            "backup_age_seconds",
+            "Age of the latest encrypted SQLite backup",
+            registry=self.registry,
+        )
 
     @property
     def metric_names(self) -> set[str]:
@@ -84,4 +118,10 @@ class OperationalMetrics:
             "sqlite_health",
             "storage_health",
             "heartbeat_timestamp_seconds",
+            "entries_allowed",
+            "operating_mode",
+            "unknown_order_outcomes_total",
+            "rate_limit_events_total",
+            "alert_failures_total",
+            "backup_age_seconds",
         }

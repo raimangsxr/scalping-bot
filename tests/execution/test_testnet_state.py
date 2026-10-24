@@ -9,6 +9,7 @@ import pytest
 from scalping_bot.execution.binance import (
     BinanceCapabilities,
     BinanceSpotTestnetAdapter,
+    InMemorySpotTransport,
     UnsafeEndpointError,
 )
 from scalping_bot.execution.reconcile import Reconciler
@@ -134,6 +135,61 @@ def test_adapter_refuses_mainnet_and_loads_capabilities_dynamically() -> None:
         taker_commission="0.001",
         request_weight_limit=6000,
     )
+
+
+def test_in_memory_transport_covers_signed_adapter_order_and_protection_contract() -> None:
+    transport = InMemorySpotTransport()
+    adapter = BinanceSpotTestnetAdapter(
+        endpoint="https://testnet.binance.vision", transport=transport
+    )
+
+    result = adapter.submit_market_buy(client_order_id="scalp-entry", quantity="0.01")
+    assert result.status == "FILLED"
+    assert adapter.query_order(client_order_id="scalp-entry") == result
+    protection_id = adapter.place_oco_protection(
+        client_order_id="scalp-entry-protect",
+        quantity="0.01",
+        stop_price="89000",
+        take_profit_price="91000",
+    )
+    assert protection_id == "1"
+    assert adapter.reconciliation_snapshot()["open_orders"]
+    adapter.cancel_protection(client_order_id="scalp-entry-protect")
+    exit_result = adapter.flatten_market_sell(client_order_id="scalp-exit", quantity="0.01")
+    assert exit_result.status == "FILLED"
+    assert len(adapter.reconciliation_snapshot()["trades"]) == 2
+
+
+def test_reconciliation_queries_unknown_order_and_rebuilds_exposure_after_restart(
+    tmp_path: Path,
+) -> None:
+    transport = InMemorySpotTransport()
+    adapter = BinanceSpotTestnetAdapter(
+        endpoint="https://testnet.binance.vision", transport=transport
+    )
+    adapter.submit_market_buy(client_order_id="scalp-restart", quantity="0.01")
+    state = SQLiteState(tmp_path / "state.db")
+    try:
+        state.persist_order_intent(
+            client_order_id="scalp-restart",
+            side="BUY",
+            quantity="0.01",
+            status="UNKNOWN",
+            created_ms=1,
+            candidate_version="momentum-v1",
+            source_event_id="candle-1",
+            invalidation_price="89000",
+        )
+
+        result = Reconciler(state, adapter).run(reason="restart", event_time_ms=2)
+
+        assert result.consistent
+        assert state.entries_allowed
+        assert state.order_intent("scalp-restart")["status"] == "FILLED"
+        assert state.position() is not None
+        assert state.position()["quantity"] == "0.01"
+    finally:
+        state.close()
 
 
 def test_startup_reconciliation_blocks_entries_until_exchange_and_local_state_agree(

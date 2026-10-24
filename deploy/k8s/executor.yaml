@@ -68,10 +68,7 @@ spec:
                   name: scalping-bot-secrets
                   key: backup-encryption-key
             - name: SCALPING_CANDIDATE_MANIFEST
-              valueFrom:
-                secretKeyRef:
-                  name: scalping-bot-secrets
-                  key: candidate-manifest-path
+              value: /run/scalping-candidate/manifest.json
             - name: SCALPING_CALIBRATED_HALF_SPREAD_RATE
               valueFrom:
                 secretKeyRef:
@@ -83,10 +80,7 @@ spec:
                   name: scalping-bot-secrets
                   key: calibrated-slippage-rate
             - name: SCALPING_COST_MODEL_SNAPSHOT
-              valueFrom:
-                secretKeyRef:
-                  name: scalping-bot-secrets
-                  key: cost-model-snapshot
+              value: /run/scalping-cost/snapshot.json
           ports:
             - name: metrics
               containerPort: 8000
@@ -95,6 +89,9 @@ spec:
               mountPath: /app/state
             - name: candidate-manifest
               mountPath: /run/scalping-candidate
+              readOnly: true
+            - name: cost-model
+              mountPath: /run/scalping-cost
               readOnly: true
           readinessProbe:
             exec:
@@ -120,6 +117,15 @@ spec:
         - name: candidate-manifest
           secret:
             secretName: scalping-bot-candidate-manifest
+            items:
+              - key: manifest.json
+                path: manifest.json
+        - name: cost-model
+          secret:
+            secretName: scalping-bot-secrets
+            items:
+              - key: cost-model-snapshot
+                path: snapshot.json
   volumeClaimTemplates:
     - metadata:
         name: state

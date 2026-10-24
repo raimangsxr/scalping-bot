@@ -24,6 +24,10 @@ class RegimeVwapPolicy:
         max_efficiency_ratio: Decimal,
         deviation: Decimal,
     ) -> None:
+        if window < 2 or not Decimal(0) <= max_efficiency_ratio <= Decimal(1):
+            raise ValueError("mean-reversion regime parameters are invalid")
+        if deviation <= 0:
+            raise ValueError("mean-reversion deviation must be positive")
         self.candidate_version = candidate_version
         self.window = window
         self.max_efficiency_ratio = max_efficiency_ratio

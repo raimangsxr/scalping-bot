@@ -21,6 +21,10 @@ class DeploymentGate:
             raise DeploymentBlocked(
                 "planned deployment is blocked while orders or exposure are open"
             )
+        if self.state.position() is not None:
+            raise DeploymentBlocked(
+                "planned deployment is blocked while a durable position remains open"
+            )
         try:
             reconciliation = self.state.latest_reconciliation()
         except LookupError as error:
@@ -41,7 +45,8 @@ class DeploymentGate:
             _assert_backup_and_schema(backup, target_schema, version)
             active = connection.execute(
                 "SELECT client_order_id FROM order_intents "
-                "WHERE status NOT IN ('FILLED', 'CANCELED', 'REJECTED', 'FLATTENED_LOCKED') LIMIT 1"
+                "WHERE status NOT IN "
+                "('FILLED', 'CANCELED', 'REJECTED', 'FLATTENED_LOCKED', 'CLOSED') LIMIT 1"
             ).fetchone()
             if active is not None:
                 raise DeploymentBlocked(
@@ -56,12 +61,19 @@ class DeploymentGate:
                 raise DeploymentBlocked(
                     "planned deployment requires zero reconciliation divergences"
                 )
+            position = connection.execute(
+                "SELECT singleton FROM positions WHERE singleton = 1 LIMIT 1"
+            ).fetchone()
+            if position is not None:
+                raise DeploymentBlocked(
+                    "planned deployment is blocked while a durable position remains open"
+                )
         finally:
             connection.close()
 
 
 def _assert_backup_and_schema(backup: Path, target_schema: int, current_schema: int) -> None:
-    if not backup.is_file() or backup.stat().st_size == 0:
+    if not backup.is_file() or backup.stat().st_size == 0 or backup.suffix != ".fernet":
         raise DeploymentBlocked("a verified encrypted backup is required before deployment")
     if target_schema != current_schema:
         raise DeploymentBlocked(

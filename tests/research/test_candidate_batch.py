@@ -13,7 +13,11 @@ from scalping_bot.research.features import (
     book_flow_features,
 )
 from scalping_bot.research.screening import AttemptLedger
-from scalping_bot.strategies.book_shadow import ShadowBookConfirmation
+from scalping_bot.strategies.book_shadow import (
+    BookShadowEvaluator,
+    BookShadowObservation,
+    ShadowBookConfirmation,
+)
 from scalping_bot.strategies.breakout import BreakoutPolicy
 from scalping_bot.strategies.mean_reversion import RegimeVwapPolicy
 from scalping_bot.strategies.trade_flow import TradeFlowConfirmation
@@ -110,6 +114,10 @@ def test_trade_flow_features_are_chronological_deterministic_and_fail_on_gaps() 
         (prints[0], TradePrint(3, 1_100, Decimal("100"), Decimal("1"), True)), as_of_ms=1_200
     )
     assert not invalid.valid
+    out_of_order = builder.build(
+        (prints[0], TradePrint(3, 900, Decimal("100"), Decimal("1"), True)), as_of_ms=1_200
+    )
+    assert not out_of_order.valid
 
 
 def test_trade_flow_can_confirm_but_missing_data_blocks_entry() -> None:
@@ -134,6 +142,7 @@ def test_book_flow_is_shadow_only_and_never_authorizes_an_entry() -> None:
             previous_ask_depth=Decimal("7"),
             executed_buy_volume=Decimal("2"),
             executed_sell_volume=Decimal("1"),
+            segment_id="segment-1",
         )
     )
     decision = ShadowBookConfirmation(min_imbalance=Decimal("0.2")).evaluate(features)
@@ -142,8 +151,54 @@ def test_book_flow_is_shadow_only_and_never_authorizes_an_entry() -> None:
     assert not decision.executable
     assert features.liquidity_change_confirmed_by_trades
 
+    visible_only = book_flow_features(
+        BookFlowInput(
+            valid_segment=True,
+            segment_id="segment-1",
+            best_bid_quantity=Decimal("4"),
+            best_ask_quantity=Decimal("1"),
+            bid_depth=Decimal("10"),
+            ask_depth=Decimal("5"),
+            previous_bid_depth=Decimal("8"),
+            previous_ask_depth=Decimal("7"),
+        )
+    )
+    assert not ShadowBookConfirmation(Decimal("0.2")).evaluate(visible_only).hypothetical_allow
+
     invalid = book_flow_features(BookFlowInput.invalid())
     assert not ShadowBookConfirmation(Decimal("0")).evaluate(invalid).hypothetical_allow
+
+
+def test_book_shadow_report_exposes_coverage_gaps_and_cannot_promote() -> None:
+    features = book_flow_features(
+        BookFlowInput(
+            valid_segment=True,
+            segment_id="segment-1",
+            best_bid_quantity=Decimal("4"),
+            best_ask_quantity=Decimal("1"),
+            bid_depth=Decimal("10"),
+            ask_depth=Decimal("5"),
+            previous_bid_depth=Decimal("8"),
+            previous_ask_depth=Decimal("7"),
+            executed_buy_volume=Decimal("2"),
+            executed_sell_volume=Decimal("1"),
+        )
+    )
+    evaluator = BookShadowEvaluator()
+    evaluator.record(BookShadowObservation(1_000, features, True, True))
+    evaluator.record_gap()
+    evaluator.record(
+        BookShadowObservation(62_000, book_flow_features(BookFlowInput.invalid()), True, True)
+    )
+
+    report = evaluator.report()
+
+    assert report.coverage == Decimal("0.5")
+    assert report.gaps == 2
+    assert report.incremental_shadow_effect == Decimal("0")
+    assert not report.promoted
+    assert "Promotion: prohibited" in report.markdown
+    assert "Incremental shadow effect" in report.markdown
 
 
 def test_attempt_ledger_retains_every_parameter_variant_and_baseline_comparison() -> None:

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
   "boto3>=1.40.0,<2",
+  "binance-sdk-spot>=13.3.0,<14",
   "cryptography>=50.0.0,<51",
   "duckdb>=1.4.1,<2",
   "httpx>=0.28.1,<0.29",
@@ -56,5 +57,8 @@ strict = true
 packages = ["scalping_bot"]
 
 [[tool.mypy.overrides]]
-module = ["boto3", "boto3.*", "botocore", "botocore.*", "pyarrow", "pyarrow.*"]
+module = [
+  "binance_common", "binance_common.*", "binance_sdk_spot", "binance_sdk_spot.*",
+  "boto3", "boto3.*", "botocore", "botocore.*", "pyarrow", "pyarrow.*",
+]
 ignore_missing_imports = true

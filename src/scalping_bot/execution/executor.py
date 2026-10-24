@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
+from binance_common.errors import NetworkError, ServerError
+
 from scalping_bot.domain.models import SubmitEntry
 from scalping_bot.execution.sqlite_state import SQLiteState
 
@@ -63,7 +65,7 @@ class ExecutionService:
                 result = self.exchange.submit_market_buy(
                     client_order_id=command.client_order_id, quantity=str(command.quantity)
                 )
-            except (TimeoutError, ConnectionError) as error:
+            except (TimeoutError, ConnectionError, NetworkError, ServerError) as error:
                 self.state.update_order_intent(command.client_order_id, status="UNKNOWN")
                 self.state.append_audit(
                     kind="unknown-order-outcome",

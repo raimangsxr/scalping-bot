@@ -6,8 +6,9 @@ The time-based gates for Live Shadow, Testnet Soak, and Promoted Position Risk a
 ## Live Shadow (#19)
 
 `LiveShadowRunner` sends the same immutable market events through the shared `Engine` and records
-the resulting proposals and commands as hypothetical decisions. It has no exchange adapter, so a
-`SubmitEntry`, exit, or protection command cannot be submitted by the runner.
+the resulting proposals and commands as hypothetical decisions. It has no exchange adapter, and
+its public result contains only audit decisions and command names, so a `SubmitEntry`, exit, or
+protection command cannot be submitted by the runner.
 
 The operator records one `LiveReplayComparison` per live observation. The comparison includes
 features, signals, expiry, latency, data quality, and hypothetical cost. Missing mandatory data
@@ -38,13 +39,17 @@ operational setting cannot silently drift from the soak contract.
 ## Promoted Position Risk (#21)
 
 `PromotedRiskGate` requires a promoted 0.25% baseline and a completed soak before it evaluates
-0.5%. `RiskEvaluation` carries separate historical-stress and Testnet-stress evidence. The gate
-requires the candidate rule hash, notional cap, daily-loss cap, drawdown cap, and risk-control
+0.5%. `RiskEvaluation` carries separate historical-stress and Testnet-stress evidence. The
+`safe_baseline` and `safe_promoted` helpers only build configuration-shaped test values and are
+not evidence. The gate requires the candidate rule hash, notional cap, daily-loss cap, drawdown cap, and risk-control
 policy to remain unchanged; it also rechecks risk, cost stress, operational controls, and profit
 concentration at both risk levels.
 
-Each decision is written as a separate immutable JSON manifest. The returned result and report
-always preserve `0.0025` as the proven baseline, whether the 0.5% trial is accepted or rejected.
+Each decision is written as a separate immutable JSON manifest. The gate requires immutable
+promotion and Soak report references plus SHA-256-verified historical and Testnet stress
+artifacts; it does not accept booleans or in-memory metrics as evidence. The returned result and
+report always preserve `0.0025` as the proven baseline, whether the 0.5% trial is accepted or
+rejected.
 
 These classes validate and persist evidence; they do not manufacture elapsed time or Testnet
 fills. Issues #19 and #20 remain operationally open until the real fourteen- and thirty-day

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 
@@ -8,7 +9,6 @@ import pytest
 from scalping_bot.data.storage import LocalObjectStore
 from scalping_bot.domain.engine import Engine
 from scalping_bot.domain.events import CandleClosed, MarketTick
-from scalping_bot.domain.models import SubmitEntry
 from scalping_bot.domain.state import InMemoryState
 from scalping_bot.operations.promotion import (
     LiveReplayComparison,
@@ -22,6 +22,28 @@ from scalping_bot.operations.shadow import LiveShadowRunner
 from scalping_bot.strategies.momentum import MomentumPolicy
 
 DAY = 86_400_000
+
+
+def _stress_evidence(
+    root: Path,
+    key: str,
+    *,
+    net_expectancy: str,
+    max_daily_loss: str,
+    max_drawdown: str,
+) -> StressEvaluation:
+    content = f"stress-evidence:{key}".encode()
+    LocalObjectStore(root).put_immutable(key, content)
+    return StressEvaluation(
+        net_expectancy=Decimal(net_expectancy),
+        max_daily_loss=Decimal(max_daily_loss),
+        max_drawdown=Decimal(max_drawdown),
+        cost_stress_passed=True,
+        operational_controls_passed=True,
+        concentration_passed=True,
+        artifact_key=key,
+        artifact_sha256=hashlib.sha256(content).hexdigest(),
+    )
 
 
 def test_live_shadow_requires_fourteen_continuous_days_and_resolved_divergences() -> None:
@@ -73,7 +95,9 @@ def test_live_shadow_requires_fourteen_continuous_days_and_resolved_divergences(
     )
     assert not gate.evaluate(now_ms=14 * DAY).approved
     gate.resolve_divergence("signal mismatch", resolution="fixed", regression="reg-live-1")
-    assert gate.evaluate(now_ms=14 * DAY).approved
+    result = gate.evaluate(now_ms=14 * DAY)
+    assert result.approved
+    assert "regression: reg-live-1" in result.report
 
 
 def test_missing_live_dependency_enters_degraded_mode_without_hypothetical_entry() -> None:
@@ -183,7 +207,7 @@ def test_live_shadow_runner_emits_hypothetical_commands_without_an_exchange() ->
         MarketTick(event_id="tick-1", event_time_ms=61_001, price=Decimal("103"))
     )
 
-    assert isinstance(result.commands[0], SubmitEntry)
+    assert result.hypothetical_commands == ("hypothetical:SubmitEntry",)
     shadow_report = gate.evaluate(now_ms=61_001).report
     assert "Orders submitted: 0" in shadow_report
     assert "Hypothetical decisions: 3" in shadow_report
@@ -191,6 +215,7 @@ def test_live_shadow_runner_emits_hypothetical_commands_without_an_exchange() ->
 
 def test_soak_requires_supervision_then_verified_incident_free_stability() -> None:
     gate = SoakGate(candidate_identity="momentum-001-v1", started_ms=0)
+    gate.record_supervised_window(start_ms=0, end_ms=7 * DAY, alerts_verified=True)
     with pytest.raises(ValueError, match="seven"):
         gate.begin_continuous(now_ms=6 * DAY, alerts_verified=True)
 
@@ -211,6 +236,7 @@ def test_soak_requires_supervision_then_verified_incident_free_stability() -> No
 
 def test_soak_rejects_wrong_risk_and_unresolved_operational_divergences() -> None:
     gate = SoakGate(candidate_identity="momentum-001-v1", started_ms=0)
+    gate.record_supervised_window(start_ms=0, end_ms=7 * DAY, alerts_verified=True)
     gate.begin_continuous(now_ms=7 * DAY, alerts_verified=True)
     gate.record_scalp(
         event_time_ms=7 * DAY,
@@ -240,6 +266,8 @@ def test_soak_requires_explicit_supervised_coverage_when_windows_are_recorded() 
 
 def test_critical_soak_incident_requires_regression_and_restarts_stability() -> None:
     gate = SoakGate(candidate_identity="momentum-001-v1", started_ms=0)
+    gate.record_supervised_window(start_ms=6 * DAY, end_ms=12 * DAY, alerts_verified=True)
+    gate.record_supervised_window(start_ms=12 * DAY, end_ms=13 * DAY, alerts_verified=True)
 
     with pytest.raises(ValueError, match="regression"):
         gate.record_incident(event_time_ms=6 * DAY, critical=True, regression=None)
@@ -250,7 +278,10 @@ def test_critical_soak_incident_requires_regression_and_restarts_stability() -> 
 
 
 def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: Path) -> None:
-    gate = PromotedRiskGate(LocalObjectStore(tmp_path))
+    store = LocalObjectStore(tmp_path)
+    store.put_immutable("promotion/baseline.json", b"promotion-evidence")
+    store.put_immutable("testnet-soak/report.md", b"soak-report")
+    gate = PromotedRiskGate(store)
     baseline = RiskEvaluation(
         position_risk=Decimal("0.0025"),
         candidate_rules_sha256="rules-immutable",
@@ -261,21 +292,19 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
         cost_stress_passed=True,
         operational_controls_passed=True,
         concentration_passed=True,
-        historical_stress=StressEvaluation(
-            net_expectancy=Decimal("0.2"),
-            max_daily_loss=Decimal("0.01"),
-            max_drawdown=Decimal("0.05"),
-            cost_stress_passed=True,
-            operational_controls_passed=True,
-            concentration_passed=True,
+        historical_stress=_stress_evidence(
+            tmp_path,
+            "stress/historical-baseline.json",
+            net_expectancy="0.2",
+            max_daily_loss="0.01",
+            max_drawdown="0.05",
         ),
-        testnet_stress=StressEvaluation(
-            net_expectancy=Decimal("0.3"),
-            max_daily_loss=Decimal("0.01"),
-            max_drawdown=Decimal("0.05"),
-            cost_stress_passed=True,
-            operational_controls_passed=True,
-            concentration_passed=True,
+        testnet_stress=_stress_evidence(
+            tmp_path,
+            "stress/testnet-baseline.json",
+            net_expectancy="0.3",
+            max_daily_loss="0.01",
+            max_drawdown="0.05",
         ),
     )
     promoted = RiskEvaluation(
@@ -288,21 +317,19 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
         cost_stress_passed=True,
         operational_controls_passed=True,
         concentration_passed=True,
-        historical_stress=StressEvaluation(
-            net_expectancy=Decimal("0.15"),
-            max_daily_loss=Decimal("0.019"),
-            max_drawdown=Decimal("0.09"),
-            cost_stress_passed=True,
-            operational_controls_passed=True,
-            concentration_passed=True,
+        historical_stress=_stress_evidence(
+            tmp_path,
+            "stress/historical-promoted.json",
+            net_expectancy="0.15",
+            max_daily_loss="0.019",
+            max_drawdown="0.09",
         ),
-        testnet_stress=StressEvaluation(
-            net_expectancy=Decimal("0.2"),
-            max_daily_loss=Decimal("0.019"),
-            max_drawdown=Decimal("0.09"),
-            cost_stress_passed=True,
-            operational_controls_passed=True,
-            concentration_passed=True,
+        testnet_stress=_stress_evidence(
+            tmp_path,
+            "stress/testnet-promoted.json",
+            net_expectancy="0.2",
+            max_daily_loss="0.019",
+            max_drawdown="0.09",
         ),
     )
 
@@ -312,6 +339,8 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
         promoted=promoted,
         baseline_promoted=True,
         soak_complete=True,
+        promotion_artifact_key="promotion/baseline.json",
+        soak_report_key="testnet-soak/report.md",
     )
 
     assert result.accepted
@@ -343,7 +372,7 @@ def test_promoted_risk_rejects_changed_rules_or_deteriorated_limits(tmp_path: Pa
         soak_complete=True,
     )
     assert not result.accepted
-    assert "drawdown" in result.reasons[0]
+    assert any("drawdown" in reason for reason in result.reasons)
 
 
 def test_promoted_risk_requires_both_stress_results_and_rejects_control_deterioration(

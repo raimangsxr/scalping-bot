@@ -172,6 +172,7 @@ class LiveShadowGate:
             reasons=tuple(reasons),
             unresolved=unresolved,
             order_count=order_count,
+            now_ms=now_ms,
         )
         return LiveShadowResult(approved, tuple(reasons), report)
 
@@ -193,21 +194,31 @@ class LiveShadowGate:
         reasons: tuple[str, ...],
         unresolved: set[str],
         order_count: int,
+        now_ms: int,
     ) -> str:
         decision = "APPROVE Testnet Soak" if approved else "REJECT progression"
         manifest = self.candidate_manifest_sha256 or "not supplied"
         reason_lines = "\n".join(f"- {reason}" for reason in reasons) or "- none"
+        resolution_lines = (
+            "\n".join(
+                f"- {divergence}: {resolution} (regression: {regression})"
+                for divergence, (resolution, regression) in sorted(self.resolutions.items())
+            )
+            or "- none"
+        )
         return (
             f"# Live Shadow — {self.candidate_identity}\n\n"
             f"Candidate manifest SHA-256: {manifest}\n"
             f"Decision: {decision}\n\n"
-            f"Window: {self.started_ms}-{self.started_ms + LIVE_SHADOW_DAYS * DAY_MS} ms\n"
+            f"Window: {self.started_ms}-{now_ms} ms\n"
             f"Comparisons: {len(self.comparisons)}\n"
             f"Hypothetical decisions: {len(self._hypothetical_decisions)}\n"
             f"Unresolved divergences: {len(unresolved)}\n"
             f"Orders submitted: {order_count}\n"
             "Compared: feature values, signals, expiry, latency, data quality, and "
             "hypothetical costs.\n\n"
+            "Divergence resolutions:\n"
+            f"{resolution_lines}\n\n"
             "Reasons:\n"
             f"{reason_lines}\n"
         )
@@ -267,7 +278,9 @@ class SoakGate:
             raise ValueError("seven incident-free days are required before continuous operation")
         if not alerts_verified:
             raise ValueError("alerts must be verified before continuous operation")
-        if self.supervised_windows and not self._supervision_covers(stable_since, now_ms):
+        if not self.supervised_windows:
+            raise ValueError("supervised windows are required before continuous operation")
+        if not self._supervision_covers(stable_since, now_ms):
             raise ValueError("supervised windows must cover the stability period")
         self.alerts_verified = True
         self.continuous_started_ms = now_ms
@@ -354,6 +367,8 @@ class SoakGate:
         for window_start, window_end, alerts_verified in self.supervised_windows:
             if window_start > cursor:
                 return False
+            if window_end > end_ms:
+                return False
             if not alerts_verified:
                 return False
             cursor = max(cursor, window_end)
@@ -393,6 +408,8 @@ class StressEvaluation:
     cost_stress_passed: bool
     operational_controls_passed: bool
     concentration_passed: bool
+    artifact_key: str = ""
+    artifact_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -414,14 +431,7 @@ class RiskEvaluation:
 
     @classmethod
     def safe_baseline(cls, rules: str) -> RiskEvaluation:
-        stress = StressEvaluation(
-            net_expectancy=Decimal("0.5"),
-            max_daily_loss=Decimal("0.01"),
-            max_drawdown=Decimal("0.05"),
-            cost_stress_passed=True,
-            operational_controls_passed=True,
-            concentration_passed=True,
-        )
+        """Build a configuration-shaped baseline; it is not promotion evidence."""
         return cls(
             position_risk=INITIAL_POSITION_RISK,
             candidate_rules_sha256=rules,
@@ -432,22 +442,13 @@ class RiskEvaluation:
             cost_stress_passed=True,
             operational_controls_passed=True,
             concentration_passed=True,
-            historical_stress=stress,
-            testnet_stress=stress,
         )
 
     @classmethod
     def safe_promoted(
         cls, rules: str, *, max_drawdown: Decimal = Decimal("0.08")
     ) -> RiskEvaluation:
-        stress = StressEvaluation(
-            net_expectancy=Decimal("0.6"),
-            max_daily_loss=Decimal("0.015"),
-            max_drawdown=max_drawdown,
-            cost_stress_passed=True,
-            operational_controls_passed=True,
-            concentration_passed=True,
-        )
+        """Build a configuration-shaped trial; it is not promotion evidence."""
         return cls(
             position_risk=PROMOTED_POSITION_RISK,
             candidate_rules_sha256=rules,
@@ -458,8 +459,6 @@ class RiskEvaluation:
             cost_stress_passed=True,
             operational_controls_passed=True,
             concentration_passed=True,
-            historical_stress=stress,
-            testnet_stress=stress,
         )
 
 
@@ -487,6 +486,8 @@ class PromotedRiskGate:
         promoted: RiskEvaluation,
         baseline_promoted: bool,
         soak_complete: bool,
+        promotion_artifact_key: str | None = None,
+        soak_report_key: str | None = None,
     ) -> PromotedRiskResult:
         if not baseline_promoted or not soak_complete:
             raise ValueError("0.5% evaluation requires promotion and Testnet Soak at 0.25%")
@@ -500,11 +501,16 @@ class PromotedRiskGate:
             )
 
         reasons: list[str] = []
+        self._check_reference(promotion_artifact_key, "promotion evidence artifact", reasons)
+        self._check_reference(soak_report_key, "Testnet Soak report artifact", reasons)
         self._check_limits(baseline, "baseline", reasons)
         self._check_limits(promoted, "promoted", reasons)
         if baseline.notional_fraction != promoted.notional_fraction:
             reasons.append("position notional limit changed between risk evaluations")
-        if baseline.notional_fraction > MAX_NOTIONAL_FRACTION:
+        if (
+            baseline.notional_fraction > MAX_NOTIONAL_FRACTION
+            or promoted.notional_fraction > MAX_NOTIONAL_FRACTION
+        ):
             reasons.append("position notional limit exceeds 50%")
         if baseline.daily_loss_limit != promoted.daily_loss_limit:
             reasons.append("daily loss control changed between risk evaluations")
@@ -532,6 +538,8 @@ class PromotedRiskGate:
             "manifest_version": 1,
             "candidate_identity": candidate_identity,
             "candidate_rules_sha256": baseline.candidate_rules_sha256,
+            "promotion_artifact_key": promotion_artifact_key,
+            "soak_report_key": soak_report_key,
             "baseline": _json_evaluation(baseline),
             "promoted": _json_evaluation(promoted),
             "proven_baseline_risk": str(INITIAL_POSITION_RISK),
@@ -554,22 +562,46 @@ class PromotedRiskGate:
 
     @staticmethod
     def _check_limits(evaluation: RiskEvaluation, label: str, reasons: list[str]) -> None:
-        if evaluation.max_daily_loss > MAX_DAILY_LOSS:
+        PromotedRiskGate._check_metric_limits(
+            label, evaluation.max_daily_loss, evaluation.max_drawdown, reasons
+        )
+
+    @staticmethod
+    def _check_metric_limits(
+        label: str, max_daily_loss: Decimal, max_drawdown: Decimal, reasons: list[str]
+    ) -> None:
+        if max_daily_loss > MAX_DAILY_LOSS:
             reasons.append(f"{label} daily loss exceeds 2%")
-        if evaluation.max_drawdown > MAX_DRAWDOWN:
+        if max_drawdown > MAX_DRAWDOWN:
             reasons.append(f"{label} drawdown exceeds 10%")
 
     @staticmethod
     def _check_criteria(evaluation: RiskEvaluation, label: str, reasons: list[str]) -> None:
-        if not evaluation.cost_stress_passed:
-            reasons.append(f"{label} cost stress failed")
-        if not evaluation.operational_controls_passed:
-            reasons.append(f"{label} operational controls failed")
-        if not evaluation.concentration_passed:
-            reasons.append(f"{label} profit concentration failed")
+        PromotedRiskGate._check_criteria_values(
+            label,
+            evaluation.cost_stress_passed,
+            evaluation.operational_controls_passed,
+            evaluation.concentration_passed,
+            reasons,
+        )
 
     @staticmethod
+    def _check_criteria_values(
+        label: str,
+        cost_stress_passed: bool,
+        operational_controls_passed: bool,
+        concentration_passed: bool,
+        reasons: list[str],
+    ) -> None:
+        if not cost_stress_passed:
+            reasons.append(f"{label} cost stress failed")
+        if not operational_controls_passed:
+            reasons.append(f"{label} operational controls failed")
+        if not concentration_passed:
+            reasons.append(f"{label} profit concentration failed")
+
     def _check_stress(
+        self,
         label: str,
         baseline: StressEvaluation | None,
         promoted: StressEvaluation | None,
@@ -583,16 +615,50 @@ class PromotedRiskGate:
         if promoted.net_expectancy <= 0:
             reasons.append(f"{label} 0.5% expectancy is not positive")
         for risk_label, result in (("baseline", baseline), ("promoted", promoted)):
-            if result.max_daily_loss > MAX_DAILY_LOSS:
-                reasons.append(f"{label} {risk_label} daily loss exceeds 2%")
-            if result.max_drawdown > MAX_DRAWDOWN:
-                reasons.append(f"{label} {risk_label} drawdown exceeds 10%")
-            if not result.cost_stress_passed:
-                reasons.append(f"{label} {risk_label} cost stress failed")
-            if not result.operational_controls_passed:
-                reasons.append(f"{label} {risk_label} operational controls failed")
-            if not result.concentration_passed:
-                reasons.append(f"{label} {risk_label} profit concentration failed")
+            self._check_stress_artifact(label, risk_label, result, reasons)
+            self._check_metric_limits(
+                f"{label} {risk_label}", result.max_daily_loss, result.max_drawdown, reasons
+            )
+            self._check_criteria_values(
+                f"{label} {risk_label}",
+                result.cost_stress_passed,
+                result.operational_controls_passed,
+                result.concentration_passed,
+                reasons,
+            )
+
+    def _check_stress_artifact(
+        self,
+        label: str,
+        risk_label: str,
+        result: StressEvaluation,
+        reasons: list[str],
+    ) -> None:
+        if not result.artifact_key or not result.artifact_sha256:
+            reasons.append(f"{label} {risk_label} stress artifact is required")
+            return
+        expected = result.artifact_sha256.lower()
+        if len(expected) != 64 or any(
+            character not in "0123456789abcdef" for character in expected
+        ):
+            reasons.append(f"{label} {risk_label} stress artifact hash is malformed")
+            return
+        try:
+            content = self.store.read(result.artifact_key)
+        except (KeyError, OSError):
+            reasons.append(f"{label} {risk_label} stress artifact is unavailable")
+            return
+        if hashlib.sha256(content).hexdigest() != expected:
+            reasons.append(f"{label} {risk_label} stress artifact hash does not match")
+
+    def _check_reference(self, key: str | None, label: str, reasons: list[str]) -> None:
+        if not key:
+            reasons.append(f"{label} is required")
+            return
+        try:
+            self.store.read(key)
+        except (KeyError, OSError):
+            reasons.append(f"{label} is unavailable")
 
     @staticmethod
     def _render_report(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 
 from scalping_bot.data.storage import ObjectStore
@@ -299,7 +299,12 @@ class SoakGate:
         unresolved_divergences: tuple[str, ...] = (),
         executed: bool = True,
     ) -> None:
-        if self.continuous_started_ms is None or event_time_ms < self.continuous_started_ms:
+        if self.continuous_started_ms is None:
+            if not self._is_supervised_time(event_time_ms):
+                raise ValueError(
+                    "scalps before continuous operation require a recorded supervised window"
+                )
+        elif event_time_ms < self.continuous_started_ms:
             raise ValueError("scalps count only after continuous operation is admitted")
         if self.scalp_times and event_time_ms <= self.scalp_times[-1]:
             raise ValueError("soak scalps must be chronological")
@@ -353,6 +358,8 @@ class SoakGate:
             or self.scalp_times[-1] < self.started_ms + SOAK_DAYS * DAY_MS
         ):
             reasons.append("executed scalp evidence does not span the thirty-day soak")
+        if any(event_time_ms > now_ms for event_time_ms in self.scalp_times):
+            reasons.append("executed scalp evidence contains future timestamps")
 
         complete = not reasons
         report = self._render_report(complete=complete, reasons=tuple(reasons))
@@ -376,6 +383,12 @@ class SoakGate:
             if cursor >= end_ms:
                 return True
         return cursor >= end_ms
+
+    def _is_supervised_time(self, event_time_ms: int) -> bool:
+        return any(
+            start_ms <= event_time_ms <= end_ms
+            for start_ms, end_ms, _alerts_verified in self.supervised_windows
+        )
 
     def _render_report(self, *, complete: bool, reasons: tuple[str, ...]) -> str:
         decision = "COMPLETE" if complete else "INCOMPLETE"
@@ -430,38 +443,6 @@ class RiskEvaluation:
     historical_stress: StressEvaluation | None = None
     testnet_stress: StressEvaluation | None = None
 
-    @classmethod
-    def safe_baseline(cls, rules: str) -> RiskEvaluation:
-        """Build a configuration-shaped baseline; it is not promotion evidence."""
-        return cls(
-            position_risk=INITIAL_POSITION_RISK,
-            candidate_rules_sha256=rules,
-            net_expectancy=Decimal("0.5"),
-            max_daily_loss=Decimal("0.01"),
-            max_drawdown=Decimal("0.05"),
-            notional_fraction=MAX_NOTIONAL_FRACTION,
-            cost_stress_passed=True,
-            operational_controls_passed=True,
-            concentration_passed=True,
-        )
-
-    @classmethod
-    def safe_promoted(
-        cls, rules: str, *, max_drawdown: Decimal = Decimal("0.08")
-    ) -> RiskEvaluation:
-        """Build a configuration-shaped trial; it is not promotion evidence."""
-        return cls(
-            position_risk=PROMOTED_POSITION_RISK,
-            candidate_rules_sha256=rules,
-            net_expectancy=Decimal("0.6"),
-            max_daily_loss=Decimal("0.015"),
-            max_drawdown=max_drawdown,
-            notional_fraction=MAX_NOTIONAL_FRACTION,
-            cost_stress_passed=True,
-            operational_controls_passed=True,
-            concentration_passed=True,
-        )
-
 
 @dataclass(frozen=True)
 class PromotedRiskResult:
@@ -502,8 +483,10 @@ class PromotedRiskGate:
             )
 
         reasons: list[str] = []
-        self._check_reference(promotion_artifact_key, "promotion evidence artifact", reasons)
-        self._check_reference(soak_report_key, "Testnet Soak report artifact", reasons)
+        self._check_promotion_reference(
+            promotion_artifact_key, candidate_identity, baseline.candidate_rules_sha256, reasons
+        )
+        self._check_soak_reference(soak_report_key, candidate_identity, reasons)
         self._check_limits(baseline, "baseline", reasons)
         self._check_limits(promoted, "promoted", reasons)
         if baseline.notional_fraction != promoted.notional_fraction:
@@ -531,9 +514,19 @@ class PromotedRiskGate:
         self._check_criteria(baseline, "baseline", reasons)
         self._check_criteria(promoted, "promoted", reasons)
         self._check_stress(
-            "historical", baseline.historical_stress, promoted.historical_stress, reasons
+            "historical",
+            candidate_identity,
+            baseline.historical_stress,
+            promoted.historical_stress,
+            reasons,
         )
-        self._check_stress("Testnet", baseline.testnet_stress, promoted.testnet_stress, reasons)
+        self._check_stress(
+            "Testnet",
+            candidate_identity,
+            baseline.testnet_stress,
+            promoted.testnet_stress,
+            reasons,
+        )
 
         manifest = {
             "manifest_version": 1,
@@ -543,6 +536,7 @@ class PromotedRiskGate:
             "soak_report_key": soak_report_key,
             "baseline": _json_evaluation(baseline),
             "promoted": _json_evaluation(promoted),
+            "comparison": _risk_comparison(baseline, promoted),
             "proven_baseline_risk": str(INITIAL_POSITION_RISK),
             "decision": "accepted" if not reasons else "rejected",
             "reasons": reasons,
@@ -599,11 +593,12 @@ class PromotedRiskGate:
         if not operational_controls_passed:
             reasons.append(f"{label} operational controls failed")
         if not concentration_passed:
-            reasons.append(f"{label} profit concentration failed")
+            reasons.append(f"{label} concentration criterion failed")
 
     def _check_stress(
         self,
         label: str,
+        candidate_identity: str,
         baseline: StressEvaluation | None,
         promoted: StressEvaluation | None,
         reasons: list[str],
@@ -616,7 +611,12 @@ class PromotedRiskGate:
         if promoted.net_expectancy <= 0:
             reasons.append(f"{label} 0.5% expectancy is not positive")
         for risk_label, result in (("baseline", baseline), ("promoted", promoted)):
-            self._check_stress_artifact(label, risk_label, result, reasons)
+            expected_risk = (
+                INITIAL_POSITION_RISK if risk_label == "baseline" else PROMOTED_POSITION_RISK
+            )
+            self._check_stress_artifact(
+                label, risk_label, result, candidate_identity, expected_risk, reasons
+            )
             self._check_metric_limits(
                 f"{label} {risk_label}", result.max_daily_loss, result.max_drawdown, reasons
             )
@@ -633,6 +633,8 @@ class PromotedRiskGate:
         label: str,
         risk_label: str,
         result: StressEvaluation,
+        candidate_identity: str,
+        expected_position_risk: Decimal,
         reasons: list[str],
     ) -> None:
         if not result.artifact_key or not result.artifact_sha256:
@@ -651,15 +653,91 @@ class PromotedRiskGate:
             return
         if hashlib.sha256(content).hexdigest() != expected:
             reasons.append(f"{label} {risk_label} stress artifact hash does not match")
-
-    def _check_reference(self, key: str | None, label: str, reasons: list[str]) -> None:
-        if not key:
-            reasons.append(f"{label} is required")
             return
         try:
-            self.store.read(key)
+            payload = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            reasons.append(f"{label} {risk_label} stress artifact is not valid JSON")
+            return
+        if not isinstance(payload, dict):
+            reasons.append(f"{label} {risk_label} stress artifact is not an object")
+            return
+        if payload.get("candidate_identity") != candidate_identity:
+            reasons.append(f"{label} {risk_label} stress artifact targets another candidate")
+            return
+        try:
+            artifact_risk = Decimal(str(payload["position_risk"]))
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            reasons.append(f"{label} {risk_label} stress artifact has no position risk")
+            return
+        if artifact_risk != expected_position_risk:
+            reasons.append(f"{label} {risk_label} stress artifact has the wrong position risk")
+            return
+        decimal_fields = {
+            "net_expectancy": result.net_expectancy,
+            "max_daily_loss": result.max_daily_loss,
+            "max_drawdown": result.max_drawdown,
+        }
+        for field, expected_metric in decimal_fields.items():
+            try:
+                actual_value = Decimal(str(payload[field]))
+            except (InvalidOperation, KeyError, TypeError, ValueError):
+                reasons.append(f"{label} {risk_label} stress artifact omits {field}")
+                return
+            if actual_value != expected_metric:
+                reasons.append(f"{label} {risk_label} stress artifact disagrees on {field}")
+                return
+        for field, expected_flag in {
+            "cost_stress_passed": result.cost_stress_passed,
+            "operational_controls_passed": result.operational_controls_passed,
+            "concentration_passed": result.concentration_passed,
+        }.items():
+            if payload.get(field) != expected_flag:
+                reasons.append(f"{label} {risk_label} stress artifact disagrees on {field}")
+                return
+
+    def _check_promotion_reference(
+        self,
+        key: str | None,
+        candidate_identity: str,
+        candidate_rules_sha256: str,
+        reasons: list[str],
+    ) -> None:
+        if not key:
+            reasons.append("promotion evidence artifact is required")
+            return
+        try:
+            content = self.store.read(key)
         except (KeyError, OSError):
-            reasons.append(f"{label} is unavailable")
+            reasons.append("promotion evidence artifact is unavailable")
+            return
+        try:
+            payload = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            reasons.append("promotion evidence artifact is not valid JSON")
+            return
+        if not isinstance(payload, dict):
+            reasons.append("promotion evidence artifact is not an object")
+            return
+        if (
+            payload.get("candidate_identity") != candidate_identity
+            or payload.get("candidate_rules_sha256") != candidate_rules_sha256
+        ):
+            reasons.append("promotion evidence artifact targets another candidate or ruleset")
+
+    def _check_soak_reference(
+        self, key: str | None, candidate_identity: str, reasons: list[str]
+    ) -> None:
+        if not key:
+            reasons.append("Testnet Soak report artifact is required")
+            return
+        try:
+            content = self.store.read(key).decode()
+        except (UnicodeDecodeError, KeyError, OSError):
+            reasons.append("Testnet Soak report artifact is unavailable")
+            return
+        if f"# Testnet Soak — {candidate_identity}" not in content:
+            reasons.append("Testnet Soak report artifact targets another candidate")
 
     @staticmethod
     def _render_report(
@@ -678,16 +756,16 @@ class PromotedRiskGate:
             f"Baseline expectancy: {baseline.net_expectancy}\n"
             f"Promoted expectancy: {promoted.net_expectancy}\n"
             "Compared evidence: historical stress, Testnet stress, cost stress, operational "
-            "controls, concentration, daily loss, drawdown, and notional cap.\n\n"
+            "controls, concentration criterion, daily loss, drawdown, and notional cap.\n\n"
             "Reasons:\n"
             f"{reason_lines}\n"
         )
 
 
 def _comparison_divergences(comparison: LiveReplayComparison) -> tuple[str, ...]:
-    if comparison.divergence is not None:
-        return (comparison.divergence,)
     divergences: list[str] = []
+    if comparison.divergence is not None:
+        divergences.append(comparison.divergence)
     if comparison.live_features != comparison.replay_features:
         divergences.append("feature values differ")
     if comparison.live_signal != comparison.replay_signal:
@@ -725,6 +803,58 @@ def _json_evaluation(evaluation: RiskEvaluation) -> dict[str, object]:
     if not isinstance(serialized, dict):
         raise TypeError("risk evaluation serialization must be an object")
     return serialized
+
+
+def _risk_comparison(baseline: RiskEvaluation, promoted: RiskEvaluation) -> dict[str, object]:
+    return {
+        "core": _metric_comparison(
+            baseline.net_expectancy,
+            promoted.net_expectancy,
+            baseline.max_daily_loss,
+            promoted.max_daily_loss,
+            baseline.max_drawdown,
+            promoted.max_drawdown,
+        ),
+        "historical_stress": _stress_comparison(
+            baseline.historical_stress, promoted.historical_stress
+        ),
+        "testnet_stress": _stress_comparison(baseline.testnet_stress, promoted.testnet_stress),
+    }
+
+
+def _stress_comparison(
+    baseline: StressEvaluation | None, promoted: StressEvaluation | None
+) -> dict[str, object] | None:
+    if baseline is None or promoted is None:
+        return None
+    return _metric_comparison(
+        baseline.net_expectancy,
+        promoted.net_expectancy,
+        baseline.max_daily_loss,
+        promoted.max_daily_loss,
+        baseline.max_drawdown,
+        promoted.max_drawdown,
+    ) | {
+        "cost_stress_changed": baseline.cost_stress_passed != promoted.cost_stress_passed,
+        "operational_controls_changed": baseline.operational_controls_passed
+        != promoted.operational_controls_passed,
+        "concentration_changed": baseline.concentration_passed != promoted.concentration_passed,
+    }
+
+
+def _metric_comparison(
+    baseline_expectancy: Decimal,
+    promoted_expectancy: Decimal,
+    baseline_daily_loss: Decimal,
+    promoted_daily_loss: Decimal,
+    baseline_drawdown: Decimal,
+    promoted_drawdown: Decimal,
+) -> dict[str, object]:
+    return {
+        "net_expectancy_delta": str(promoted_expectancy - baseline_expectancy),
+        "max_daily_loss_delta": str(promoted_daily_loss - baseline_daily_loss),
+        "max_drawdown_delta": str(promoted_drawdown - baseline_drawdown),
+    }
 
 
 def _json_value(value: object) -> object:

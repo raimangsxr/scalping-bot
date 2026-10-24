@@ -40,10 +40,10 @@ operational setting cannot silently drift from the soak contract.
 
 `PromotedRiskGate` requires a promoted 0.25% baseline and a completed soak before it evaluates
 0.5%. `RiskEvaluation` carries separate historical-stress and Testnet-stress evidence. The
-`safe_baseline` and `safe_promoted` helpers only build configuration-shaped test values and are
-not evidence. The gate requires the candidate rule hash, notional cap, daily-loss cap, drawdown cap, and risk-control
-policy to remain unchanged; it also rechecks risk, cost stress, operational controls, and profit
-concentration at both risk levels.
+Test fixtures may build configuration-shaped values, but they are not evidence. The gate requires
+the candidate rule hash, notional cap, daily-loss cap, drawdown cap, and risk-control
+policy to remain unchanged; it also rechecks risk, cost stress, operational controls, and the
+concentration criterion at both risk levels.
 
 Each decision is written as a separate immutable JSON manifest. The gate requires immutable
 promotion and Soak report references plus SHA-256-verified historical and Testnet stress

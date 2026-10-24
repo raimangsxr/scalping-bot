@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 from decimal import Decimal
+from typing import Protocol
 
 from scalping_bot.domain.events import (
     CandleClosed,
     EngineEvent,
+    EntryFillUpdated,
     ExitFillReceived,
     FillReceived,
     MarketTick,
@@ -15,6 +17,8 @@ from scalping_bot.domain.models import (
     AuditDecision,
     Command,
     EngineResult,
+    EntryProposal,
+    ExecutionCosts,
     ExitMarket,
     PlaceProtection,
     Position,
@@ -22,13 +26,23 @@ from scalping_bot.domain.models import (
 )
 from scalping_bot.domain.risk import position_quantity
 from scalping_bot.domain.state import InMemoryState
-from scalping_bot.strategies.momentum import MomentumPolicy
+
+
+class StrategyPolicy(Protocol):
+    def observe(self, event: CandleClosed) -> EntryProposal | None: ...
 
 
 class Engine:
-    def __init__(self, state: InMemoryState, policy: MomentumPolicy) -> None:
+    def __init__(
+        self,
+        state: InMemoryState,
+        policy: StrategyPolicy,
+        *,
+        execution_costs: ExecutionCosts | None = None,
+    ) -> None:
         self.state = state
         self.policy = policy
+        self.execution_costs = execution_costs or ExecutionCosts(commission_rate=Decimal(0))
 
     def handle(self, event: EngineEvent) -> EngineResult:
         if self.state.already_processed(event.event_id):
@@ -41,6 +55,8 @@ class Engine:
             self._handle_tick(event, commands, decisions)
         elif isinstance(event, FillReceived):
             self._handle_fill(event, commands, decisions)
+        elif isinstance(event, EntryFillUpdated):
+            self._handle_fill_update(event, commands, decisions)
         elif isinstance(event, ExitFillReceived):
             self._handle_exit_fill(event, decisions)
         elif isinstance(event, OperatorConfirmedNewDay):
@@ -133,6 +149,7 @@ class Engine:
         command = SubmitEntry(
             client_order_id=f"scalp-{identity}",
             candidate_version=proposal.candidate_version,
+            source_event_id=proposal.source_event_id,
             quantity=quantity,
             price_reference=event.price,
             invalidation_price=proposal.invalidation_price,
@@ -166,7 +183,7 @@ class Engine:
             return
         position = Position(
             candidate_version=entry.candidate_version,
-            source_event_id=_source_event(self.state, entry.client_order_id),
+            source_event_id=entry.source_event_id,
             entry_fill_id=event.event_id,
             entry_time_ms=event.event_time_ms,
             entry_price=event.price,
@@ -179,6 +196,7 @@ class Engine:
             parent_client_order_id=entry.client_order_id,
             quantity=event.quantity,
             stop_price=entry.invalidation_price,
+            take_profit_price=event.price + 2 * (event.price - entry.invalidation_price),
         )
         self.state.position = position
         self.state.pending_entry = None
@@ -209,7 +227,9 @@ class Engine:
         position = self.state.position
         if position is None or self.state.pending_exit is not None:
             return
-        estimated_close_commission = event.price * position.quantity * Decimal("0.001")
+        estimated_close_commission = self.execution_costs.estimated_close_cost(
+            event.price * position.quantity
+        )
         mark_equity = (
             self.state.current_equity
             + (event.price - position.entry_price) * position.quantity
@@ -252,6 +272,45 @@ class Engine:
                     "quantity": str(command.quantity),
                     "mark_equity": str(mark_equity),
                 },
+            )
+        )
+
+    def _handle_fill_update(
+        self,
+        event: EntryFillUpdated,
+        commands: list[Command],
+        decisions: list[AuditDecision],
+    ) -> None:
+        position = self.state.position
+        if position is None or event.cumulative_quantity <= position.quantity:
+            return
+        updated = Position(
+            candidate_version=position.candidate_version,
+            source_event_id=position.source_event_id,
+            entry_fill_id=position.entry_fill_id,
+            entry_time_ms=position.entry_time_ms,
+            entry_price=event.price,
+            quantity=event.cumulative_quantity,
+            invalidation_price=position.invalidation_price,
+            commission=event.cumulative_commission,
+            protected=False,
+        )
+        self.state.position = updated
+        commands.append(
+            PlaceProtection(
+                client_order_id=f"{event.client_order_id}-protect",
+                parent_client_order_id=event.client_order_id,
+                quantity=event.cumulative_quantity,
+                stop_price=position.invalidation_price,
+                take_profit_price=event.price + 2 * (event.price - position.invalidation_price),
+            )
+        )
+        decisions.append(
+            AuditDecision(
+                event_id=event.event_id,
+                event_time_ms=event.event_time_ms,
+                kind="entry-fill-updated",
+                details={"cumulative_quantity": str(event.cumulative_quantity)},
             )
         )
 
@@ -304,13 +363,3 @@ class Engine:
                 details={"utc_day": event.utc_day},
             )
         )
-
-
-def _source_event(state: InMemoryState, client_order_id: str) -> str:
-    for decision in reversed(state.audit):
-        if (
-            decision.kind == "entry-submitted"
-            and decision.details.get("client_order_id") == client_order_id
-        ):
-            return str(decision.details["source_event_id"])
-    raise RuntimeError("entry intent has no source event")

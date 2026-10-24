@@ -40,6 +40,7 @@ def test_only_prior_gate_passers_receive_a_single_holdout_reveal(tmp_path: Path)
         net_expectancy=Decimal("0.8"),
         baseline=Decimal("0.1"),
     )
+    fold_count = len(EvidenceProtocol().walk_forward_folds())
     trades = tuple(
         ScalpResult(
             scalp_id=f"s-{index}",
@@ -50,11 +51,21 @@ def test_only_prior_gate_passers_receive_a_single_holdout_reveal(tmp_path: Path)
             quantity=Decimal("1"),
             gross_pnl=Decimal("1"),
             costs=Decimal("0.2"),
-            fold=index % 10,
+            fold=index % fold_count,
         )
         for index in range(300)
     )
-    evidence = EvidenceProtocol().evaluate(trades, initial_equity=Decimal("10000"), attempts=8)
+    evidence = EvidenceProtocol().evaluate(
+        trades,
+        initial_equity=Decimal("10000"),
+        attempts=8,
+        cost_stress_multipliers=(Decimal("1"), Decimal("1.5"), Decimal("2")),
+        cost_scenario_trades={
+            Decimal("1"): trades,
+            Decimal("1.5"): trades,
+            Decimal("2"): trades,
+        },
+    )
 
     review = BatchCloser(HoldoutRegistry(LocalObjectStore(tmp_path))).close(
         batch, ledger=ledger, evidence={candidate.identity: evidence}

@@ -4,6 +4,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 
+from scalping_bot.domain.costs import ExecutionCosts
+
+__all__ = [
+    "AuditDecision",
+    "Command",
+    "EngineResult",
+    "EntryProposal",
+    "ExecutionCosts",
+    "ExitMarket",
+    "PlaceProtection",
+    "Position",
+    "SubmitEntry",
+]
+
 
 @dataclass(frozen=True)
 class EntryProposal:
@@ -30,6 +44,7 @@ class AuditDecision:
 class SubmitEntry:
     client_order_id: str
     candidate_version: str
+    source_event_id: str
     quantity: Decimal
     price_reference: Decimal
     invalidation_price: Decimal
@@ -42,6 +57,7 @@ class PlaceProtection:
     parent_client_order_id: str
     quantity: Decimal
     stop_price: Decimal
+    take_profit_price: Decimal
 
 
 @dataclass(frozen=True)

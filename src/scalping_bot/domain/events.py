@@ -16,6 +16,10 @@ class CandleClosed(Event):
     low: Decimal
     close: Decimal
     complete: bool
+    volume: Decimal = Decimal(0)
+    buy_volume: Decimal = Decimal(0)
+    sell_volume: Decimal = Decimal(0)
+    trade_count: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -33,6 +37,15 @@ class FillReceived(Event):
 
 
 @dataclass(frozen=True, kw_only=True)
+class EntryFillUpdated(Event):
+    client_order_id: str
+    price: Decimal
+    cumulative_quantity: Decimal
+    cumulative_commission: Decimal
+    commission_asset: str
+
+
+@dataclass(frozen=True, kw_only=True)
 class ExitFillReceived(Event):
     client_order_id: str
     price: Decimal
@@ -45,4 +58,11 @@ class OperatorConfirmedNewDay(Event):
     utc_day: int
 
 
-EngineEvent = CandleClosed | MarketTick | FillReceived | ExitFillReceived | OperatorConfirmedNewDay
+EngineEvent = (
+    CandleClosed
+    | MarketTick
+    | FillReceived
+    | EntryFillUpdated
+    | ExitFillReceived
+    | OperatorConfirmedNewDay
+)

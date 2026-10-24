@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 from scalping_bot.research.candidates import CandidateBatch
 from scalping_bot.research.evidence import (
@@ -86,6 +87,10 @@ class BatchCloser:
                 )
             )
             if prior is not None:
+                required_costs = {Decimal("1"), Decimal("1.5"), Decimal("2")}
+                costs_evidenced = required_costs.issubset(
+                    prior.cost_stress_multipliers
+                ) and required_costs.issubset(prior.cost_scenario_metrics)
                 detail_lines.extend(
                     (
                         f"### {candidate.identity}",
@@ -93,7 +98,7 @@ class BatchCloser:
                         f"- Aggregate-trade fidelity: "
                         f"{'verified' if prior.metrics.trade_count else 'not evidenced'}",
                         f"- Calibrated/stressed costs represented: "
-                        f"{'yes' if prior.metrics.trade_count else 'no'}",
+                        f"{'yes' if costs_evidenced else 'no'}",
                         f"- Risk gates: {'pass' if prior.promoted else 'fail or incomplete'}",
                         f"- Concentration: {'fail' if prior.concentration_failed else 'pass'}",
                         f"- Decision: {decision}",

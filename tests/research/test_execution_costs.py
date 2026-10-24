@@ -14,7 +14,7 @@ from scalping_bot.research.costs import (
     CalibrationObservation,
     ExecutionCostCalibrator,
 )
-from scalping_bot.research.execution import AggTrade, AggTradeExecution, ConfirmedSignal
+from scalping_bot.research.execution import AggTrade, AggTradeReplay
 
 
 def test_official_aggtrades_are_immutable_validated_and_manifested(tmp_path: Path) -> None:
@@ -82,24 +82,16 @@ def test_execution_cost_model_is_calibrated_by_size_hour_and_volatility() -> Non
 
 
 def test_aggregate_trade_execution_waits_for_post_confirmation_trade() -> None:
-    signal = ConfirmedSignal(
-        confirmed_ms=1_000,
-        side="buy",
-        stop_price=Decimal("99"),
-        take_profit_price=Decimal("102"),
-    )
     trades = (
         AggTrade(1, 1_000, Decimal("100"), Decimal("1"), buyer_maker=False),
         AggTrade(2, 1_001, Decimal("100.10"), Decimal("1"), buyer_maker=False),
         AggTrade(3, 1_002, Decimal("102"), Decimal("1"), buyer_maker=True),
     )
 
-    execution = AggTradeExecution().execute(signal, trades)
+    events = AggTradeReplay().events_after(1_000, trades)
 
-    assert execution.entry_trade_id == 2
-    assert execution.entry_price == Decimal("100.10")
-    assert execution.exit_trade_id == 3
-    assert execution.exit_reason == "take-profit"
+    assert [event.event_id for event in events] == ["aggTrade-2", "aggTrade-3"]
+    assert events[0].price == Decimal("100.10")
 
 
 def test_out_of_order_aggregate_trades_are_rejected() -> None:
@@ -108,6 +100,4 @@ def test_out_of_order_aggregate_trades_are_rejected() -> None:
         AggTrade(1, 1_000, Decimal("99"), Decimal("1"), buyer_maker=True),
     )
     with pytest.raises(ValueError, match="chronological"):
-        AggTradeExecution().execute(
-            ConfirmedSignal(999, "buy", Decimal("98"), Decimal("101")), trades
-        )
+        AggTradeReplay().events_after(999, trades)

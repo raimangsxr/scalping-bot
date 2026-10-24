@@ -82,6 +82,7 @@ def test_walk_forward_folds_are_twelve_development_then_three_unseen_months() ->
 
 
 def test_daily_block_bootstrap_and_concentration_feed_promotion_decision() -> None:
+    fold_count = len(EvidenceProtocol().walk_forward_folds())
     trades = tuple(
         ScalpResult(
             scalp_id=f"s-{index}",
@@ -92,11 +93,21 @@ def test_daily_block_bootstrap_and_concentration_feed_promotion_decision() -> No
             quantity=Decimal("1"),
             gross_pnl=Decimal("1"),
             costs=Decimal("0.20"),
-            fold=index % 10,
+            fold=index % fold_count,
         )
         for index in range(300)
     )
-    result = EvidenceProtocol().evaluate(trades, initial_equity=Decimal("10000"), attempts=8)
+    result = EvidenceProtocol().evaluate(
+        trades,
+        initial_equity=Decimal("10000"),
+        attempts=8,
+        cost_stress_multipliers=(Decimal("1"), Decimal("1.5"), Decimal("2")),
+        cost_scenario_trades={
+            Decimal("1"): trades,
+            Decimal("1.5"): trades,
+            Decimal("2"): trades,
+        },
+    )
 
     assert result.metrics.trade_count == 300
     assert result.metrics.expectancy == Decimal("0.80")

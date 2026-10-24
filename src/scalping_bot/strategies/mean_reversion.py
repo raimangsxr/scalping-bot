@@ -30,7 +30,10 @@ class RegimeVwapPolicy:
         self.deviation = deviation
         self._history: deque[_VolumeBar] = deque(maxlen=window)
 
-    def observe(self, event: CandleClosed, *, volume: Decimal) -> EntryProposal | None:
+    def observe(
+        self, event: CandleClosed, *, volume: Decimal | None = None
+    ) -> EntryProposal | None:
+        volume = event.volume if volume is None else volume
         if not event.complete or volume <= 0:
             return None
         proposal: EntryProposal | None = None

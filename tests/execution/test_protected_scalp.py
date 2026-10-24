@@ -1,21 +1,43 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
-from scalping_bot.domain.models import SubmitEntry
-from scalping_bot.execution.executor import ExecutionService, OrderResult
+import pytest
+
+from scalping_bot.domain.models import PlaceProtection, SubmitEntry
+from scalping_bot.execution.executor import (
+    ExecutionFill,
+    ExecutionLimits,
+    ExecutionService,
+    OrderResult,
+)
 from scalping_bot.execution.sqlite_state import SQLiteState
+from scalping_bot.operations.safety import OperationalMode
+
+LIMITS = ExecutionLimits(step_size=Decimal("0.00001"), min_notional=Decimal("5"))
 
 
 def _entry() -> SubmitEntry:
     return SubmitEntry(
         client_order_id="scalp-deterministic-1",
         candidate_version="momentum-v1",
+        source_event_id="candle-1",
         quantity=Decimal("0.01000"),
         price_reference=Decimal("90000"),
         invalidation_price=Decimal("89500"),
         rationale={"condition": "test"},
+    )
+
+
+def _protection(quantity: str = "0.01000") -> PlaceProtection:
+    return PlaceProtection(
+        client_order_id="scalp-deterministic-1-protect",
+        parent_client_order_id="scalp-deterministic-1",
+        quantity=Decimal(quantity),
+        stop_price=Decimal("89500"),
+        take_profit_price=Decimal("91030"),
     )
 
 
@@ -28,7 +50,11 @@ class FakeExecutionExchange:
         self.query_result = OrderResult(
             status="FILLED",
             exchange_order_id="42",
-            fills=(("fill-1", "90010", "0.01000", "0.90", "USDT"),),
+            fills=(
+                ExecutionFill(
+                    "fill-1", Decimal("90010"), Decimal("0.01000"), Decimal("0.90"), "USDT"
+                ),
+            ),
         )
 
     def submit_market_buy(self, *, client_order_id: str, quantity: str) -> OrderResult:
@@ -60,7 +86,11 @@ class FakeExecutionExchange:
         return OrderResult(
             status="FILLED",
             exchange_order_id="44",
-            fills=(("flatten-fill", "89900", quantity, "0.90", "USDT"),),
+            fills=(
+                ExecutionFill(
+                    "flatten-fill", Decimal("89900"), Decimal(quantity), Decimal("0.90"), "USDT"
+                ),
+            ),
         )
 
 
@@ -71,13 +101,16 @@ def test_intent_is_durable_before_submission_and_complete_scalp_is_auditable(
     state.set_entries_allowed(True)
     exchange = FakeExecutionExchange(state)
     try:
-        result = ExecutionService(state, exchange).submit_entry(_entry(), event_time_ms=100)
+        service = ExecutionService(state, exchange, LIMITS)
+        result = service.submit_entry(_entry(), event_time_ms=100)
+        service.place_protection(_protection(), event_time_ms=101)
 
         assert result.status == "FILLED"
         assert exchange.actions == ["submit", "protect:0.01000"]
         assert state.order_intent("scalp-deterministic-1")["status"] == "PROTECTED"
         trace = state.reconstruct_order("scalp-deterministic-1")
         assert trace["intent"]["candidate_version"] == "momentum-v1"
+        assert trace["intent"]["source_event_id"] == "candle-1"
         assert trace["fills"][0]["fill_id"] == "fill-1"
         assert trace["fills"][0]["commission"] == "0.90"
         assert trace["protection"]["exchange_order_id"] == "protection-1"
@@ -91,7 +124,9 @@ def test_timeout_becomes_unknown_and_is_queried_before_any_retry(tmp_path: Path)
     exchange = FakeExecutionExchange(state)
     exchange.timeout_after_submit = True
     try:
-        result = ExecutionService(state, exchange).submit_entry(_entry(), event_time_ms=100)
+        service = ExecutionService(state, exchange, LIMITS)
+        result = service.submit_entry(_entry(), event_time_ms=100)
+        service.place_protection(_protection(), event_time_ms=101)
 
         assert result.status == "FILLED"
         assert exchange.actions == ["submit", "query", "protect:0.01000"]
@@ -109,10 +144,16 @@ def test_partial_fill_is_accounted_and_only_executed_quantity_is_protected(tmp_p
     exchange.query_result = OrderResult(
         status="PARTIALLY_FILLED",
         exchange_order_id="42",
-        fills=(("fill-partial", "90010", "0.00400", "0.36", "USDT"),),
+        fills=(
+            ExecutionFill(
+                "fill-partial", Decimal("90010"), Decimal("0.00400"), Decimal("0.36"), "USDT"
+            ),
+        ),
     )
     try:
-        ExecutionService(state, exchange).submit_entry(_entry(), event_time_ms=100)
+        service = ExecutionService(state, exchange, LIMITS)
+        service.submit_entry(_entry(), event_time_ms=100)
+        service.place_protection(_protection("0.00400"), event_time_ms=101)
 
         assert exchange.actions == ["submit", "protect:0.00400"]
         assert state.order_intent("scalp-deterministic-1")["executed_quantity"] == "0.00400"
@@ -126,11 +167,37 @@ def test_protection_failure_flattens_actual_fill_and_locks_entries(tmp_path: Pat
     exchange = FakeExecutionExchange(state)
     exchange.protection_fails = True
     try:
-        ExecutionService(state, exchange).submit_entry(_entry(), event_time_ms=100)
+        service = ExecutionService(state, exchange, LIMITS)
+        service.submit_entry(_entry(), event_time_ms=100)
+        service.place_protection(_protection(), event_time_ms=101)
 
         assert exchange.actions == ["submit", "protect:0.01000", "flatten:0.01000"]
-        assert state.operating_mode == "FLATTEN_AND_LOCK"
+        assert state.operating_mode is OperationalMode.FLATTEN_AND_LOCK
         assert not state.entries_allowed
         assert "protection-failed" in state.audit_kinds()
+    finally:
+        state.close()
+
+
+def test_dynamic_filters_normalize_quantity_and_reject_sub_notional_entries(
+    tmp_path: Path,
+) -> None:
+    state = SQLiteState(tmp_path / "state.db")
+    state.set_entries_allowed(True)
+    exchange = FakeExecutionExchange(state)
+    try:
+        command = _entry()
+        normalized = replace(command, quantity=Decimal("0.010009"))
+        ExecutionService(state, exchange, LIMITS).submit_entry(normalized, event_time_ms=100)
+        assert state.order_intent(command.client_order_id)["quantity"] == "0.01000"
+
+        too_small = replace(
+            command,
+            client_order_id="scalp-too-small",
+            quantity=Decimal("0.00001"),
+            price_reference=Decimal("100"),
+        )
+        with pytest.raises(ValueError, match="filters"):
+            ExecutionService(state, exchange, LIMITS).submit_entry(too_small, event_time_ms=101)
     finally:
         state.close()

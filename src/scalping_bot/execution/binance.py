@@ -17,7 +17,7 @@ from binance_sdk_spot.rest_api.models.enums import (
 )
 from binance_sdk_spot.spot import Spot
 
-from scalping_bot.execution.executor import OrderResult
+from scalping_bot.execution.executor import ExecutionFill, OrderResult
 
 TESTNET_HOST = "testnet.binance.vision"
 
@@ -55,6 +55,8 @@ class SpotTransport(Protocol):
     def flatten_market_sell(
         self, symbol: str, client_order_id: str, quantity: str
     ) -> OrderResult: ...
+
+    def cancel_protection(self, symbol: str, client_order_id: str) -> None: ...
 
 
 class OfficialSpotTransport:
@@ -157,6 +159,11 @@ class OfficialSpotTransport:
         )
         return _order_result(response)
 
+    def cancel_protection(self, symbol: str, client_order_id: str) -> None:
+        self._client.delete_order_list(
+            symbol=symbol, list_client_order_id=client_order_id, recv_window=5000
+        ).data()
+
 
 @dataclass(frozen=True)
 class BinanceCapabilities:
@@ -164,6 +171,9 @@ class BinanceCapabilities:
     order_types: tuple[str, ...]
     step_size: str
     min_notional: str
+    tick_size: str
+    max_quantity: str
+    max_notional: str
     maker_commission: str
     taker_commission: str
     request_weight_limit: int
@@ -211,14 +221,22 @@ class BinanceSpotTestnetAdapter:
             order_types=tuple(str(item) for item in symbol["orderTypes"]),
             step_size=str(filters["LOT_SIZE"]["stepSize"]),
             min_notional=str(filters["NOTIONAL"]["minNotional"]),
+            tick_size=str(filters["PRICE_FILTER"]["tickSize"]),
+            max_quantity=str(filters.get("MARKET_LOT_SIZE", filters["LOT_SIZE"])["maxQty"]),
+            max_notional=str(filters["NOTIONAL"].get("maxNotional", "0")),
             maker_commission=str(standard["maker"]),
             taker_commission=str(standard["taker"]),
             request_weight_limit=weight,
         )
 
+    def cancel_protection(self, *, client_order_id: str) -> None:
+        self.transport.cancel_protection(self.symbol, client_order_id)
+
     def reconciliation_snapshot(self) -> dict[str, object]:
+        account = self.transport.account()
         return {
-            "account": self.transport.account(),
+            "account": account,
+            "balances": account.get("balances", []),
             "open_orders": self.transport.open_orders(self.symbol),
             "trades": self.transport.trades(self.symbol),
         }
@@ -274,18 +292,18 @@ def _order_result(response: dict[str, object]) -> OrderResult:
     raw_fills = response.get("fills", [])
     if not isinstance(raw_fills, list):
         raise ValueError("Binance order fills are malformed")
-    fills: list[tuple[str, str, str, str, str]] = []
+    fills: list[ExecutionFill] = []
     for index, raw in enumerate(raw_fills):
         if not isinstance(raw, dict):
             raise ValueError("Binance order fill is malformed")
         fill_id = raw.get("id", raw.get("tradeId", raw.get("trade_id", index)))
         fills.append(
-            (
-                str(fill_id),
-                str(_field(raw, "price")),
-                str(_field(raw, "qty", "quantity")),
-                str(_field(raw, "commission")),
-                str(_field(raw, "commissionAsset", "commission_asset")),
+            ExecutionFill(
+                fill_id=str(fill_id),
+                price=Decimal(str(_field(raw, "price"))),
+                quantity=Decimal(str(_field(raw, "qty", "quantity"))),
+                commission=Decimal(str(_field(raw, "commission"))),
+                commission_asset=str(_field(raw, "commissionAsset", "commission_asset")),
             )
         )
     return OrderResult(

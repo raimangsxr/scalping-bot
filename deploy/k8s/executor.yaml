@@ -67,12 +67,35 @@ spec:
                 secretKeyRef:
                   name: scalping-bot-secrets
                   key: backup-encryption-key
+            - name: SCALPING_CANDIDATE_MANIFEST
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: candidate-manifest-path
+            - name: SCALPING_CALIBRATED_HALF_SPREAD_RATE
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: calibrated-half-spread-rate
+            - name: SCALPING_CALIBRATED_SLIPPAGE_RATE
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: calibrated-slippage-rate
+            - name: SCALPING_COST_MODEL_SNAPSHOT
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: cost-model-snapshot
           ports:
             - name: metrics
               containerPort: 8000
           volumeMounts:
             - name: state
               mountPath: /app/state
+            - name: candidate-manifest
+              mountPath: /run/scalping-candidate
+              readOnly: true
           readinessProbe:
             exec:
               command: ["python", "-m", "scalping_bot.health", "/app/state/scalping-bot.db"]
@@ -93,6 +116,10 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: candidate-manifest
+          secret:
+            secretName: scalping-bot-candidate-manifest
   volumeClaimTemplates:
     - metadata:
         name: state

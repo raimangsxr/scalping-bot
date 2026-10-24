@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from decimal import Decimal
+from itertools import pairwise
 
 from scalping_bot.data.storage import ObjectStore
 
@@ -88,6 +89,11 @@ class LiveShadowGate:
             reasons.append(f"unresolved divergences: {', '.join(sorted(unresolved))}")
         if not self.comparisons:
             reasons.append("no live/replay comparisons were recorded")
+        else:
+            observation_times = [item.event_time_ms for item in self.comparisons]
+            boundaries = [self.started_ms, *observation_times, now_ms]
+            if any(current - previous > DAY_MS for previous, current in pairwise(boundaries)):
+                reasons.append("Live Shadow has an unobserved calendar-day gap")
         approved = not reasons
         report = (
             f"# Live Shadow — {self.candidate_identity}\n\n"
@@ -113,6 +119,7 @@ class SoakGate:
         self.continuous_started_ms: int | None = None
         self.last_critical_incident_ms: int | None = None
         self.scalps = 0
+        self.scalp_times: list[int] = []
         self.safety_failures = 0
         self.testnet_pnl = Decimal(0)
 
@@ -133,7 +140,11 @@ class SoakGate:
         reconciled: bool,
         testnet_pnl: Decimal,
     ) -> None:
-        del event_time_ms
+        if self.continuous_started_ms is None or event_time_ms < self.continuous_started_ms:
+            raise ValueError("scalps count only after continuous operation is admitted")
+        if self.scalp_times and event_time_ms <= self.scalp_times[-1]:
+            raise ValueError("soak scalps must be chronological")
+        self.scalp_times.append(event_time_ms)
         self.scalps += 1
         self.testnet_pnl += testnet_pnl
         if not protected or duplicate_order or not reconciled:
@@ -158,6 +169,11 @@ class SoakGate:
             reasons.append("continuous operation was not admitted after supervised stability")
         if self.safety_failures:
             reasons.append("unprotected, duplicate, or unreconciled execution was observed")
+        if self.scalp_times and (
+            self.scalp_times[0] - self.started_ms > 8 * DAY_MS
+            or self.scalp_times[-1] < self.started_ms + 30 * DAY_MS
+        ):
+            reasons.append("executed scalp evidence does not span the thirty-day soak")
         complete = not reasons
         report = (
             f"# Testnet Soak — {self.candidate_identity}\n\n"

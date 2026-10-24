@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     backup_encryption_key: str | None = None
     state_path: Path = Path("state/scalping-bot.db")
     position_risk: str = "0.0025"
+    candidate_manifest: Path | None = None
+    initial_equity: str = "10000"
+    calibrated_half_spread_rate: str | None = None
+    calibrated_slippage_rate: str | None = None
+    cost_model_snapshot: str | None = None
 
     @model_validator(mode="after")
     def validate_safe_scope(self) -> Self:

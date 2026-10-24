@@ -3,8 +3,13 @@ from __future__ import annotations
 import fcntl
 import json
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+from scalping_bot.domain.models import Position
+from scalping_bot.domain.state import InMemoryState
+from scalping_bot.operations.safety import OperationalMode
 
 
 class WriterAlreadyActive(RuntimeError):
@@ -73,6 +78,40 @@ MIGRATIONS = (
         created_ms INTEGER NOT NULL
     );
     """,
+    """
+    ALTER TABLE order_intents ADD COLUMN source_event_id TEXT;
+    CREATE TABLE positions (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        candidate_version TEXT NOT NULL,
+        source_event_id TEXT NOT NULL,
+        entry_fill_id TEXT NOT NULL,
+        entry_time_ms INTEGER NOT NULL,
+        entry_price TEXT NOT NULL,
+        quantity TEXT NOT NULL,
+        invalidation_price TEXT NOT NULL,
+        commission TEXT NOT NULL,
+        protected INTEGER NOT NULL CHECK (protected IN (0, 1)),
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE circuit_breakers (
+        kind TEXT PRIMARY KEY,
+        active INTEGER NOT NULL CHECK (active IN (0, 1)),
+        triggered_ms INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        operator_confirmation_required INTEGER NOT NULL CHECK (
+            operator_confirmation_required IN (0, 1)
+        )
+    );
+    """,
+    """
+    ALTER TABLE runtime_state ADD COLUMN current_equity TEXT;
+    ALTER TABLE runtime_state ADD COLUMN high_water_mark TEXT;
+    ALTER TABLE runtime_state ADD COLUMN day_open_equity TEXT;
+    ALTER TABLE runtime_state ADD COLUMN utc_day INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE runtime_state ADD COLUMN daily_locked INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE runtime_state ADD COLUMN drawdown_locked INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE runtime_state ADD COLUMN operator_confirmed_day INTEGER;
+    """,
 )
 
 
@@ -129,16 +168,16 @@ class SQLiteState:
         )
 
     @property
-    def operating_mode(self) -> str:
+    def operating_mode(self) -> OperationalMode:
         row = self.connection.execute(
             "SELECT operating_mode FROM runtime_state WHERE singleton = 1"
         ).fetchone()
-        return str(row[0])
+        return OperationalMode(str(row[0]))
 
-    def set_operating_mode(self, mode: str) -> None:
+    def set_operating_mode(self, mode: OperationalMode) -> None:
         self.connection.execute(
             "UPDATE runtime_state SET operating_mode = ?, entries_allowed = 0 WHERE singleton = 1",
-            (mode,),
+            (mode.value,),
         )
 
     def pragma(self, name: str) -> str | int:
@@ -165,11 +204,13 @@ class SQLiteState:
         status: str,
         created_ms: int,
         candidate_version: str | None = None,
+        source_event_id: str | None = None,
         invalidation_price: str | None = None,
     ) -> None:
         self.connection.execute(
             "INSERT INTO order_intents(client_order_id, side, quantity, status, created_ms, "
-            "candidate_version, invalidation_price) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "candidate_version, source_event_id, invalidation_price) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 client_order_id,
                 side,
@@ -177,6 +218,7 @@ class SQLiteState:
                 status,
                 created_ms,
                 candidate_version,
+                source_event_id,
                 invalidation_price,
             ),
         )
@@ -241,7 +283,8 @@ class SQLiteState:
         created_ms: int,
     ) -> None:
         self.connection.execute(
-            "INSERT INTO protections(client_order_id, entry_client_order_id, exchange_order_id, "
+            "INSERT OR REPLACE INTO protections(client_order_id, entry_client_order_id, "
+            "exchange_order_id, "
             "quantity, stop_price, take_profit_price, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 client_order_id,
@@ -253,6 +296,140 @@ class SQLiteState:
                 created_ms,
             ),
         )
+
+    def protection(self, entry_client_order_id: str) -> dict[str, object] | None:
+        row = self.connection.execute(
+            "SELECT * FROM protections WHERE entry_client_order_id = ?",
+            (entry_client_order_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def upsert_position(
+        self,
+        *,
+        candidate_version: str,
+        source_event_id: str,
+        entry_fill_id: str,
+        entry_time_ms: int,
+        entry_price: str,
+        quantity: str,
+        invalidation_price: str,
+        commission: str,
+        protected: bool,
+    ) -> None:
+        self.connection.execute(
+            "INSERT OR REPLACE INTO positions(singleton, candidate_version, source_event_id, "
+            "entry_fill_id, entry_time_ms, entry_price, quantity, invalidation_price, commission, "
+            "protected) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                candidate_version,
+                source_event_id,
+                entry_fill_id,
+                entry_time_ms,
+                entry_price,
+                quantity,
+                invalidation_price,
+                commission,
+                int(protected),
+            ),
+        )
+
+    def position(self) -> dict[str, object] | None:
+        row = self.connection.execute("SELECT * FROM positions WHERE singleton = 1").fetchone()
+        return dict(row) if row is not None else None
+
+    def position_entry_client_order_id(self) -> str:
+        row = self.connection.execute(
+            "SELECT f.client_order_id FROM positions p "
+            "JOIN fills f ON f.fill_id = p.entry_fill_id WHERE p.singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise LookupError("no durable open position")
+        return str(row[0])
+
+    def mark_position_protected(self) -> None:
+        self.connection.execute("UPDATE positions SET protected = 1 WHERE singleton = 1")
+
+    def clear_position(self) -> None:
+        self.connection.execute("DELETE FROM positions WHERE singleton = 1")
+
+    def set_circuit_breaker(
+        self,
+        *,
+        kind: str,
+        active: bool,
+        triggered_ms: int,
+        reason: str,
+        operator_confirmation_required: bool,
+    ) -> None:
+        self.connection.execute(
+            "INSERT OR REPLACE INTO circuit_breakers(kind, active, triggered_ms, reason, "
+            "operator_confirmation_required) VALUES (?, ?, ?, ?, ?)",
+            (kind, int(active), triggered_ms, reason, int(operator_confirmation_required)),
+        )
+
+    def persist_engine_state(self, state: InMemoryState, *, event_time_ms: int) -> None:
+        self.connection.execute(
+            "UPDATE runtime_state SET current_equity = ?, high_water_mark = ?, "
+            "day_open_equity = ?, utc_day = ?, daily_locked = ?, drawdown_locked = ?, "
+            "operator_confirmed_day = ? WHERE singleton = 1",
+            (
+                str(state.current_equity),
+                str(state.high_water_mark),
+                str(state.day_open_equity),
+                state.utc_day,
+                int(state.daily_locked),
+                int(state.drawdown_locked),
+                state.operator_confirmed_day,
+            ),
+        )
+        self.set_circuit_breaker(
+            kind="daily-loss",
+            active=state.daily_locked,
+            triggered_ms=event_time_ms,
+            reason="daily loss threshold",
+            operator_confirmation_required=True,
+        )
+        self.set_circuit_breaker(
+            kind="drawdown",
+            active=state.drawdown_locked,
+            triggered_ms=event_time_ms,
+            reason="maximum drawdown threshold",
+            operator_confirmation_required=True,
+        )
+
+    def restore_engine_state(self, *, initial_equity: str) -> InMemoryState:
+        state = InMemoryState(initial_equity=Decimal(initial_equity))
+        row = self.connection.execute(
+            "SELECT current_equity, high_water_mark, day_open_equity, utc_day, daily_locked, "
+            "drawdown_locked, operator_confirmed_day FROM runtime_state WHERE singleton = 1"
+        ).fetchone()
+        if row is not None and row["current_equity"] is not None:
+            state.current_equity = Decimal(str(row["current_equity"]))
+            state.high_water_mark = Decimal(str(row["high_water_mark"]))
+            state.day_open_equity = Decimal(str(row["day_open_equity"]))
+            state.utc_day = int(row["utc_day"])
+            state.daily_locked = bool(row["daily_locked"])
+            state.drawdown_locked = bool(row["drawdown_locked"])
+            state.operator_confirmed_day = (
+                int(row["operator_confirmed_day"])
+                if row["operator_confirmed_day"] is not None
+                else None
+            )
+        position = self.position()
+        if position is not None:
+            state.position = Position(
+                candidate_version=str(position["candidate_version"]),
+                source_event_id=str(position["source_event_id"]),
+                entry_fill_id=str(position["entry_fill_id"]),
+                entry_time_ms=int(str(position["entry_time_ms"])),
+                entry_price=Decimal(str(position["entry_price"])),
+                quantity=Decimal(str(position["quantity"])),
+                invalidation_price=Decimal(str(position["invalidation_price"])),
+                commission=Decimal(str(position["commission"])),
+                protected=bool(position["protected"]),
+            )
+        return state
 
     def audit_kinds(self) -> tuple[str, ...]:
         rows = self.connection.execute("SELECT kind FROM audit_events ORDER BY id").fetchall()
@@ -281,9 +458,42 @@ class SQLiteState:
     def active_intents(self) -> tuple[dict[str, object], ...]:
         rows = self.connection.execute(
             "SELECT client_order_id, side, quantity, status, created_ms, exchange_order_id "
-            "FROM order_intents WHERE status NOT IN ('FILLED', 'CANCELED', 'REJECTED')"
+            "FROM order_intents WHERE status NOT IN "
+            "('FILLED', 'CANCELED', 'REJECTED', 'FLATTENED_LOCKED', 'CLOSED')"
         ).fetchall()
         return tuple(dict(row) for row in rows)
+
+    def reconciliation_intents(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            intent
+            for intent in self.active_intents()
+            if intent["status"] in {"SUBMITTING", "UNKNOWN", "PARTIALLY_FILLED"}
+        )
+
+    def partial_entry_intents(self) -> tuple[dict[str, object], ...]:
+        rows = self.connection.execute(
+            "SELECT * FROM order_intents WHERE side = 'BUY' AND status = 'PARTIALLY_FILLED'"
+        ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def fill_ids(self) -> frozenset[str]:
+        rows = self.connection.execute("SELECT fill_id FROM fills").fetchall()
+        return frozenset(str(row[0]) for row in rows)
+
+    def exchange_orders(self) -> dict[str, str]:
+        rows = self.connection.execute(
+            "SELECT exchange_order_id, client_order_id FROM order_intents "
+            "WHERE exchange_order_id IS NOT NULL"
+        ).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows}
+
+    def active_protection_ids(self) -> frozenset[str]:
+        rows = self.connection.execute(
+            "SELECT exchange_order_id FROM protections "
+            "WHERE entry_client_order_id IN "
+            "(SELECT client_order_id FROM order_intents WHERE status = 'PROTECTED')"
+        ).fetchall()
+        return frozenset(str(row[0]) for row in rows)
 
     def record_reconciliation(
         self,

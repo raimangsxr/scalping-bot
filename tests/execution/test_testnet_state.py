@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -28,8 +29,17 @@ class FakeTransport:
                     "status": "TRADING",
                     "orderTypes": ["MARKET", "LIMIT", "STOP_LOSS_LIMIT"],
                     "filters": [
-                        {"filterType": "LOT_SIZE", "stepSize": "0.00001000"},
-                        {"filterType": "NOTIONAL", "minNotional": "5.00000000"},
+                        {
+                            "filterType": "LOT_SIZE",
+                            "stepSize": "0.00001000",
+                            "maxQty": "100.00000000",
+                        },
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01000000"},
+                        {
+                            "filterType": "NOTIONAL",
+                            "minNotional": "5.00000000",
+                            "maxNotional": "1000000.00000000",
+                        },
                     ],
                 }
             ],
@@ -58,7 +68,7 @@ def test_sqlite_uses_durable_single_writer_settings_and_versioned_migrations(
         assert state.pragma("journal_mode") == "wal"
         assert state.pragma("foreign_keys") == 1
         assert state.pragma("synchronous") == 2
-        assert state.schema_version == 2
+        assert state.schema_version == 4
         with pytest.raises(WriterAlreadyActive):
             SQLiteState(path)
     finally:
@@ -79,6 +89,30 @@ def test_audit_rows_are_append_only(tmp_path: Path) -> None:
         state.close()
 
 
+def test_engine_risk_locks_and_equity_survive_restart(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    state = SQLiteState(path)
+    engine_state = state.restore_engine_state(initial_equity="10000")
+    engine_state.current_equity = Decimal("9750")
+    engine_state.high_water_mark = Decimal("11000")
+    engine_state.day_open_equity = Decimal("10000")
+    engine_state.utc_day = 20_000
+    engine_state.daily_locked = True
+    engine_state.drawdown_locked = True
+    state.persist_engine_state(engine_state, event_time_ms=100)
+    state.close()
+
+    reopened = SQLiteState(path)
+    try:
+        restored = reopened.restore_engine_state(initial_equity="10000")
+        assert restored.current_equity == Decimal("9750")
+        assert restored.high_water_mark == Decimal("11000")
+        assert restored.daily_locked
+        assert restored.drawdown_locked
+    finally:
+        reopened.close()
+
+
 def test_adapter_refuses_mainnet_and_loads_capabilities_dynamically() -> None:
     with pytest.raises(UnsafeEndpointError, match="Testnet"):
         BinanceSpotTestnetAdapter(endpoint="https://api.binance.com", transport=FakeTransport())
@@ -93,6 +127,9 @@ def test_adapter_refuses_mainnet_and_loads_capabilities_dynamically() -> None:
         order_types=("MARKET", "LIMIT", "STOP_LOSS_LIMIT"),
         step_size="0.00001000",
         min_notional="5.00000000",
+        tick_size="0.01000000",
+        max_quantity="100.00000000",
+        max_notional="1000000.00000000",
         maker_commission="0.001",
         taker_commission="0.001",
         request_weight_limit=6000,

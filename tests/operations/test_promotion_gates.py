@@ -35,6 +35,21 @@ def test_live_shadow_requires_fourteen_continuous_days_and_resolved_divergences(
     early = gate.evaluate(now_ms=14 * DAY - 1)
     assert not early.approved
 
+    for day in range(2, 14):
+        gate.record(
+            LiveReplayComparison(
+                event_time_ms=day * DAY,
+                live_features={"return": "0.01"},
+                replay_features={"return": "0.01"},
+                live_signal=True,
+                replay_signal=True,
+                expiry_match=True,
+                latency_ms=20,
+                data_quality="valid",
+                hypothetical_cost="1.2",
+            )
+        )
+
     gate.record(
         LiveReplayComparison(
             event_time_ms=14 * DAY,
@@ -71,7 +86,7 @@ def test_soak_requires_supervision_then_verified_incident_free_stability() -> No
     gate.begin_continuous(now_ms=7 * DAY, alerts_verified=True)
     for index in range(300):
         gate.record_scalp(
-            event_time_ms=7 * DAY + index,
+            event_time_ms=7 * DAY + index * (23 * DAY) // 299,
             protected=True,
             duplicate_order=False,
             reconciled=True,

@@ -9,6 +9,7 @@ def render_evidence_markdown(
     candidate_identity: str, evidence: EvidenceResult, trades: tuple[ScalpResult, ...]
 ) -> str:
     decision = "PROMOTED" if evidence.promoted else "REJECTED"
+    cost_stress = ", ".join(map(str, evidence.cost_stress_multipliers)) or "not evidenced"
     lines = [
         f"# Evidence report — {candidate_identity}",
         "",
@@ -28,6 +29,19 @@ def render_evidence_markdown(
         f"- Selection-adjusted lower bound: {evidence.bootstrap_lower_95 or 'non-evaluable'}",
         f"- Positive folds: {evidence.positive_fold_fraction}",
         f"- Concentration gate failed: {evidence.concentration_failed}",
+        f"- Cost stress multipliers: {cost_stress}",
+        *(
+            f"- Cost {multiplier}x net/expectancy: "
+            f"{metrics.net_return}/{metrics.expectancy or 'non-evaluable'}"
+            for multiplier, metrics in sorted(evidence.cost_scenario_metrics.items())
+        ),
+        "",
+        "## Comparators",
+        "",
+        *(
+            f"- {name}: {value if value is not None else 'non-evaluable'}"
+            for name, value in evidence.comparators.items()
+        ),
         "",
         "## Scalp traces",
         "",

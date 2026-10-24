@@ -119,6 +119,7 @@ class ScalpResult:
     trace_event_ids: tuple[str, ...] = ()
     risk_compliant: bool = True
     market_fidelity: str = "aggTrades"
+    equity_marks: tuple[tuple[int, Decimal], ...] = ()
 
     @property
     def net_pnl(self) -> Decimal:
@@ -148,6 +149,8 @@ class EvidenceResult:
     concentration_failed: bool
     promoted: bool
     selection_adjusted_alpha: Decimal
+    cost_stress_multipliers: tuple[Decimal, ...] = ()
+    cost_scenario_metrics: Mapping[Decimal, EvidenceMetrics] = field(default_factory=dict)
     comparators: Mapping[str, Decimal | None] = field(
         default_factory=lambda: {"no_trade": Decimal(0), "buy_and_hold": None, "momentum": None}
     )
@@ -179,6 +182,8 @@ class EvidenceProtocol:
         attempts: int,
         random_seed: int = 7,
         comparators: Mapping[str, Decimal | None] | None = None,
+        cost_stress_multipliers: tuple[Decimal, ...] = (),
+        cost_scenario_trades: Mapping[Decimal, tuple[ScalpResult, ...]] | None = None,
     ) -> EvidenceResult:
         if attempts < 1:
             raise ValueError("selection attempt count must be positive")
@@ -188,12 +193,12 @@ class EvidenceProtocol:
         by_fold: dict[int, Decimal] = defaultdict(Decimal)
         for trade in trades:
             by_fold[trade.fold] += trade.net_pnl
-        positive_fraction = (
-            Decimal(sum(value > 0 for value in by_fold.values())) / Decimal(len(by_fold))
-            if by_fold
-            else Decimal(0)
-        )
+        fold_count = len(self.walk_forward_folds())
+        positive_fraction = Decimal(
+            sum(by_fold.get(index, Decimal(0)) > 0 for index in range(fold_count))
+        ) / Decimal(fold_count)
         concentration_failed = _concentration_failed(trades)
+        required_stress = {Decimal("1"), Decimal("1.5"), Decimal("2")}
         promoted = (
             len(trades) >= 300
             and positive_fraction >= Decimal("0.70")
@@ -202,6 +207,8 @@ class EvidenceProtocol:
             and not concentration_failed
             and all(trade.risk_compliant for trade in trades)
             and all(trade.market_fidelity == "aggTrades" for trade in trades)
+            and required_stress.issubset(cost_stress_multipliers)
+            and required_stress.issubset((cost_scenario_trades or {}).keys())
         )
         return EvidenceResult(
             metrics=metrics,
@@ -210,6 +217,11 @@ class EvidenceProtocol:
             concentration_failed=concentration_failed,
             promoted=promoted,
             selection_adjusted_alpha=alpha,
+            cost_stress_multipliers=cost_stress_multipliers,
+            cost_scenario_metrics={
+                multiplier: _metrics(scenario, initial_equity)
+                for multiplier, scenario in (cost_scenario_trades or {}).items()
+            },
             comparators=comparators
             or {"no_trade": Decimal(0), "buy_and_hold": None, "momentum": None},
         )
@@ -257,15 +269,26 @@ class HoldoutRegistry:
 def _metrics(trades: tuple[ScalpResult, ...], initial_equity: Decimal) -> EvidenceMetrics:
     net = [trade.net_pnl for trade in trades]
     total = sum(net, Decimal(0))
-    equity = initial_equity
+    realized_equity = initial_equity
     peak = initial_equity
     max_drawdown = Decimal(0)
     by_day: dict[str, Decimal] = defaultdict(Decimal)
     for trade in sorted(trades, key=lambda item: item.closed_ms):
-        equity += trade.net_pnl
-        peak = max(peak, equity)
-        if peak:
-            max_drawdown = max(max_drawdown, (peak - equity) / peak)
+        marks = trade.equity_marks or (
+            (trade.opened_ms, trade.entry_price),
+            (trade.closed_ms, trade.exit_price),
+        )
+        for _mark_ms, mark_price in marks:
+            marked_equity = (
+                realized_equity
+                + (mark_price - trade.entry_price) * trade.quantity
+                - trade.costs / 2
+            )
+            peak = max(peak, marked_equity)
+            if peak:
+                max_drawdown = max(max_drawdown, (peak - marked_equity) / peak)
+        realized_equity += trade.net_pnl
+        peak = max(peak, realized_equity)
         day = datetime.fromtimestamp(trade.closed_ms / 1000, tz=UTC).date().isoformat()
         by_day[day] += trade.net_pnl
     wins = sum((value for value in net if value > 0), Decimal(0))

@@ -18,7 +18,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: deployment-gate
-          image: ghcr.io/raimangsxr/scalping-bot:git-a291d3bab87325875a88492af3462791e6bf707b
+          image: ghcr.io/raimangsxr/scalping-bot:git-4ca68cc276661f070eec25f91635f2572e96b702
           args: ["deployment-check"]
           volumeMounts:
             - name: state

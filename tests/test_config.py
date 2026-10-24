@@ -42,3 +42,8 @@ def test_non_testnet_endpoints_are_rejected_before_network_use(
 def test_only_the_research_market_is_accepted(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="BTCUSDT"):
         Settings(symbol="ETHUSDT", state_path=tmp_path / "state.db")
+
+
+def test_testnet_executor_rejects_any_position_risk_other_than_baseline(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match=r"0\.25%"):
+        Settings(position_risk="0.005", state_path=tmp_path / "state.db")

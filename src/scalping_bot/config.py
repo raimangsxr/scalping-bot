@@ -1,3 +1,4 @@
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Self
 from urllib.parse import urlparse
@@ -34,6 +35,12 @@ class Settings(BaseSettings):
     def validate_safe_scope(self) -> Self:
         if self.symbol != "BTCUSDT":
             raise ValueError("the first version accepts BTCUSDT only")
+        try:
+            configured_risk = Decimal(self.position_risk)
+        except (InvalidOperation, ValueError):
+            raise ValueError("position risk must be 0.25% in the first Testnet phase") from None
+        if configured_risk != Decimal("0.0025"):
+            raise ValueError("position risk must be 0.25% in the first Testnet phase")
         allowed_hosts = {"testnet.binance.vision", "stream.testnet.binance.vision"}
         for endpoint in (self.binance_rest_url, self.binance_ws_url):
             if urlparse(endpoint).hostname not in allowed_hosts:

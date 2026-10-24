@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     binance_ws_url: str = "wss://stream.testnet.binance.vision/ws"
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    backup_encryption_key: str | None = None
     state_path: Path = Path("state/scalping-bot.db")
     position_risk: str = "0.0025"
 

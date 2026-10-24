@@ -17,7 +17,7 @@ metadata:
   name: scalping-bot
   namespace: scalping-bot
   annotations:
-    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-7ebc7371ef1286defcdd81867a8c7daab8525e88.spdx.json
+    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-5c06fc7924850a85e1b45122ba9818433b4ec593.spdx.json
 spec:
   serviceName: scalping-bot-metrics
   replicas: 1
@@ -38,7 +38,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: executor
-          image: ghcr.io/raimangsxr/scalping-bot:git-7ebc7371ef1286defcdd81867a8c7daab8525e88
+          image: ghcr.io/raimangsxr/scalping-bot:git-5c06fc7924850a85e1b45122ba9818433b4ec593
           imagePullPolicy: IfNotPresent
           args: ["run-testnet-executor"]
           env:
@@ -52,6 +52,21 @@ spec:
                 secretKeyRef:
                   name: scalping-bot-secrets
                   key: binance-api-secret
+            - name: SCALPING_TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: telegram-bot-token
+            - name: SCALPING_TELEGRAM_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: telegram-chat-id
+            - name: SCALPING_BACKUP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: backup-encryption-key
           ports:
             - name: metrics
               containerPort: 8000

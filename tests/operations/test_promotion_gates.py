@@ -128,6 +128,7 @@ def test_live_shadow_detects_unannotated_drift_and_any_order_submission() -> Non
                 data_quality="valid",
                 hypothetical_cost="1.3" if day == 14 else "1.2",
                 replay_hypothetical_cost="1.2",
+                replay_latency_ms=10 if day == 14 else 20,
             )
         )
     gate.record_order_submission(event_time_ms=14 * DAY, client_order_id="shadow-order-1")
@@ -139,6 +140,7 @@ def test_live_shadow_detects_unannotated_drift_and_any_order_submission() -> Non
     assert "signal" in " ".join(result.reasons)
     assert "expiry" in " ".join(result.reasons)
     assert "hypothetical cost" in " ".join(result.reasons)
+    assert "latency" in " ".join(result.reasons)
     assert "submitted orders" in " ".join(result.reasons)
     assert "candidate-manifest" in result.report
 

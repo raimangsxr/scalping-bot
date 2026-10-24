@@ -42,6 +42,7 @@ class LiveReplayComparison:
     divergence: str | None = None
     replay_hypothetical_cost: str | None = None
     replay_data_quality: str | None = None
+    replay_latency_ms: int | None = None
     live_expiry_ms: int | None = None
     replay_expiry_ms: int | None = None
     orders_submitted: int = 0
@@ -707,6 +708,11 @@ def _comparison_divergences(comparison: LiveReplayComparison) -> tuple[str, ...]
         and comparison.data_quality != comparison.replay_data_quality
     ):
         divergences.append("data quality differs")
+    if (
+        comparison.replay_latency_ms is not None
+        and comparison.latency_ms != comparison.replay_latency_ms
+    ):
+        divergences.append("latency differs")
     if comparison.data_quality != "valid":
         divergences.append("live data quality is not valid")
     if comparison.latency_ms < 0:

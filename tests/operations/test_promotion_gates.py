@@ -8,9 +8,7 @@ from pathlib import Path
 import pytest
 
 from scalping_bot.data.storage import LocalObjectStore
-from scalping_bot.domain.engine import Engine
 from scalping_bot.domain.events import CandleClosed, MarketTick
-from scalping_bot.domain.state import InMemoryState
 from scalping_bot.operations.promotion import (
     LiveReplayComparison,
     LiveShadowGate,
@@ -220,14 +218,12 @@ def test_live_shadow_report_can_be_saved_as_an_immutable_artifact(tmp_path: Path
 def test_live_shadow_runner_emits_hypothetical_commands_without_an_exchange() -> None:
     gate = LiveShadowGate(candidate_identity="momentum-001-v1", started_ms=0)
     runner = LiveShadowRunner(
-        engine=Engine(
-            InMemoryState(initial_equity=Decimal("10000")),
-            MomentumPolicy(
-                candidate_version="momentum-001-v1",
-                window=2,
-                threshold=Decimal("0.01"),
-            ),
+        policy=MomentumPolicy(
+            candidate_version="momentum-001-v1",
+            window=2,
+            threshold=Decimal("0.01"),
         ),
+        initial_equity=Decimal("10000"),
         gate=gate,
     )
 

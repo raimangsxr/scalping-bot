@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 
-from scalping_bot.domain.engine import Engine
+from scalping_bot.domain.engine import Engine, StrategyPolicy
 from scalping_bot.domain.events import EngineEvent
-from scalping_bot.domain.models import AuditDecision, ExitMarket, PlaceProtection, SubmitEntry
+from scalping_bot.domain.models import (
+    AuditDecision,
+    EngineResult,
+    ExecutionCosts,
+    ExitMarket,
+    PlaceProtection,
+    SubmitEntry,
+)
+from scalping_bot.domain.state import InMemoryState
 from scalping_bot.operations.promotion import LiveShadowGate
 
 
@@ -17,12 +27,38 @@ class ShadowProcessResult:
 class LiveShadowRunner:
     """Run the shared event engine without returning an executable command."""
 
-    def __init__(self, *, engine: Engine, gate: LiveShadowGate) -> None:
-        self.engine = engine
+    __slots__ = ("_process_event", "gate")
+
+    def __init__(
+        self,
+        *,
+        policy: StrategyPolicy,
+        initial_equity: Decimal,
+        gate: LiveShadowGate,
+        execution_costs: ExecutionCosts | None = None,
+    ) -> None:
         self.gate = gate
+        engine = Engine(
+            InMemoryState(initial_equity=initial_equity),
+            policy,
+            execution_costs=execution_costs,
+        )
+
+        def process_event(event: EngineEvent) -> EngineResult:
+            result = engine.handle(event)
+            for command in result.commands:
+                if isinstance(command, SubmitEntry):
+                    engine.state.pending_entry = None
+                elif isinstance(command, ExitMarket):
+                    engine.state.pending_exit = None
+                elif isinstance(command, PlaceProtection):
+                    continue
+            return result
+
+        self._process_event: Callable[[EngineEvent], EngineResult] = process_event
 
     def process(self, event: EngineEvent) -> ShadowProcessResult:
-        result = self.engine.handle(event)
+        result = self._process_event(event)
         hypothetical_commands: list[str] = []
         for decision in result.decisions:
             self.gate.record_hypothetical_decision(
@@ -36,10 +72,4 @@ class LiveShadowRunner:
                 kind=kind,
             )
             hypothetical_commands.append(kind)
-            if isinstance(command, SubmitEntry):
-                self.engine.state.pending_entry = None
-            elif isinstance(command, ExitMarket):
-                self.engine.state.pending_exit = None
-            elif isinstance(command, PlaceProtection):
-                continue
         return ShadowProcessResult(tuple(result.decisions), tuple(hypothetical_commands))

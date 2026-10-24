@@ -71,7 +71,7 @@ def test_argocd_application_uses_an_immutable_commit_revision() -> None:
     int(revision, 16)
 
 
-def test_executor_and_gate_use_the_same_immutable_release_reference() -> None:
+def test_executor_and_gate_use_the_same_immutable_image_reference() -> None:
     executor = next(
         item for item in _documents("deploy/k8s/executor.yaml") if item["kind"] == "StatefulSet"
     )
@@ -79,9 +79,13 @@ def test_executor_and_gate_use_the_same_immutable_release_reference() -> None:
     image = executor["spec"]["template"]["spec"]["containers"][0]["image"]
     gate_image = gate["spec"]["template"]["spec"]["containers"][0]["image"]
     revision = _documents("deploy/argocd/application.yaml")[0]["spec"]["source"]["targetRevision"]
+    image_revision = image.removeprefix("ghcr.io/raimangsxr/scalping-bot:git-")
 
     assert image == gate_image
-    assert image.endswith(revision)
+    assert len(image_revision) == 40
+    int(image_revision, 16)
     assert executor["metadata"]["annotations"]["scalping-bot.io/sbom"].endswith(
-        f"{revision}.spdx.json"
+        f"{image_revision}.spdx.json"
     )
+    assert len(revision) == 40
+    int(revision, 16)

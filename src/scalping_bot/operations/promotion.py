@@ -516,6 +516,7 @@ class PromotedRiskGate:
         self._check_stress(
             "historical",
             candidate_identity,
+            baseline.candidate_rules_sha256,
             baseline.historical_stress,
             promoted.historical_stress,
             reasons,
@@ -523,6 +524,7 @@ class PromotedRiskGate:
         self._check_stress(
             "Testnet",
             candidate_identity,
+            baseline.candidate_rules_sha256,
             baseline.testnet_stress,
             promoted.testnet_stress,
             reasons,
@@ -593,12 +595,13 @@ class PromotedRiskGate:
         if not operational_controls_passed:
             reasons.append(f"{label} operational controls failed")
         if not concentration_passed:
-            reasons.append(f"{label} concentration criterion failed")
+            reasons.append(f"{label} profit concentration failed")
 
     def _check_stress(
         self,
         label: str,
         candidate_identity: str,
+        candidate_rules_sha256: str,
         baseline: StressEvaluation | None,
         promoted: StressEvaluation | None,
         reasons: list[str],
@@ -615,7 +618,13 @@ class PromotedRiskGate:
                 INITIAL_POSITION_RISK if risk_label == "baseline" else PROMOTED_POSITION_RISK
             )
             self._check_stress_artifact(
-                label, risk_label, result, candidate_identity, expected_risk, reasons
+                label,
+                risk_label,
+                result,
+                candidate_identity,
+                candidate_rules_sha256,
+                expected_risk,
+                reasons,
             )
             self._check_metric_limits(
                 f"{label} {risk_label}", result.max_daily_loss, result.max_drawdown, reasons
@@ -634,6 +643,7 @@ class PromotedRiskGate:
         risk_label: str,
         result: StressEvaluation,
         candidate_identity: str,
+        candidate_rules_sha256: str,
         expected_position_risk: Decimal,
         reasons: list[str],
     ) -> None:
@@ -664,6 +674,12 @@ class PromotedRiskGate:
             return
         if payload.get("candidate_identity") != candidate_identity:
             reasons.append(f"{label} {risk_label} stress artifact targets another candidate")
+            return
+        if payload.get("candidate_rules_sha256") != candidate_rules_sha256:
+            reasons.append(f"{label} {risk_label} stress artifact targets another ruleset")
+            return
+        if payload.get("sample") != label.lower():
+            reasons.append(f"{label} {risk_label} stress artifact has the wrong sample")
             return
         try:
             artifact_risk = Decimal(str(payload["position_risk"]))
@@ -722,8 +738,9 @@ class PromotedRiskGate:
         if (
             payload.get("candidate_identity") != candidate_identity
             or payload.get("candidate_rules_sha256") != candidate_rules_sha256
+            or payload.get("decision") not in {"PROMOTED", "accepted", "promoted"}
         ):
-            reasons.append("promotion evidence artifact targets another candidate or ruleset")
+            reasons.append("promotion evidence artifact is not a completed candidate promotion")
 
     def _check_soak_reference(
         self, key: str | None, candidate_identity: str, reasons: list[str]
@@ -738,6 +755,8 @@ class PromotedRiskGate:
             return
         if f"# Testnet Soak — {candidate_identity}" not in content:
             reasons.append("Testnet Soak report artifact targets another candidate")
+        elif "Decision: COMPLETE" not in content or "Executed scalps: 300/300" not in content:
+            reasons.append("Testnet Soak report artifact is not complete")
 
     @staticmethod
     def _render_report(
@@ -756,7 +775,7 @@ class PromotedRiskGate:
             f"Baseline expectancy: {baseline.net_expectancy}\n"
             f"Promoted expectancy: {promoted.net_expectancy}\n"
             "Compared evidence: historical stress, Testnet stress, cost stress, operational "
-            "controls, concentration criterion, daily loss, drawdown, and notional cap.\n\n"
+            "controls, profit concentration, daily loss, drawdown, and notional cap.\n\n"
             "Reasons:\n"
             f"{reason_lines}\n"
         )

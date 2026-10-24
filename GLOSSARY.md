@@ -192,6 +192,10 @@ _Avoid_: Validation sample, tuning data
 The minimum evidence required for a candidate to advance: risk limits satisfied, at least 300 out-of-sample scalps, positive net results in at least 70% of walk-forward folds, and a non-negative lower 95% bootstrap bound for net expectancy.
 _Avoid_: Best backtest, leaderboard rank
 
+**Profit Concentration**:
+The share of net out-of-sample return attributable to one scalp or one calendar month; it fails when a scalp exceeds 10% or a month exceeds 25% of total profit.
+_Avoid_: Event-dependent result, concentrated profit
+
 **Operator**:
 The single person who configures, supervises, and evaluates the system.
 _Avoid_: User, customer

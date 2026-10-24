@@ -42,8 +42,8 @@ operational setting cannot silently drift from the soak contract.
 0.5%. `RiskEvaluation` carries separate historical-stress and Testnet-stress evidence. The
 Test fixtures may build configuration-shaped values, but they are not evidence. The gate requires
 the candidate rule hash, notional cap, daily-loss cap, drawdown cap, and risk-control
-policy to remain unchanged; it also rechecks risk, cost stress, operational controls, and the
-concentration criterion at both risk levels.
+policy to remain unchanged; it also rechecks risk, cost stress, operational controls, and Profit
+Concentration at both risk levels.
 
 Each decision is written as a separate immutable JSON manifest. The gate requires immutable
 promotion and Soak report references plus SHA-256-verified historical and Testnet stress

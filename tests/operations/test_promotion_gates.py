@@ -30,6 +30,8 @@ def _stress_evidence(
     key: str,
     *,
     candidate_identity: str,
+    candidate_rules_sha256: str,
+    sample: str,
     position_risk: str,
     net_expectancy: str,
     max_daily_loss: str,
@@ -38,6 +40,8 @@ def _stress_evidence(
     content = json.dumps(
         {
             "candidate_identity": candidate_identity,
+            "candidate_rules_sha256": candidate_rules_sha256,
+            "sample": sample,
             "position_risk": position_risk,
             "net_expectancy": net_expectancy,
             "max_daily_loss": max_daily_loss,
@@ -358,11 +362,15 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
             {
                 "candidate_identity": "momentum-001-v1",
                 "candidate_rules_sha256": "rules-immutable",
+                "decision": "PROMOTED",
             },
             sort_keys=True,
         ).encode(),
     )
-    store.put_immutable("testnet-soak/report.md", "# Testnet Soak — momentum-001-v1\n".encode())
+    store.put_immutable(
+        "testnet-soak/report.md",
+        "# Testnet Soak — momentum-001-v1\nDecision: COMPLETE\nExecuted scalps: 300/300\n".encode(),
+    )
     gate = PromotedRiskGate(store)
     baseline = RiskEvaluation(
         position_risk=Decimal("0.0025"),
@@ -378,6 +386,8 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
             tmp_path,
             "stress/historical-baseline.json",
             candidate_identity="momentum-001-v1",
+            candidate_rules_sha256="rules-immutable",
+            sample="historical",
             position_risk="0.0025",
             net_expectancy="0.2",
             max_daily_loss="0.01",
@@ -387,6 +397,8 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
             tmp_path,
             "stress/testnet-baseline.json",
             candidate_identity="momentum-001-v1",
+            candidate_rules_sha256="rules-immutable",
+            sample="testnet",
             position_risk="0.0025",
             net_expectancy="0.3",
             max_daily_loss="0.01",
@@ -407,6 +419,8 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
             tmp_path,
             "stress/historical-promoted.json",
             candidate_identity="momentum-001-v1",
+            candidate_rules_sha256="rules-immutable",
+            sample="historical",
             position_risk="0.005",
             net_expectancy="0.15",
             max_daily_loss="0.019",
@@ -416,6 +430,8 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
             tmp_path,
             "stress/testnet-promoted.json",
             candidate_identity="momentum-001-v1",
+            candidate_rules_sha256="rules-immutable",
+            sample="testnet",
             position_risk="0.005",
             net_expectancy="0.2",
             max_daily_loss="0.019",

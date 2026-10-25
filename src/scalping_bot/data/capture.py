@@ -106,9 +106,10 @@ class CaptureCohort:
             for segment in self.segments
         ):
             raise ValueError("capture cohort contains an invalid or out-of-window segment")
-        if tuple(
-            sorted(self.segments, key=lambda segment: (segment.stream, segment.started_ms))
-        ) != self.segments:
+        if (
+            tuple(sorted(self.segments, key=lambda segment: (segment.stream, segment.started_ms)))
+            != self.segments
+        ):
             raise ValueError("capture cohort segments must be sorted")
 
     @property

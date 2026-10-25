@@ -262,9 +262,7 @@ class SharedEngineLiveShadow:
         freshness = status.get("freshness_ms")
         if isinstance(freshness, int):
             self.metrics.market_data_freshness_ms.set(freshness)
-        self.metrics.market_data_gaps_total.set(
-            float(bool(status.get("continuity_broken")))
-        )
+        self.metrics.market_data_gaps_total.set(float(bool(status.get("continuity_broken"))))
         self.metrics.entries_allowed.set(0)
         self.metrics.operating_mode.set(1 if bool(status.get("healthy")) else 2)
         self.metrics.heartbeat_timestamp_seconds.set(now_ms / 1000)

@@ -88,8 +88,9 @@ def check_config() -> None:
 
 @app.command()
 def check_runtime_secrets(
-    role: Annotated[str, typer.Option("--role", help="collector, live-shadow, or executor")]
-    = "executor",
+    role: Annotated[
+        str, typer.Option("--role", help="collector, live-shadow, or executor")
+    ] = "executor",
 ) -> None:
     """Check least-privilege runtime inputs without printing secret values."""
     settings = Settings()
@@ -98,9 +99,7 @@ def check_runtime_secrets(
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
     if missing:
-        raise RuntimeError(
-            f"{role} runtime secrets are incomplete: {', '.join(missing)}"
-        )
+        raise RuntimeError(f"{role} runtime secrets are incomplete: {', '.join(missing)}")
     typer.echo(f"{role} runtime secret boundary is complete; values were not displayed")
 
 

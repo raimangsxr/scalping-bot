@@ -34,10 +34,7 @@ def test_release_provenance_binds_source_manifest_image_digest_and_sbom() -> Non
     digest = "sha256:" + "a" * 64
     provenance = ReleaseProvenance(
         source_commit=verification.image_revision,
-        image=(
-            "ghcr.io/raimangsxr/scalping-bot:git-"
-            f"{verification.image_revision}@{digest}"
-        ),
+        image=(f"ghcr.io/raimangsxr/scalping-bot:git-{verification.image_revision}@{digest}"),
         image_digest=digest,
         manifest_commit=verification.target_revision,
         sbom_sha256=hashlib.sha256(sbom).hexdigest(),

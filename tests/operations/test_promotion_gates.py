@@ -411,9 +411,7 @@ def test_testnet_soak_report_has_machine_and_html_sidecars(tmp_path: Path) -> No
     key = gate.persist_report(result, LocalObjectStore(tmp_path))
 
     identity = key.rsplit("/", 1)[-1].removesuffix(".md")
-    machine = json.loads(
-        (tmp_path / f"testnet-soak/momentum-001-v1/{identity}.json").read_text()
-    )
+    machine = json.loads((tmp_path / f"testnet-soak/momentum-001-v1/{identity}.json").read_text())
     assert machine["complete"] is False
     assert machine["report_sha256"] == identity
     assert (tmp_path / f"testnet-soak/momentum-001-v1/{identity}.html").is_file()

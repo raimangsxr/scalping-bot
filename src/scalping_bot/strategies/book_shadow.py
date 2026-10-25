@@ -206,12 +206,8 @@ class BookShadowEvaluator:
         )
         ledger = CaptureLedger(store)
         if cohort_key is None:
-            depth_segments = tuple(
-                entry.segment for entry in ledger.catalog(depth_stream).entries
-            )
-            trade_segments = tuple(
-                entry.segment for entry in ledger.catalog(trade_stream).entries
-            )
+            depth_segments = tuple(entry.segment for entry in ledger.catalog(depth_stream).entries)
+            trade_segments = tuple(entry.segment for entry in ledger.catalog(trade_stream).entries)
         else:
             cohort = CaptureCohort.load(store, cohort_key)
             cohort.verify(store)

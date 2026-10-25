@@ -187,9 +187,7 @@ class ResearchArchiveCatalog:
                 if entry.derived_sha256 and (
                     hashlib.sha256(derived).hexdigest() != entry.derived_sha256[index]
                 ):
-                    raise ArchiveIncompleteError(
-                        f"derived artifact checksum differs: {key}"
-                    )
+                    raise ArchiveIncompleteError(f"derived artifact checksum differs: {key}")
 
     @classmethod
     def load(cls, store: ObjectStore, key: str) -> ResearchArchiveCatalog:
@@ -360,9 +358,7 @@ def select_research_periods(names: Iterable[str] | None = None) -> tuple[Researc
     by_name = {period.name: period for period in RESEARCH_PERIODS}
     unknown = sorted(set(requested) - set(by_name))
     if unknown:
-        raise ValueError(
-            "unknown archive period(s): " + ", ".join(unknown)
-        )
+        raise ValueError("unknown archive period(s): " + ", ".join(unknown))
     selected = set(requested)
     return tuple(period for period in RESEARCH_PERIODS if period.name in selected)
 
@@ -470,10 +466,7 @@ def _find_gaps(
                 key=lambda item: item.month,
             )
             for previous, current in pairwise(items):
-                if (
-                    kind is ArchiveKind.KLINES
-                    and current.start_time_ms <= previous.end_time_ms
-                ):
+                if kind is ArchiveKind.KLINES and current.start_time_ms <= previous.end_time_ms:
                     gaps.append(f"overlap between {previous.month} and {current.month}")
                 if (
                     kind is ArchiveKind.KLINES

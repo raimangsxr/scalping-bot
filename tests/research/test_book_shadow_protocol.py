@@ -50,9 +50,7 @@ def test_book_shadow_protocol_rejects_invalid_windows_and_coverage() -> None:
 def test_book_shadow_evidence_binds_protocol_and_rejects_out_of_window_observations(
     tmp_path: Path,
 ) -> None:
-    protocol = BookShadowProtocol(
-        candidate_identities=("candidate-v1",), start_ms=100, end_ms=200
-    )
+    protocol = BookShadowProtocol(candidate_identities=("candidate-v1",), start_ms=100, end_ms=200)
     evaluator = BookShadowEvaluator(protocol=protocol)
     observation = BookShadowObservation(
         event_time_ms=150,

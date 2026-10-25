@@ -100,10 +100,14 @@ def test_collector_and_live_shadow_publish_distinct_metrics_ports() -> None:
     shadow_deployment = next(item for item in shadow if item["kind"] == "Deployment")
 
     assert collector_service["spec"]["ports"][0]["port"] == 8001
-    assert collector_deployment["spec"]["template"]["spec"]["containers"][0]["ports"][0][
-        "containerPort"
-    ] == 8001
+    assert (
+        collector_deployment["spec"]["template"]["spec"]["containers"][0]["ports"][0][
+            "containerPort"
+        ]
+        == 8001
+    )
     assert shadow_service["spec"]["ports"][0]["port"] == 8002
-    assert shadow_deployment["spec"]["template"]["spec"]["containers"][0]["ports"][0][
-        "containerPort"
-    ] == 8002
+    assert (
+        shadow_deployment["spec"]["template"]["spec"]["containers"][0]["ports"][0]["containerPort"]
+        == 8002
+    )

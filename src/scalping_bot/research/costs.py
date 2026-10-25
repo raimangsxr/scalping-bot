@@ -420,9 +420,7 @@ class ExecutionCostModel:
         engine = self.as_engine_costs()
         checked = 0
         for hour, volatility, size in sorted(self.buckets):
-            event_time_ms = int(
-                datetime(2024, 1, 1, hour, tzinfo=UTC).timestamp() * 1000
-            )
+            event_time_ms = int(datetime(2024, 1, 1, hour, tzinfo=UTC).timestamp() * 1000)
             expected = self.estimate(
                 notional=notional,
                 hour_utc=hour,
@@ -436,9 +434,7 @@ class ExecutionCostModel:
                 size_bucket=size,
             )
             if expected != actual:
-                raise ValueError(
-                    f"execution cost adapter disagrees for {hour}/{volatility}/{size}"
-                )
+                raise ValueError(f"execution cost adapter disagrees for {hour}/{volatility}/{size}")
             checked += 1
         if checked == 0:
             raise ValueError("execution cost model has no buckets to verify")
@@ -535,12 +531,16 @@ def render_calibration_markdown(
     """Render the immutable human-readable calibration evidence report."""
     observed = sum(bucket.observations for bucket in model.buckets.values())
     required = bucket_plan.required_buckets if bucket_plan is not None else ()
-    missing = tuple(
-        bucket
-        for bucket in required
-        if model.buckets.get(bucket) is None
-        or model.buckets[bucket].observations < bucket_plan.minimum_observations
-    ) if bucket_plan is not None else ()
+    missing = (
+        tuple(
+            bucket
+            for bucket in required
+            if model.buckets.get(bucket) is None
+            or model.buckets[bucket].observations < bucket_plan.minimum_observations
+        )
+        if bucket_plan is not None
+        else ()
+    )
     plan_identity = bucket_plan.identity if bucket_plan is not None else model.bucket_plan_identity
     lines = [
         "# Execution Cost Model calibration report",
@@ -571,8 +571,7 @@ def render_calibration_markdown(
         lines.append(f"- Under-evidenced buckets: {len(missing)}")
         if missing:
             lines.extend(
-                f"- Missing: `{hour:02d}/{volatility}/{size}`"
-                for hour, volatility, size in missing
+                f"- Missing: `{hour:02d}/{volatility}/{size}`" for hour, volatility, size in missing
             )
     lines.extend(
         (

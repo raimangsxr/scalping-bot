@@ -28,7 +28,7 @@ spec:
   template:
     metadata:
       annotations:
-        scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-4b9784ec07ca21dee7e6126068f9bd47302a9e72.spdx.json
+        scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-e5c47254f60cb5a62be6be1e4204ade65af054ba.spdx.json
       labels:
         app.kubernetes.io/name: scalping-bot
         app.kubernetes.io/component: collector
@@ -40,7 +40,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: collector
-          image: ghcr.io/raimangsxr/scalping-bot:git-4b9784ec07ca21dee7e6126068f9bd47302a9e72
+          image: ghcr.io/raimangsxr/scalping-bot:git-e5c47254f60cb5a62be6be1e4204ade65af054ba
           imagePullPolicy: IfNotPresent
           args: ["collect-live", "--storage", "/var/lib/market-data"]
           ports:

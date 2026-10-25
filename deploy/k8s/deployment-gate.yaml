@@ -6,7 +6,7 @@ metadata:
   annotations:
     argocd.argoproj.io/hook: PreSync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
-    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-4b9784ec07ca21dee7e6126068f9bd47302a9e72.spdx.json
+    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-e5c47254f60cb5a62be6be1e4204ade65af054ba.spdx.json
 spec:
   backoffLimit: 0
   template:
@@ -19,7 +19,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: deployment-gate
-          image: ghcr.io/raimangsxr/scalping-bot:git-4b9784ec07ca21dee7e6126068f9bd47302a9e72
+          image: ghcr.io/raimangsxr/scalping-bot:git-e5c47254f60cb5a62be6be1e4204ade65af054ba
           args: ["deployment-check"]
           volumeMounts:
             - name: state

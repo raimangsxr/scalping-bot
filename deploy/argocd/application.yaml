@@ -5,12 +5,12 @@ metadata:
   namespace: argocd
   annotations:
     scalping-bot.io/release-image-commit: 22967503c849b168e65b5d5b06f8d07b15f4a205
-    scalping-bot.io/release-manifest-commit: 7c2bbcfda0524e39c02781bc53296cb899bba0d8
+    scalping-bot.io/release-manifest-commit: e62de808b443febdca355cb907bdd78ae170991d
 spec:
   project: default
   source:
     repoURL: https://github.com/raimangsxr/scalping-bot.git
-    targetRevision: 7c2bbcfda0524e39c02781bc53296cb899bba0d8
+    targetRevision: e62de808b443febdca355cb907bdd78ae170991d
     path: deploy/k8s
   destination:
     server: https://kubernetes.default.svc

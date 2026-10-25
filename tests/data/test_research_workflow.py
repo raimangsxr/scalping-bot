@@ -59,6 +59,7 @@ def test_archive_materializer_is_resumable_and_keeps_a_catalog(tmp_path: Path) -
     assert second.missing == ()
     assert second.catalog_key
     assert LocalObjectStore(tmp_path / "objects").read(second.catalog_key)
+    second.verify(LocalObjectStore(tmp_path / "objects"))
 
 
 def test_incomplete_catalog_cannot_be_finalized(tmp_path: Path) -> None:

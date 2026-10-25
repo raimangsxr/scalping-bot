@@ -49,6 +49,7 @@ from scalping_bot.research.costs import (
     ExecutionCostModel,
     ExecutionCostModelPublisher,
     calibration_observations_from_capture,
+    capture_account_commission_snapshot,
 )
 from scalping_bot.research.evidence import CandidateLifecycle, CandidateRecord
 from scalping_bot.research.execution import canonical_aggregate_trade_bytes
@@ -159,6 +160,29 @@ def publish_cost_model(
         model, source_evidence=source_evidence
     )
     typer.echo(f"cost-model={key}")
+
+
+@app.command()
+def capture_commission_snapshot(
+    output: Path = Path("data/commission"),
+    account_context: str = typer.Option("configured-account", "--account-context"),
+    captured_ms: int | None = typer.Option(None, "--captured-ms"),
+) -> None:
+    """Capture the configured account commission from Binance Spot Testnet."""
+    settings = Settings()
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        raise RuntimeError("Binance Testnet credentials are required for commission capture")
+    transport = OfficialSpotTransport(
+        api_key=settings.binance_api_key, api_secret=settings.binance_api_secret
+    )
+    snapshot = capture_account_commission_snapshot(
+        transport,
+        symbol=settings.symbol,
+        captured_ms=captured_ms if captured_ms is not None else _now_ms(),
+        account_context=account_context,
+    )
+    key = snapshot.persist(LocalObjectStore(output))
+    typer.echo(f"commission-snapshot={key}")
 
 
 @app.command()

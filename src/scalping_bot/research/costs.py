@@ -4,16 +4,22 @@ import gzip
 import hashlib
 import json
 from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from statistics import median
+from typing import Protocol
 
 from scalping_bot.data.capture import CaptureLedger, RawSegment
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.domain.costs import EngineCostBucket, ExecutionCosts
 from scalping_bot.domain.events import MarketTick
 from scalping_bot.domain.market_context import MarketContext
+
+
+class CommissionSource(Protocol):
+    def account_commission(self, symbol: str) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -23,11 +29,18 @@ class AccountCommissionSnapshot:
     taker: Decimal
     captured_ms: int
     account_context: str = ""
+    raw_response: Mapping[str, object] = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.symbol != "BTCUSDT":
             raise ValueError("commission snapshots are scoped to BTCUSDT")
-        if self.maker < 0 or self.taker < 0 or self.captured_ms < 0:
+        if (
+            not self.maker.is_finite()
+            or not self.taker.is_finite()
+            or self.maker < 0
+            or self.taker < 0
+            or self.captured_ms < 0
+        ):
             raise ValueError("commission snapshot values cannot be negative")
 
     @classmethod
@@ -40,9 +53,68 @@ class AccountCommissionSnapshot:
         try:
             maker = Decimal(str(standard["maker"]))
             taker = Decimal(str(standard["taker"]))
-        except (KeyError, ValueError):
+        except (InvalidOperation, KeyError, ValueError):
             raise ValueError("Binance commission response has malformed standard rates") from None
-        return cls("BTCUSDT", maker, taker, captured_ms, account_context)
+        return cls("BTCUSDT", maker, taker, captured_ms, account_context, dict(response))
+
+    def canonical_bytes(self) -> bytes:
+        value = {
+            "schema_version": 1,
+            "symbol": self.symbol,
+            "maker": str(self.maker),
+            "taker": str(self.taker),
+            "captured_ms": self.captured_ms,
+            "account_context": self.account_context,
+            "raw_response": self.raw_response,
+        }
+        return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    @property
+    def identity(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def persist(self, store: ObjectStore) -> str:
+        key = f"commission-snapshots/{self.identity}.json"
+        store.put_immutable(key, self.canonical_bytes())
+        return key
+
+    @classmethod
+    def load(cls, store: ObjectStore, key: str) -> AccountCommissionSnapshot:
+        raw = store.read(key)
+        expected = key.rsplit("/", 1)[-1].removesuffix(".json")
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise ValueError("commission snapshot checksum does not match its key")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or not isinstance(value.get("raw_response", {}), dict):
+            raise ValueError("commission snapshot is malformed")
+        snapshot = cls(
+            symbol=str(value["symbol"]),
+            maker=Decimal(str(value["maker"])),
+            taker=Decimal(str(value["taker"])),
+            captured_ms=int(str(value["captured_ms"])),
+            account_context=str(value.get("account_context", "")),
+            raw_response=dict(value["raw_response"]),
+        )
+        if snapshot.identity != expected:
+            raise ValueError("commission snapshot identity is invalid")
+        return snapshot
+
+
+def capture_account_commission_snapshot(
+    source: CommissionSource,
+    *,
+    symbol: str,
+    captured_ms: int,
+    account_context: str,
+) -> AccountCommissionSnapshot:
+    """Capture the account-specific commission through the exchange seam."""
+    if symbol != "BTCUSDT":
+        raise ValueError("commission capture is scoped to BTCUSDT")
+    return AccountCommissionSnapshot.from_binance_response(
+        source.account_commission(symbol),
+        captured_ms=captured_ms,
+        account_context=account_context,
+    )
 
 
 @dataclass(frozen=True)

@@ -9,12 +9,14 @@ import pytest
 
 from scalping_bot.data.storage import LocalObjectStore
 from scalping_bot.domain.costs import ExecutionCostSnapshot
+from scalping_bot.execution.binance import InMemorySpotTransport
 from scalping_bot.research.costs import (
     AccountCommissionSnapshot,
     CalibrationObservation,
     ExecutionCostCalibrator,
     ExecutionCostModel,
     ExecutionCostModelPublisher,
+    capture_account_commission_snapshot,
 )
 
 
@@ -134,3 +136,39 @@ def test_engine_cost_adapter_preserves_time_volatility_and_size_buckets() -> Non
     )
 
     assert high > low
+
+
+def test_account_commission_snapshot_is_immutable_and_content_addressed(
+    tmp_path: Path,
+) -> None:
+    snapshot = AccountCommissionSnapshot.from_binance_response(
+        {
+            "symbol": "BTCUSDT",
+            "standardCommission": {"maker": "0.0008", "taker": "0.001"},
+        },
+        captured_ms=1_700_000_000_000,
+        account_context="testnet-account",
+    )
+    store = LocalObjectStore(tmp_path / "objects")
+
+    key = snapshot.persist(store)
+    loaded = AccountCommissionSnapshot.load(store, key)
+
+    assert key == f"commission-snapshots/{snapshot.identity}.json"
+    assert loaded == snapshot
+    assert loaded.raw_response["standardCommission"] == {"maker": "0.0008", "taker": "0.001"}
+
+
+def test_commission_capture_uses_the_exchange_transport_seam() -> None:
+    snapshot = capture_account_commission_snapshot(
+        InMemorySpotTransport(),
+        symbol="BTCUSDT",
+        captured_ms=123,
+        account_context="testnet-account",
+    )
+
+    assert snapshot.taker == Decimal("0.001")
+    assert snapshot.raw_response["standardCommission"] == {
+        "maker": "0.001",
+        "taker": "0.001",
+    }

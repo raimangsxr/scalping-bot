@@ -9,7 +9,7 @@ from statistics import pstdev
 from typing import Any
 
 from scalping_bot.data.book import BookGap, LocalOrderBook
-from scalping_bot.data.capture import CaptureLedger
+from scalping_bot.data.capture import CaptureCohort, CaptureLedger, RawSegment
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.research.features import (
     BookFlowFeatures,
@@ -196,6 +196,7 @@ class BookShadowEvaluator:
         trade_stream: str = "btcusdt-aggTrade",
         confirmation: ShadowBookConfirmation | None = None,
         protocol: BookShadowProtocol | None = None,
+        cohort_key: str | None = None,
         entry_proposal: Callable[[int, BookFlowFeatures], bool] | None = None,
     ) -> "BookShadowEvaluator":
         """Derive prospective observations directly from immutable capture segments."""
@@ -204,16 +205,31 @@ class BookShadowEvaluator:
             protocol=protocol,
         )
         ledger = CaptureLedger(store)
-        depth_catalog = ledger.catalog(depth_stream)
-        trade_catalog = ledger.catalog(trade_stream)
-        trades = _captured_trades(store, trade_catalog)
+        if cohort_key is None:
+            depth_segments = tuple(
+                entry.segment for entry in ledger.catalog(depth_stream).entries
+            )
+            trade_segments = tuple(
+                entry.segment for entry in ledger.catalog(trade_stream).entries
+            )
+        else:
+            cohort = CaptureCohort.load(store, cohort_key)
+            cohort.verify(store)
+            if depth_stream not in cohort.streams or trade_stream not in cohort.streams:
+                raise ValueError("Book Flow cohort must include depth and trade streams")
+            depth_segments = tuple(
+                segment for segment in cohort.segments if segment.stream == depth_stream
+            )
+            trade_segments = tuple(
+                segment for segment in cohort.segments if segment.stream == trade_stream
+            )
+        trades = _captured_trades(store, trade_segments)
         trade_index = 0
         recent: list[TradePrint] = []
         book = LocalOrderBook("BTCUSDT")
         previous_bid_depth = Decimal(0)
         previous_ask_depth = Decimal(0)
-        for entry in depth_catalog.entries:
-            segment = entry.segment
+        for segment in depth_segments:
             if segment.gap_before_ms is not None:
                 evaluator.record_gap()
                 book = LocalOrderBook("BTCUSDT")
@@ -468,13 +484,14 @@ def _levels(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(levels)
 
 
-def _captured_trades(store: ObjectStore, catalog: object) -> tuple[TradePrint, ...]:
-    entries = getattr(catalog, "entries", ())
+def _captured_trades(
+    store: ObjectStore, segments: tuple[RawSegment, ...]
+) -> tuple[TradePrint, ...]:
     trades: list[TradePrint] = []
-    for entry in entries:
-        if not entry.segment.valid:
+    for segment in segments:
+        if not segment.valid:
             continue
-        for item in _segment_events(store, entry.segment.object_key):
+        for item in _segment_events(store, segment.object_key):
             payload = item.get("payload")
             if not isinstance(payload, dict) or "a" not in payload:
                 continue

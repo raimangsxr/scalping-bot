@@ -105,6 +105,10 @@ def test_live_shadow_state_survives_restart_and_only_finalizes_after_fourteen_da
 
     assert store.read(key).decode().startswith("# Live Shadow")
     assert "APPROVE Testnet Soak" in store.read(key).decode()
+    status = resumed.health_status(now_ms=14 * DAY)
+    assert status["expected_end_ms"] == 14 * DAY
+    assert status["process_identity"]
+    assert status["release_digest"]
     resumed.close()
 
 

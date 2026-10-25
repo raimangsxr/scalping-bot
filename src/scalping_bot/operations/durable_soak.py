@@ -36,6 +36,10 @@ class DurableTestnetSoak:
         candidate_identity: str,
         store: ObjectStore,
         started_ms: int | None = None,
+        candidate_manifest_sha256: str | None = None,
+        execution_cost_model_identity: str | None = None,
+        release_digest: str | None = None,
+        expected_end_ms: int | None = None,
     ) -> None:
         self.store = store
         self.path = path
@@ -50,13 +54,38 @@ class DurableTestnetSoak:
             if started_ms is None or started_ms < 0:
                 raise ValueError("a new Testnet Soak requires a non-negative start time")
             self._put_metadata(
-                {"candidate_identity": candidate_identity, "started_ms": str(started_ms)}
+                {
+                    "candidate_identity": candidate_identity,
+                    "started_ms": str(started_ms),
+                    "expected_end_ms": str(
+                        expected_end_ms
+                        if expected_end_ms is not None
+                        else started_ms + 30 * 86_400_000
+                    ),
+                    "candidate_manifest_sha256": candidate_manifest_sha256 or "",
+                    "execution_cost_model_identity": execution_cost_model_identity or "",
+                    "release_digest": release_digest or "",
+                }
             )
         elif metadata.get("candidate_identity") != candidate_identity:
             raise ValueError("Testnet Soak candidate changed during a restart")
+        for name, value in (
+            ("candidate_manifest_sha256", candidate_manifest_sha256),
+            ("execution_cost_model_identity", execution_cost_model_identity),
+            ("release_digest", release_digest),
+            ("expected_end_ms", str(expected_end_ms) if expected_end_ms is not None else None),
+        ):
+            if value is not None and metadata.get(name, "") != str(value):
+                raise ValueError(f"Testnet Soak {name} changed during a restart")
         self.gate = SoakGate(
             candidate_identity=candidate_identity,
             started_ms=int(metadata.get("started_ms", str(started_ms))),
+            expected_end_ms=(
+                int(metadata["expected_end_ms"]) if metadata.get("expected_end_ms") else None
+            ),
+            candidate_manifest_sha256=metadata.get("candidate_manifest_sha256") or None,
+            execution_cost_model_identity=metadata.get("execution_cost_model_identity") or None,
+            release_digest=metadata.get("release_digest") or None,
         )
         self._restore()
 
@@ -233,7 +262,8 @@ class DurableTestnetSoak:
         self.connection.commit()
 
     def finalize(self, *, now_ms: int) -> str:
-        if now_ms - self.started_ms < 30 * 86_400_000:
+        expected_end = self._metadata().get("expected_end_ms")
+        if expected_end is not None and now_ms < int(expected_end):
             raise ValueError("Testnet Soak cannot finalize before thirty calendar days")
         result = self.gate.evaluate(now_ms=now_ms)
         key = self.gate.persist_report(result, self.store)

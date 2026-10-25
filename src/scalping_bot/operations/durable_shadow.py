@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
@@ -53,6 +54,9 @@ class DurableLiveShadow:
         cost_model: Path,
         store: ObjectStore,
         started_ms: int | None = None,
+        expected_end_ms: int | None = None,
+        process_identity: str | None = None,
+        release_digest: str | None = None,
     ) -> None:
         self.store = store
         self.path = path
@@ -74,12 +78,24 @@ class DurableLiveShadow:
         if not stored:
             if started_ms is None or started_ms < 0:
                 raise ValueError("a new Live Shadow run requires a non-negative start time")
+            effective_end = (
+                expected_end_ms
+                if expected_end_ms is not None
+                else started_ms + LIVE_SHADOW_DAYS * DAY_MS
+            )
+            if effective_end < started_ms:
+                raise ValueError("Live Shadow expected end cannot precede its start")
             self._put_metadata(
                 {
                     "candidate_identity": candidate.candidate_identity,
                     "candidate_manifest_sha256": candidate_sha,
                     "cost_model_sha256": cost_sha,
                     "started_ms": str(started_ms),
+                    "expected_end_ms": str(effective_end),
+                    "process_identity": process_identity or f"pid:{os.getpid()}",
+                    "release_digest": release_digest
+                    or f"artifacts:{candidate_sha[:16]}-{cost_sha[:16]}",
+                    "continuity_state": "continuous",
                 }
             )
         elif (
@@ -88,11 +104,20 @@ class DurableLiveShadow:
             or stored.get("cost_model_sha256") != cost_sha
         ):
             raise ValueError("Live Shadow artifacts changed during a restart")
+        if expected_end_ms is not None and stored.get("expected_end_ms") != str(expected_end_ms):
+            raise ValueError("Live Shadow expected end changed during a restart")
+        if release_digest is not None and stored.get("release_digest") != release_digest:
+            raise ValueError("Live Shadow release digest changed during a restart")
         effective_start = int(stored.get("started_ms", str(started_ms)))
         self.gate = LiveShadowGate(
             candidate_identity=candidate.candidate_identity,
             started_ms=effective_start,
             candidate_manifest_sha256=candidate_sha,
+            expected_end_ms=(
+                int(stored["expected_end_ms"]) if stored.get("expected_end_ms") else None
+            ),
+            process_identity=stored.get("process_identity"),
+            release_digest=stored.get("release_digest"),
         )
         self._restore()
 
@@ -150,6 +175,14 @@ class DurableLiveShadow:
             "freshness_ms": freshness,
             "continuity_broken": bool(self.gate.continuity_broken),
             "dependency_degraded": dependency_degraded,
+            "expected_end_ms": (
+                int(metadata["expected_end_ms"])
+                if metadata.get("expected_end_ms") is not None
+                else None
+            ),
+            "process_identity": metadata.get("process_identity"),
+            "release_digest": metadata.get("release_digest"),
+            "continuity_state": metadata.get("continuity_state", "continuous"),
             "healthy": freshness is not None
             and 0 <= freshness <= stale_after_ms
             and not self.gate.continuity_broken
@@ -187,10 +220,12 @@ class DurableLiveShadow:
     def mark_continuity_broken(self, reason: str) -> None:
         self.gate.mark_continuity_broken(reason)
         self.connection.execute("INSERT INTO continuity(reason) VALUES (?)", (reason,))
+        self._put_metadata({"continuity_state": "broken"})
         self.connection.commit()
 
     def finalize(self, *, now_ms: int) -> str:
-        if now_ms - self.started_ms < LIVE_SHADOW_DAYS * DAY_MS:
+        expected_end = self._metadata().get("expected_end_ms")
+        if expected_end is not None and now_ms < int(expected_end):
             raise ValueError("Live Shadow cannot finalize before fourteen continuous days")
         result = self.gate.evaluate(now_ms=now_ms)
         key = self.gate.persist_report(result, self.store)

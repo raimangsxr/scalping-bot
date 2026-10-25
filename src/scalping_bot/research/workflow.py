@@ -645,8 +645,15 @@ def _verify_archive_provenance(
         ):
             raise ValueError("research catalog derived artifact is not bound to its manifest")
         try:
-            for derived_key in entry.derived_keys:
-                store.read(derived_key)
+            for index, derived_key in enumerate(entry.derived_keys):
+                derived = store.read(derived_key)
+                if entry.derived_sha256 and (
+                    len(entry.derived_sha256) != len(entry.derived_keys)
+                    or hashlib.sha256(derived).hexdigest() != entry.derived_sha256[index]
+                ):
+                    raise ValueError(
+                        "research catalog derived artifact checksum does not match its entry"
+                    )
         except (KeyError, OSError) as error:
             raise ValueError("research catalog derived artifact is unavailable") from error
 

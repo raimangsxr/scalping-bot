@@ -74,9 +74,15 @@ class LiveShadowGate:
         candidate_identity: str,
         started_ms: int,
         candidate_manifest_sha256: str | None = None,
+        expected_end_ms: int | None = None,
+        process_identity: str | None = None,
+        release_digest: str | None = None,
     ) -> None:
         self.candidate_identity = candidate_identity
         self.candidate_manifest_sha256 = candidate_manifest_sha256
+        self.expected_end_ms = expected_end_ms
+        self.process_identity = process_identity
+        self.release_digest = release_digest
         self.started_ms = started_ms
         self.comparisons: list[LiveReplayComparison] = []
         self.resolutions: dict[str, tuple[str, str]] = {}
@@ -241,6 +247,9 @@ class LiveShadowGate:
             f"Candidate manifest SHA-256: {manifest}\n"
             f"Decision: {decision}\n\n"
             f"Window: {self.started_ms}-{now_ms} ms\n"
+            f"Expected end: {self.expected_end_ms or 'not supplied'} ms\n"
+            f"Process identity: {self.process_identity or 'not supplied'}\n"
+            f"Release digest: {self.release_digest or 'not supplied'}\n"
             f"Comparisons: {len(self.comparisons)}\n"
             f"Hypothetical decisions: {len(self._hypothetical_decisions)}\n"
             f"Unresolved divergences: {len(unresolved)}\n"
@@ -272,6 +281,10 @@ class SoakGate:
         started_ms: int,
         position_risk: Decimal = INITIAL_POSITION_RISK,
         notional_fraction: Decimal = MAX_NOTIONAL_FRACTION,
+        candidate_manifest_sha256: str | None = None,
+        execution_cost_model_identity: str | None = None,
+        release_digest: str | None = None,
+        expected_end_ms: int | None = None,
     ) -> None:
         if position_risk != INITIAL_POSITION_RISK:
             raise ValueError("Testnet Soak requires exactly 0.25% position risk")
@@ -279,6 +292,10 @@ class SoakGate:
             raise ValueError("Testnet Soak notional cannot exceed 50%")
         self.candidate_identity = candidate_identity
         self.started_ms = started_ms
+        self.expected_end_ms = expected_end_ms
+        self.candidate_manifest_sha256 = candidate_manifest_sha256
+        self.execution_cost_model_identity = execution_cost_model_identity
+        self.release_digest = release_digest
         self.position_risk = position_risk
         self.notional_fraction = notional_fraction
         self.continuous_started_ms: int | None = None
@@ -454,6 +471,10 @@ class SoakGate:
             f"Position risk: {self.position_risk:.2%}\n"
             f"Notional cap: {self.notional_fraction:.2%}\n"
             f"Window: {self.started_ms}-{self.started_ms + SOAK_DAYS * DAY_MS} ms\n"
+            f"Expected end: {self.expected_end_ms or 'not supplied'} ms\n"
+            f"Candidate manifest SHA-256: {self.candidate_manifest_sha256 or 'not supplied'}\n"
+            f"Execution Cost Model: {self.execution_cost_model_identity or 'not supplied'}\n"
+            f"Release digest: {self.release_digest or 'not supplied'}\n"
             f"Executed scalps: {self.scalps}/{SOAK_SCALPS}\n"
             f"Supervised windows: {len(self.supervised_windows)}\n"
             f"Critical incidents: {len(self.critical_incidents)}\n"

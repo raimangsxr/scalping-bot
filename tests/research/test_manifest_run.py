@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scalping_bot.data.capture import CaptureLedger, RawSegmentWriter
+from scalping_bot.data.capture import CaptureLedger, RawSegmentWriter, freeze_capture_cohort
 from scalping_bot.data.storage import LocalObjectStore
 from scalping_bot.research.candidates import first_batch
 from scalping_bot.research.costs import (
@@ -228,3 +228,18 @@ def test_book_shadow_can_derive_valid_observations_from_capture_segments(tmp_pat
     assert report.valid_observations == 1
     assert report.gaps == 0
     assert evaluator.observations[0].hypothetical_entry
+
+    cohort = freeze_capture_cohort(
+        store,
+        purpose="book-flow",
+        streams=("btcusdt-aggTrade", "btcusdt-depth-100ms"),
+        start_ms=1_000,
+        end_ms=2_000,
+    )
+    cohort_key = cohort.persist(store)
+    cohort_evaluator = BookShadowEvaluator.from_capture(
+        store,
+        cohort_key=cohort_key,
+        entry_proposal=lambda _event_time_ms, _features: True,
+    )
+    assert cohort_evaluator.report().valid_observations == 1

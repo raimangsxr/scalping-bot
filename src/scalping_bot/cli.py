@@ -552,6 +552,7 @@ def run_live_shadow(
         cost_model=Path(settings.cost_model_snapshot),
         store=store,
         started_ms=_now_ms() if not state.exists() else None,
+        release_digest=settings.release_digest,
     )
     runner = SharedEngineLiveShadow(
         process,
@@ -627,6 +628,7 @@ def freeze_book_shadow_protocol(
 def evaluate_book_shadow(
     storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
     protocol_key: Annotated[str, typer.Option("--protocol")] = "",
+    cohort_key: Annotated[str | None, typer.Option("--cohort")] = None,
     entry_proposals: Annotated[
         Path | None,
         typer.Option(
@@ -652,6 +654,7 @@ def evaluate_book_shadow(
         store,
         protocol=protocol,
         confirmation=ShadowBookConfirmation(min_imbalance=protocol.min_imbalance),
+        cohort_key=cohort_key,
         entry_proposal=lambda event_time_ms, _features: proposals.get(event_time_ms, False),
     )
     typer.echo(f"book-shadow-report={evaluator.persist_report(store)}")

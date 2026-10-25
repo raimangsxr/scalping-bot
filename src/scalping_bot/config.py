@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     calibrated_half_spread_rate: str | None = None
     calibrated_slippage_rate: str | None = None
     cost_model_snapshot: str | None = None
+    release_digest: str | None = None
 
     @model_validator(mode="after")
     def validate_safe_scope(self) -> Self:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import queue
 import signal
 import threading
@@ -115,6 +116,11 @@ def run_executor(settings: Settings) -> None:
             candidate_identity=candidate.candidate_identity,
             store=LocalObjectStore(settings.state_path.parent / "testnet-soak-artifacts"),
             started_ms=time.time_ns() // 1_000_000,
+            candidate_manifest_sha256=hashlib.sha256(
+                settings.candidate_manifest.read_bytes()
+            ).hexdigest(),
+            execution_cost_model_identity=cost_snapshot.snapshot_id,
+            release_digest=settings.release_digest,
         )
 
         def record_user_closed_scalp(

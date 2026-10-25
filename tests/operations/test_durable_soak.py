@@ -34,4 +34,5 @@ def test_testnet_soak_evidence_survives_restart_and_excludes_profitability(tmp_p
     report = store.read(key).decode()
     assert "Decision: COMPLETE" in report
     assert "Testnet profitability is not production evidence" in report
+    assert "Expected end: 2592000000 ms" in report
     resumed.close()

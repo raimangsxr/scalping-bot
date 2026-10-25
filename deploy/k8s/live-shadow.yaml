@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scalping-bot-live-shadow
+  namespace: scalping-bot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scalping-bot
+      app.kubernetes.io/component: live-shadow
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scalping-bot
+        app.kubernetes.io/component: live-shadow
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: live-shadow
+          image: ghcr.io/raimangsxr/scalping-bot:git-3638bbe3d4b76af39a3e6ae87c3ceb97101d1be6
+          imagePullPolicy: IfNotPresent
+          args: ["run-live-shadow"]
+          env:
+            - name: SCALPING_CANDIDATE_MANIFEST
+              value: /run/scalping-candidate/manifest.json
+            - name: SCALPING_COST_MODEL_SNAPSHOT
+              value: /run/scalping-cost/snapshot.json
+          volumeMounts:
+            - name: shadow-state
+              mountPath: /app/state
+            - name: candidate-manifest
+              mountPath: /run/scalping-candidate
+              readOnly: true
+            - name: cost-model
+              mountPath: /run/scalping-cost
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: shadow-state
+          persistentVolumeClaim:
+            claimName: shadow-state
+        - name: candidate-manifest
+          secret:
+            secretName: scalping-bot-candidate-manifest
+            items:
+              - key: manifest.json
+                path: manifest.json
+        - name: cost-model
+          secret:
+            secretName: scalping-bot-evidence
+            items:
+              - key: cost-model-snapshot
+                path: snapshot.json

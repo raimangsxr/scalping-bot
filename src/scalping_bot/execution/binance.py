@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Protocol
 from urllib.parse import urlparse
 
+import httpx
 from binance_common.configuration import ConfigurationRestAPI
 from binance_common.constants import SPOT_REST_API_TESTNET_URL
 from binance_sdk_spot.rest_api.models.enums import (
@@ -58,11 +59,18 @@ class SpotTransport(Protocol):
 
     def cancel_protection(self, symbol: str, client_order_id: str) -> None: ...
 
+    def cancel_order(self, symbol: str, client_order_id: str) -> None: ...
+
+    def create_listen_key(self) -> str: ...
+
+    def keepalive_listen_key(self, listen_key: str) -> None: ...
+
 
 class OfficialSpotTransport:
     """Contains every official Binance SDK type behind plain dictionaries."""
 
     def __init__(self, *, api_key: str, api_secret: str) -> None:
+        self._api_key = api_key
         configuration = ConfigurationRestAPI(
             api_key=api_key,
             api_secret=api_secret,
@@ -71,6 +79,28 @@ class OfficialSpotTransport:
             retries=0,
         )
         self._client = Spot(config_rest_api=configuration).rest_api
+
+    def create_listen_key(self) -> str:
+        # Spot User Data listen keys use the API-key header. Order signing
+        # remains contained in the official SDK adapter above.
+        with httpx.Client(base_url=SPOT_REST_API_TESTNET_URL, timeout=10) as client:
+            response = client.post(
+                "/api/v3/userDataStream", headers={"X-MBX-APIKEY": self._api_key}
+            )
+            response.raise_for_status()
+            payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("listenKey"), str):
+            raise ValueError("Binance User Data listen-key response is malformed")
+        return str(payload["listenKey"])
+
+    def keepalive_listen_key(self, listen_key: str) -> None:
+        with httpx.Client(base_url=SPOT_REST_API_TESTNET_URL, timeout=10) as client:
+            response = client.put(
+                "/api/v3/userDataStream",
+                params={"listenKey": listen_key},
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            response.raise_for_status()
 
     def exchange_info(self, symbol: str) -> dict[str, object]:
         return _plain(self._client.exchange_info(symbol=symbol).data())
@@ -162,6 +192,11 @@ class OfficialSpotTransport:
     def cancel_protection(self, symbol: str, client_order_id: str) -> None:
         self._client.delete_order_list(
             symbol=symbol, list_client_order_id=client_order_id, recv_window=5000
+        ).data()
+
+    def cancel_order(self, symbol: str, client_order_id: str) -> None:
+        self._client.delete_order(
+            symbol=symbol, orig_client_order_id=client_order_id, recv_window=5000
         ).data()
 
 
@@ -267,6 +302,17 @@ class InMemorySpotTransport:
     def cancel_protection(self, symbol: str, client_order_id: str) -> None:
         self._check_symbol(symbol)
         self._open_orders.pop(client_order_id, None)
+
+    def cancel_order(self, symbol: str, client_order_id: str) -> None:
+        self._check_symbol(symbol)
+        self._open_orders.pop(client_order_id, None)
+
+    def create_listen_key(self) -> str:
+        return "in-memory-listen-key"
+
+    def keepalive_listen_key(self, listen_key: str) -> None:
+        if listen_key != "in-memory-listen-key":
+            raise ValueError("unknown in-memory listen key")
 
     def _market_order(
         self, symbol: str, client_order_id: str, quantity: str, *, side: str
@@ -406,6 +452,9 @@ class BinanceSpotTestnetAdapter:
 
     def cancel_protection(self, *, client_order_id: str) -> None:
         self.transport.cancel_protection(self.symbol, client_order_id)
+
+    def cancel_order(self, *, client_order_id: str) -> None:
+        self.transport.cancel_order(self.symbol, client_order_id)
 
     def reconciliation_snapshot(self) -> dict[str, object]:
         account = self.transport.account()

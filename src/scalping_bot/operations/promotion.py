@@ -425,6 +425,19 @@ class StressEvaluation:
     artifact_key: str = ""
     artifact_sha256: str = ""
 
+    @classmethod
+    def from_mapping(cls, value: dict[str, object]) -> StressEvaluation:
+        return cls(
+            net_expectancy=Decimal(str(value["net_expectancy"])),
+            max_daily_loss=Decimal(str(value["max_daily_loss"])),
+            max_drawdown=Decimal(str(value["max_drawdown"])),
+            cost_stress_passed=bool(value["cost_stress_passed"]),
+            operational_controls_passed=bool(value["operational_controls_passed"]),
+            concentration_passed=bool(value["concentration_passed"]),
+            artifact_key=str(value.get("artifact_key", "")),
+            artifact_sha256=str(value.get("artifact_sha256", "")),
+        )
+
 
 @dataclass(frozen=True)
 class RiskEvaluation:
@@ -442,6 +455,47 @@ class RiskEvaluation:
     risk_controls: tuple[str, ...] = DEFAULT_RISK_CONTROLS
     historical_stress: StressEvaluation | None = None
     testnet_stress: StressEvaluation | None = None
+    dataset_checksums: tuple[str, ...] = ()
+    execution_cost_model_sha256: str = ""
+    experiment_manifest_key: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, object]) -> RiskEvaluation:
+        historical = value.get("historical_stress")
+        testnet = value.get("testnet_stress")
+        risk_controls_value = value.get("risk_controls", DEFAULT_RISK_CONTROLS)
+        if not isinstance(risk_controls_value, (list, tuple)):
+            risk_controls_value = DEFAULT_RISK_CONTROLS
+        dataset_checksums_value = value.get("dataset_checksums", ())
+        if not isinstance(dataset_checksums_value, (list, tuple)):
+            dataset_checksums_value = ()
+        return cls(
+            position_risk=Decimal(str(value["position_risk"])),
+            candidate_rules_sha256=str(value["candidate_rules_sha256"]),
+            net_expectancy=Decimal(str(value["net_expectancy"])),
+            max_daily_loss=Decimal(str(value["max_daily_loss"])),
+            max_drawdown=Decimal(str(value["max_drawdown"])),
+            notional_fraction=Decimal(str(value["notional_fraction"])),
+            cost_stress_passed=bool(value["cost_stress_passed"]),
+            operational_controls_passed=bool(value["operational_controls_passed"]),
+            concentration_passed=bool(value["concentration_passed"]),
+            daily_loss_limit=Decimal(str(value.get("daily_loss_limit", MAX_DAILY_LOSS))),
+            drawdown_limit=Decimal(str(value.get("drawdown_limit", MAX_DRAWDOWN))),
+            risk_controls=tuple(str(item) for item in risk_controls_value),
+            historical_stress=(
+                StressEvaluation.from_mapping(historical) if isinstance(historical, dict) else None
+            ),
+            testnet_stress=(
+                StressEvaluation.from_mapping(testnet) if isinstance(testnet, dict) else None
+            ),
+            dataset_checksums=tuple(str(item) for item in dataset_checksums_value),
+            execution_cost_model_sha256=str(value.get("execution_cost_model_sha256", "")),
+            experiment_manifest_key=(
+                str(value["experiment_manifest_key"])
+                if value.get("experiment_manifest_key") is not None
+                else None
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -508,6 +562,10 @@ class PromotedRiskGate:
             reasons.append("risk control policy changed between risk evaluations")
         if baseline.risk_controls != DEFAULT_RISK_CONTROLS:
             reasons.append("baseline risk control policy is not the approved policy")
+        if baseline.dataset_checksums != promoted.dataset_checksums:
+            reasons.append("dataset evidence changed between risk evaluations")
+        if baseline.execution_cost_model_sha256 != promoted.execution_cost_model_sha256:
+            reasons.append("execution cost evidence changed between risk evaluations")
 
         if baseline.net_expectancy <= 0:
             reasons.append("larger size cannot rescue weak baseline expectancy")
@@ -539,6 +597,12 @@ class PromotedRiskGate:
             "baseline": _json_evaluation(baseline),
             "promoted": _json_evaluation(promoted),
             "comparison": _risk_comparison(baseline, promoted),
+            "dataset_checksums": list(baseline.dataset_checksums),
+            "execution_cost_model_sha256": baseline.execution_cost_model_sha256,
+            "experiment_manifest_keys": [
+                baseline.experiment_manifest_key,
+                promoted.experiment_manifest_key,
+            ],
             "proven_baseline_risk": str(INITIAL_POSITION_RISK),
             "decision": "accepted" if not reasons else "rejected",
             "reasons": reasons,
@@ -735,6 +799,10 @@ class PromotedRiskGate:
         if not isinstance(payload, dict):
             reasons.append("promotion evidence artifact is not an object")
             return
+        expected = key.rsplit("/", 1)[-1].removesuffix(".json")
+        if len(expected) == 64 and hashlib.sha256(content).hexdigest() != expected:
+            reasons.append("promotion evidence artifact checksum does not match its key")
+            return
         if (
             payload.get("candidate_identity") != candidate_identity
             or payload.get("candidate_rules_sha256") != candidate_rules_sha256
@@ -749,7 +817,8 @@ class PromotedRiskGate:
             reasons.append("Testnet Soak report artifact is required")
             return
         try:
-            content = self.store.read(key).decode()
+            raw_content = self.store.read(key)
+            content = raw_content.decode()
         except (UnicodeDecodeError, KeyError, OSError):
             reasons.append("Testnet Soak report artifact is unavailable")
             return
@@ -757,6 +826,10 @@ class PromotedRiskGate:
             reasons.append("Testnet Soak report artifact targets another candidate")
         elif "Decision: COMPLETE" not in content or "Executed scalps: 300/300" not in content:
             reasons.append("Testnet Soak report artifact is not complete")
+        else:
+            expected = key.rsplit("/", 1)[-1].removesuffix(".md")
+            if len(expected) == 64 and hashlib.sha256(raw_content).hexdigest() != expected:
+                reasons.append("Testnet Soak report checksum does not match its key")
 
     @staticmethod
     def _render_report(

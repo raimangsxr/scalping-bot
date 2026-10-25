@@ -16,6 +16,8 @@ class ObjectStore(Protocol):
 
     def read(self, key: str) -> bytes: ...
 
+    def list_keys(self, prefix: str = "") -> tuple[str, ...]: ...
+
 
 class LocalObjectStore:
     """Filesystem implementation of immutable object storage."""
@@ -42,6 +44,20 @@ class LocalObjectStore:
 
     def read(self, key: str) -> bytes:
         return self.path(key).read_bytes()
+
+    def list_keys(self, prefix: str = "") -> tuple[str, ...]:
+        base = self.path(prefix) if prefix else self.root.resolve()
+        if not base.exists():
+            return ()
+        if base.is_file():
+            return (prefix,)
+        return tuple(
+            sorted(
+                str(path.relative_to(self.root.resolve()))
+                for path in base.rglob("*")
+                if path.is_file()
+            )
+        )
 
 
 class S3ObjectStore:
@@ -82,3 +98,15 @@ class S3ObjectStore:
     def read(self, key: str) -> bytes:
         response = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
         return bytes(response["Body"].read())
+
+    def list_keys(self, prefix: str = "") -> tuple[str, ...]:
+        keys: list[str] = []
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=self._key(prefix)):
+            for item in page.get("Contents", []):
+                if isinstance(item, dict) and isinstance(item.get("Key"), str):
+                    key = str(item["Key"])
+                    if self.prefix:
+                        key = key.removeprefix(f"{self.prefix}/")
+                    keys.append(key)
+        return tuple(sorted(keys))

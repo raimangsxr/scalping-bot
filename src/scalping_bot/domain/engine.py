@@ -75,10 +75,36 @@ class Engine:
             or self.state.drawdown_locked
         ):
             return
+        if not self.state.entries_allowed:
+            decisions.append(
+                AuditDecision(
+                    event_id=event.event_id,
+                    event_time_ms=event.event_time_ms,
+                    kind="entry-blocked-operational-mode",
+                    details={"reason": "new entries are disabled by durable operational state"},
+                )
+            )
+            return
         proposal = self.policy.observe(event)
         if proposal is None:
             return
         self.state.pending_proposal = proposal
+        missing_dependencies = tuple(
+            dependency
+            for dependency in proposal.market_data_dependencies
+            if self.state.dependency_status.get(dependency, True) is False
+        )
+        if missing_dependencies:
+            self.state.pending_proposal = None
+            decisions.append(
+                AuditDecision(
+                    event_id=event.event_id,
+                    event_time_ms=event.event_time_ms,
+                    kind="entry-blocked-dependency",
+                    details={"dependencies": missing_dependencies},
+                )
+            )
+            return
         decisions.append(
             AuditDecision(
                 event_id=event.event_id,
@@ -102,6 +128,18 @@ class Engine:
     ) -> None:
         if self.state.position is not None:
             self._evaluate_open_position(event, commands, decisions)
+            return
+        if not self.state.entries_allowed:
+            if self.state.pending_proposal is not None:
+                self.state.pending_proposal = None
+            decisions.append(
+                AuditDecision(
+                    event_id=event.event_id,
+                    event_time_ms=event.event_time_ms,
+                    kind="entry-blocked-operational-mode",
+                    details={"reason": "new entries are disabled by durable operational state"},
+                )
+            )
             return
         proposal = self.state.pending_proposal
         if proposal is None:

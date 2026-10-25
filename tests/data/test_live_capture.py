@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from scalping_bot.data.book import BookGap, LocalOrderBook
-from scalping_bot.data.capture import CaptureHealth, RawSegmentWriter
+from scalping_bot.data.capture import CaptureHealth, CaptureLedger, RawSegmentWriter
 from scalping_bot.data.storage import LocalObjectStore
 
 
@@ -101,3 +101,28 @@ def test_capture_health_reports_gaps_drift_storage_and_reconnects() -> None:
         "reconnects": 1,
         "storage_failures": 1,
     }
+
+
+def test_capture_ledger_keeps_completed_segments_and_exposes_only_valid_book_evidence(
+    tmp_path: Path,
+) -> None:
+    store = LocalObjectStore(tmp_path / "objects")
+    ledger = CaptureLedger(store)
+    writer = RawSegmentWriter(store, stream="btcusdt-depth-100ms", segment_started_ms=1_000)
+    writer.append(
+        {
+            "event_type": "depth",
+            "exchange_time_ms": 1_001,
+            "receipt_time_ms": 1_002,
+            "payload": {"U": 101, "u": 101},
+        }
+    )
+    segment = writer.close(valid=True)
+    ledger.record(segment, health={"freshness_ms": 0, "gaps": 0})
+
+    catalog = ledger.catalog("btcusdt-depth-100ms")
+
+    assert catalog.completed == (segment,)
+    assert catalog.valid_book_segments == (segment,)
+    assert catalog.invalid_segments == ()
+    assert "health" in json.loads(store.read(catalog.entries[0].catalog_key))

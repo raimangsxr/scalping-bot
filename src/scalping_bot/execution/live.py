@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from decimal import Decimal
@@ -35,11 +36,17 @@ class BinanceTestnetMarketStream:
         )
 
     def events(
-        self, stop: threading.Event, *, on_reconnect: Callable[[], None] | None = None
+        self,
+        stop: threading.Event,
+        *,
+        on_disconnect: Callable[[str], None] | None = None,
+        on_reconnect: Callable[[], None] | None = None,
     ) -> Iterator[EngineEvent]:
         connected_once = False
         while not stop.is_set():
             try:
+                stale_notified = False
+                last_received_ms = time.time_ns() // 1_000_000
                 with connect(self.url, open_timeout=10, close_timeout=5) as websocket:
                     if connected_once and on_reconnect is not None:
                         on_reconnect()
@@ -48,13 +55,27 @@ class BinanceTestnetMarketStream:
                         try:
                             message = websocket.recv(timeout=1)
                         except TimeoutError:
+                            now_ms = time.time_ns() // 1_000_000
+                            if (
+                                not stale_notified
+                                and now_ms - last_received_ms > 5_000
+                                and on_disconnect is not None
+                            ):
+                                on_disconnect("market data stream stale")
+                                stale_notified = True
                             continue
                         if not isinstance(message, str):
                             continue
+                        if stale_notified and on_reconnect is not None:
+                            on_reconnect()
+                        last_received_ms = time.time_ns() // 1_000_000
+                        stale_notified = False
                         event = _parse_market_message(message)
                         if event is not None:
                             yield event
-            except (ConnectionClosed, OSError):
+            except (ConnectionClosed, OSError) as error:
+                if on_disconnect is not None:
+                    on_disconnect(type(error).__name__)
                 if not stop.wait(1):
                     continue
 
@@ -70,6 +91,11 @@ class LiveEngineRunner:
         self.durable_state = durable_state
 
     def process(self, event: EngineEvent) -> None:
+        # SQLite is the durable authority for operational mode. Synchronizing
+        # this before every event keeps a stale in-memory engine from emitting
+        # entries after an operator action or health transition, while exits
+        # and reconciliation remain available.
+        self.engine.state.entries_allowed = self.durable_state.entries_allowed
         if isinstance(event, MarketTick):
             for refresh_command, order in self.execution.refresh_partial_entries(
                 event_time_ms=event.event_time_ms

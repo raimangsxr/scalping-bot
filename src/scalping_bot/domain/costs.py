@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from statistics import median
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,8 @@ class ExecutionCostSnapshot:
         if not isinstance(value, dict) or not isinstance(value.get("buckets"), list):
             raise ValueError("execution cost snapshot is malformed")
         expected = value.get("sha256")
+        if isinstance(value.get("commission"), dict):
+            return cls._from_research_artifact(path, raw, value)
         if not isinstance(expected, str):
             raise ValueError("execution cost snapshot has no checksum")
         canonical_value = {key: item for key, item in value.items() if key != "sha256"}
@@ -123,10 +126,101 @@ class ExecutionCostSnapshot:
             buckets=buckets,
         )
 
+    @classmethod
+    def _from_research_artifact(
+        cls, path: Path, raw: bytes, value: dict[str, object]
+    ) -> ExecutionCostSnapshot:
+        """Adapt the calibrated research artifact to the live-engine seam.
+
+        Research calibration is finer grained than the first live engine
+        contract: it records size, hour, and volatility buckets, while the
+        engine consumes a notional/hour/volatility snapshot. The adapter
+        preserves the observed hour and volatility dimensions and combines
+        size buckets with an observation-weighted median. No fixed friction is
+        invented, and the source artifact remains the checksum authority.
+        """
+        declared = value.get("sha256")
+        canonical_value = {key: item for key, item in value.items() if key != "sha256"}
+        canonical = (
+            json.dumps(canonical_value, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        expected = str(declared) if declared is not None else path.name.removesuffix(path.suffix)
+        if len(expected) != 64 or any(
+            character not in "0123456789abcdef" for character in expected.lower()
+        ):
+            raise ValueError("research cost model must be content addressed")
+        if hashlib.sha256(canonical).hexdigest() != expected.lower():
+            raise ValueError("research cost model checksum is invalid")
+        commission_value = value.get("commission")
+        raw_buckets = value.get("buckets")
+        if not isinstance(commission_value, dict) or not isinstance(raw_buckets, list):
+            raise ValueError("research cost model is malformed")
+        try:
+            commission_rate = Decimal(str(commission_value["taker"]))
+            captured_ms = int(str(commission_value["captured_ms"]))
+            grouped: dict[tuple[int, str], list[tuple[Decimal, Decimal, int]]] = {}
+            for item in raw_buckets:
+                if not isinstance(item, dict):
+                    raise ValueError("research cost model bucket is malformed")
+                identity = (int(str(item["hour_utc"])), str(item["volatility_bucket"]))
+                observations = int(str(item["observations"]))
+                if observations < 1:
+                    raise ValueError("research cost model bucket has no observations")
+                grouped.setdefault(identity, []).append(
+                    (
+                        Decimal(str(item["spread_bps"])) / Decimal("20000"),
+                        Decimal(str(item["slippage_bps"])) / Decimal("10000"),
+                        observations,
+                    )
+                )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("research cost model contains invalid values") from error
+        buckets = tuple(
+            ExecutionCostBucket(
+                hour_utc=hour,
+                volatility_bucket=volatility,
+                minimum_notional=Decimal(0),
+                maximum_notional=None,
+                half_spread_rate=_weighted_median(
+                    tuple((spread, count) for spread, _slippage, count in values)
+                ),
+                slippage_rate=_weighted_median(
+                    tuple((slippage, count) for _spread, slippage, count in values)
+                ),
+                observations=sum(count for _spread, _slippage, count in values),
+            )
+            for (hour, volatility), values in sorted(grouped.items())
+        )
+        if not buckets:
+            raise ValueError("research cost model has no evidenced buckets")
+        return cls(
+            snapshot_id=expected,
+            captured_ms=captured_ms,
+            commission_rate=commission_rate,
+            buckets=buckets,
+        )
+
     def stressed(self, multiplier: Decimal) -> ExecutionCostSnapshot:
         if multiplier not in {Decimal("1"), Decimal("1.5"), Decimal("2")}:
             raise ValueError("cost stress multiplier is not preregistered")
         return replace(self, stress_multiplier=multiplier)
+
+    def as_engine_costs(self) -> ExecutionCosts:
+        """Resolve the evidenced snapshot to the shared deterministic seam."""
+        total_observations = sum(item.observations for item in self.buckets)
+        if total_observations < 1:
+            raise ValueError("execution cost snapshot has no observations")
+        half_spread = sum(
+            (item.half_spread_rate * item.observations for item in self.buckets), Decimal(0)
+        ) / Decimal(total_observations)
+        slippage = sum(
+            (item.slippage_rate * item.observations for item in self.buckets), Decimal(0)
+        ) / Decimal(total_observations)
+        return ExecutionCosts(
+            commission_rate=self.commission_rate,
+            half_spread_rate=half_spread,
+            slippage_rate=slippage,
+        )
 
     def estimated_close_cost(
         self,
@@ -151,3 +245,10 @@ class ExecutionCostSnapshot:
             * (self.commission_rate + bucket.half_spread_rate + bucket.slippage_rate)
             * self.stress_multiplier
         )
+
+
+def _weighted_median(values: tuple[tuple[Decimal, int], ...]) -> Decimal:
+    expanded = [value for value, count in values for _ in range(count)]
+    if not expanded:
+        raise ValueError("cannot calculate a cost median without observations")
+    return median(expanded)

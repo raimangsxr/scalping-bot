@@ -10,7 +10,7 @@ import httpx
 import websockets
 
 from scalping_bot.data.book import BookGap, LocalOrderBook
-from scalping_bot.data.capture import CaptureHealth, RawSegmentWriter
+from scalping_bot.data.capture import CaptureHealth, CaptureLedger, RawSegmentWriter
 from scalping_bot.data.storage import ObjectStore
 
 PRODUCTION_PUBLIC_REST = "https://api.binance.com"
@@ -34,9 +34,11 @@ class BinancePublicCollector:
         self.clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self.segment_event_limit = segment_event_limit
         self.health = CaptureHealth()
+        self.ledger = CaptureLedger(store)
         self.book = LocalOrderBook("BTCUSDT")
         self._writers: dict[str, RawSegmentWriter] = {}
         self._counts: dict[str, int] = {}
+        self._gap_pending: dict[str, int] = {}
 
     async def run_forever(self) -> None:
         delay = 1.0
@@ -45,11 +47,11 @@ class BinancePublicCollector:
                 await self._capture_connection()
                 delay = 1.0
             except asyncio.CancelledError:
-                self._close_all(valid=self.book.valid)
+                self._close_all(valid=self.book.valid, invalid_reason="collector cancelled")
                 raise
             except Exception:
                 self.health.record_reconnect()
-                self._close_all(valid=False)
+                self._close_all(valid=False, invalid_reason="connection or sequence failure")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60.0)
 
@@ -91,7 +93,7 @@ class BinancePublicCollector:
             writer.append(raw)
         except (OSError, RuntimeError):
             self.health.record_storage_failure()
-            self._rotate(stream, valid=False)
+            self._rotate(stream, valid=False, invalid_reason="storage failure")
             raise
         self._counts[stream] += 1
         if "@depth" in stream:
@@ -106,25 +108,39 @@ class BinancePublicCollector:
                 )
             except BookGap:
                 self.health.record_gap()
-                self._rotate(stream, valid=False)
+                self._rotate(stream, valid=False, invalid_reason="order-book sequence gap")
                 raise
         if self._counts[stream] >= self.segment_event_limit:
-            self._rotate(stream, valid=self.book.valid if "@depth" in stream else True)
+            self._rotate(
+                stream,
+                valid=self.book.valid if "@depth" in stream else True,
+                invalid_reason=None,
+            )
 
     def _writer(self, stream: str, now_ms: int) -> RawSegmentWriter:
         if stream not in self._writers:
             self._writers[stream] = RawSegmentWriter(
-                self.store, stream=stream.replace("@", "-"), segment_started_ms=now_ms
+                self.store,
+                stream=stream.replace("@", "-"),
+                segment_started_ms=now_ms,
+                gap_before_ms=self._gap_pending.pop(stream, None),
             )
             self._counts[stream] = 0
         return self._writers[stream]
 
-    def _rotate(self, stream: str, *, valid: bool) -> None:
+    def _rotate(self, stream: str, *, valid: bool, invalid_reason: str | None) -> None:
         writer = self._writers.pop(stream, None)
         self._counts.pop(stream, None)
         if writer is not None:
-            writer.close(valid=valid)
+            segment = writer.close(valid=valid, invalid_reason=invalid_reason)
+            self.ledger.record(segment, health=self.health.snapshot(now_ms=segment.ended_ms))
+        if not valid:
+            self._gap_pending[stream] = self.clock_ms()
 
-    def _close_all(self, *, valid: bool) -> None:
+    def _close_all(self, *, valid: bool, invalid_reason: str | None) -> None:
         for stream in tuple(self._writers):
-            self._rotate(stream, valid=valid if "@depth" in stream else True)
+            self._rotate(
+                stream,
+                valid=valid if "@depth" in stream else True,
+                invalid_reason=invalid_reason if "@depth" in stream else None,
+            )

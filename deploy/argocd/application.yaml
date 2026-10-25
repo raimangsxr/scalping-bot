@@ -7,7 +7,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/raimangsxr/scalping-bot.git
-    targetRevision: 5de81cd89e6a5e7602afd67054577206aeb7f8dd
+    targetRevision: 3638bbe3d4b76af39a3e6ae87c3ceb97101d1be6
     path: deploy/k8s
   destination:
     server: https://kubernetes.default.svc

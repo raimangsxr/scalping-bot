@@ -132,6 +132,11 @@ class SQLiteState:
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA busy_timeout=5000")
         self._migrate()
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS account_balances ("
+            "asset TEXT PRIMARY KEY, free TEXT NOT NULL, locked TEXT NOT NULL, "
+            "updated_ms INTEGER NOT NULL)"
+        )
 
     def _migrate(self) -> None:
         self.connection.execute(
@@ -180,6 +185,24 @@ class SQLiteState:
         self.connection.execute(
             "UPDATE runtime_state SET operating_mode = ?, entries_allowed = 0 WHERE singleton = 1",
             (mode.value,),
+        )
+
+    def upsert_balance(self, *, asset: str, free: str, locked: str, updated_ms: int) -> None:
+        if not asset:
+            raise ValueError("account balance asset is required")
+        self.connection.execute(
+            "INSERT INTO account_balances(asset, free, locked, updated_ms) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(asset) DO UPDATE SET free = excluded.free, locked = excluded.locked, "
+            "updated_ms = excluded.updated_ms",
+            (asset, free, locked, updated_ms),
+        )
+
+    def balances(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT asset, free, locked, updated_ms FROM account_balances ORDER BY asset"
+            ).fetchall()
         )
 
     def pragma(self, name: str) -> str | int:
@@ -454,6 +477,7 @@ class SQLiteState:
 
     def restore_engine_state(self, *, initial_equity: str) -> InMemoryState:
         state = InMemoryState(initial_equity=Decimal(initial_equity))
+        state.entries_allowed = self.entries_allowed
         row = self.connection.execute(
             "SELECT current_equity, high_water_mark, day_open_equity, utc_day, daily_locked, "
             "drawdown_locked, operator_confirmed_day FROM runtime_state WHERE singleton = 1"

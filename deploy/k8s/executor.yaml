@@ -6,6 +6,7 @@ metadata:
 spec:
   selector:
     app.kubernetes.io/name: scalping-bot
+    app.kubernetes.io/component: executor
   ports:
     - name: metrics
       port: 8000
@@ -17,7 +18,7 @@ metadata:
   name: scalping-bot
   namespace: scalping-bot
   annotations:
-    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-46f898a0238d3893bdca7fa4a4781ffe001854ff.spdx.json
+    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-3638bbe3d4b76af39a3e6ae87c3ceb97101d1be6.spdx.json
 spec:
   serviceName: scalping-bot-metrics
   replicas: 1
@@ -26,10 +27,12 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: scalping-bot
+      app.kubernetes.io/component: executor
   template:
     metadata:
       labels:
         app.kubernetes.io/name: scalping-bot
+        app.kubernetes.io/component: executor
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -38,7 +41,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: executor
-          image: ghcr.io/raimangsxr/scalping-bot:git-46f898a0238d3893bdca7fa4a4781ffe001854ff
+          image: ghcr.io/raimangsxr/scalping-bot:git-3638bbe3d4b76af39a3e6ae87c3ceb97101d1be6
           imagePullPolicy: IfNotPresent
           args: ["run-testnet-executor"]
           env:
@@ -122,7 +125,7 @@ spec:
                 path: manifest.json
         - name: cost-model
           secret:
-            secretName: scalping-bot-secrets
+            secretName: scalping-bot-evidence
             items:
               - key: cost-model-snapshot
                 path: snapshot.json

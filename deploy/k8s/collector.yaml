@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scalping-bot-collector
+  namespace: scalping-bot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scalping-bot
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scalping-bot
+        app.kubernetes.io/component: collector
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: collector
+          image: ghcr.io/raimangsxr/scalping-bot:git-3638bbe3d4b76af39a3e6ae87c3ceb97101d1be6
+          imagePullPolicy: IfNotPresent
+          args: ["collect-live", "--storage", "/var/lib/market-data"]
+          volumeMounts:
+            - name: market-evidence
+              mountPath: /var/lib/market-data
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: market-evidence
+          persistentVolumeClaim:
+            claimName: market-evidence

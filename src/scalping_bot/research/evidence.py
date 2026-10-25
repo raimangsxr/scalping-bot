@@ -47,6 +47,7 @@ class CandidateRecord:
     lifecycle: CandidateLifecycle = CandidateLifecycle.PROPOSED
     history: tuple[LifecycleTransition, ...] = ()
     frozen: bool = False
+    market_data_dependencies: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.version < 1:
@@ -61,6 +62,11 @@ class CandidateRecord:
             raise ValueError(
                 "candidate rules, preregistered parameters, and rejection criteria are required"
             )
+        if not self.market_data_dependencies:
+            dependency = (
+                "aggTrades" if self.family == "executed-trade-pressure" else "closed-1m-klines"
+            )
+            object.__setattr__(self, "market_data_dependencies", (dependency,))
 
     @property
     def identity(self) -> str:

@@ -26,6 +26,8 @@ class InMemoryState:
         self.daily_locked = False
         self.drawdown_locked = False
         self.operator_confirmed_day: int | None = None
+        self.entries_allowed = True
+        self.dependency_status: dict[str, bool] = {}
         self.audit: list[AuditDecision] = []
         self._processed_event_ids: set[str] = set()
 

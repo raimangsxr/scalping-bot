@@ -39,6 +39,8 @@ class BatchEvaluation:
     trades: Mapping[str, tuple[ScalpResult, ...]]
     candidate_records: Mapping[str, CandidateRecord] = field(default_factory=dict)
     manifest_keys: Mapping[str, str] = field(default_factory=dict)
+    historical_evidence: Mapping[str, EvidenceResult] = field(default_factory=dict)
+    historical_trades: Mapping[str, tuple[ScalpResult, ...]] = field(default_factory=dict)
 
 
 class ResearchBatchRunner:
@@ -61,7 +63,11 @@ class ResearchBatchRunner:
         self.dataset_checksums = dataset_checksums
 
     def run(
-        self, trades: tuple[AggTrade, ...], batch: CandidateBatch | None = None
+        self,
+        trades: tuple[AggTrade, ...],
+        batch: CandidateBatch | None = None,
+        *,
+        historical_trades: tuple[AggTrade, ...] = (),
     ) -> BatchEvaluation:
         selected_batch = batch or first_batch()
         ledger = AttemptLedger()
@@ -203,7 +209,47 @@ class ResearchBatchRunner:
                     random_seed=7,
                 )
                 manifest_keys[candidate.identity] = manifest.persist(self.manifest_store)
-        return BatchEvaluation(evidence, ledger, evidence_trades, records, manifest_keys)
+        historical_evidence, historical_results = self._historical_stress(
+            historical_trades, selected_batch
+        )
+        return BatchEvaluation(
+            evidence,
+            ledger,
+            evidence_trades,
+            records,
+            manifest_keys,
+            historical_evidence,
+            historical_results,
+        )
+
+    def _historical_stress(
+        self, trades: tuple[AggTrade, ...], batch: CandidateBatch
+    ) -> tuple[dict[str, EvidenceResult], dict[str, tuple[ScalpResult, ...]]]:
+        if not trades:
+            return {}, {}
+        evidence: dict[str, EvidenceResult] = {}
+        results: dict[str, tuple[ScalpResult, ...]] = {}
+        for candidate in batch.candidates:
+            scenario_results = {
+                multiplier: self._evaluate_period(
+                    candidate,
+                    _first_parameter_values(candidate.parameters),
+                    trades,
+                    fold=-1,
+                    stress=multiplier,
+                )
+                for multiplier in (Decimal("1"), Decimal("1.5"), Decimal("2"))
+            }
+            worst = scenario_results[Decimal("2")]
+            results[candidate.identity] = worst
+            evidence[candidate.identity] = self.protocol.evaluate(
+                worst,
+                initial_equity=self.initial_equity,
+                attempts=1,
+                cost_stress_multipliers=tuple(scenario_results),
+                cost_scenario_trades=scenario_results,
+            )
+        return evidence, results
 
     def _evaluate_period(
         self,
@@ -601,6 +647,13 @@ def _parameter_sets(candidate: CandidateRecord) -> tuple[dict[str, object], ...]
 
 def _baseline_parameters(candidate: CandidateRecord) -> dict[str, object]:
     return {"baseline_family": candidate.family, "unoptimised": True}
+
+
+def _first_parameter_values(parameters: Mapping[str, object]) -> dict[str, object]:
+    return {
+        name: value[0] if isinstance(value, list) and value else value
+        for name, value in parameters.items()
+    }
 
 
 def _expectancy(trades: tuple[ScalpResult, ...]) -> Decimal:

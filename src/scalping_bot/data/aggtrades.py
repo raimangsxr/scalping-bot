@@ -39,7 +39,13 @@ class AggTradeArchivePipeline:
     def ingest_file(
         self, archive_path: Path, *, expected_sha256: str, source_uri: str
     ) -> AggTradeManifest:
-        archive = archive_path.read_bytes()
+        return self.ingest_bytes(
+            archive_path.read_bytes(), expected_sha256=expected_sha256, source_uri=source_uri
+        )
+
+    def ingest_bytes(
+        self, archive: bytes, *, expected_sha256: str, source_uri: str
+    ) -> AggTradeManifest:
         checksum = hashlib.sha256(archive).hexdigest()
         if checksum.lower() != expected_sha256.lower():
             raise ArchiveIntegrityError("aggregate-trade checksum mismatch")

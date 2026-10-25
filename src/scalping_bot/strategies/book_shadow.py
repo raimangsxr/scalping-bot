@@ -1,7 +1,10 @@
+import hashlib
+import json
 from dataclasses import dataclass
 from decimal import Decimal
 from statistics import pstdev
 
+from scalping_bot.data.storage import ObjectStore
 from scalping_bot.research.features import BookFlowFeatures
 
 
@@ -75,7 +78,8 @@ class BookShadowReport:
 class BookShadowEvaluator:
     """Collect prospective Book Flow observations without an executable path."""
 
-    def __init__(self) -> None:
+    def __init__(self, confirmation: ShadowBookConfirmation | None = None) -> None:
+        self.confirmation = confirmation
         self._observations: list[BookShadowObservation] = []
         self._last_event_time_ms: int | None = None
         self._gaps = 0
@@ -92,12 +96,16 @@ class BookShadowEvaluator:
         ):
             self._gaps += 1
         self._last_event_time_ms = observation.event_time_ms
-        decision = ShadowDecision(
-            hypothetical_allow=(
-                observation.hypothetical_entry
-                and observation.features.valid
-                and observation.features.market_data_quality == "valid"
-                and observation.features.segment_id is not None
+        confirmation = (
+            self.confirmation.evaluate(observation.features)
+            if self.confirmation is not None
+            else ShadowDecision(
+                hypothetical_allow=(
+                    observation.hypothetical_entry
+                    and observation.features.valid
+                    and observation.features.market_data_quality == "valid"
+                    and observation.features.segment_id is not None
+                )
             )
         )
         self._observations.append(
@@ -105,10 +113,14 @@ class BookShadowEvaluator:
                 event_time_ms=observation.event_time_ms,
                 features=observation.features,
                 baseline_entry=observation.baseline_entry,
-                hypothetical_entry=decision.hypothetical_allow,
+                hypothetical_entry=(
+                    observation.hypothetical_entry and confirmation.hypothetical_allow
+                ),
             )
         )
-        return decision
+        return ShadowDecision(
+            hypothetical_allow=(observation.hypothetical_entry and confirmation.hypothetical_allow)
+        )
 
     def record_gap(self) -> None:
         """Record a sequence gap that invalidates the current Book Flow segment."""
@@ -149,3 +161,50 @@ class BookShadowEvaluator:
                 else None
             ),
         )
+
+    @property
+    def observations(self) -> tuple[BookShadowObservation, ...]:
+        return tuple(self._observations)
+
+    def persist_report(self, store: ObjectStore) -> str:
+        report = self.report()
+        payload = {
+            "schema_version": 1,
+            "report": {
+                "observations": report.observations,
+                "valid_observations": report.valid_observations,
+                "coverage": str(report.coverage),
+                "gaps": report.gaps,
+                "feature_stability": (
+                    str(report.feature_stability) if report.feature_stability is not None else None
+                ),
+                "hypothetical_entries": report.hypothetical_entries,
+                "blocked_entries": report.blocked_entries,
+                "incremental_shadow_entries": report.incremental_shadow_entries,
+                "incremental_shadow_effect": (
+                    str(report.incremental_shadow_effect)
+                    if report.incremental_shadow_effect is not None
+                    else None
+                ),
+                "promoted": False,
+            },
+            "observations": [
+                {
+                    "event_time_ms": item.event_time_ms,
+                    "baseline_entry": item.baseline_entry,
+                    "hypothetical_entry": item.hypothetical_entry,
+                    "valid": item.features.valid,
+                    "market_data_quality": item.features.market_data_quality,
+                    "segment_id": item.features.segment_id,
+                    "depth_imbalance": str(item.features.depth_imbalance),
+                    "best_quote_imbalance": str(item.features.best_quote_imbalance),
+                }
+                for item in self._observations
+            ],
+            "classification": "Shadow Evaluation",
+            "markdown": report.markdown,
+        }
+        content = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        key = f"shadow/book-flow/{hashlib.sha256(content).hexdigest()}.json"
+        store.put_immutable(key, content)
+        return key

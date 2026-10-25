@@ -93,6 +93,8 @@ class ExecutionExchange(Protocol):
 
     def cancel_protection(self, *, client_order_id: str) -> None: ...
 
+    def cancel_order(self, *, client_order_id: str) -> None: ...
+
 
 class ExecutionService:
     def __init__(
@@ -162,6 +164,59 @@ class ExecutionService:
             self._account_entry(command, result, event_time_ms=event_time_ms)
             updates.append((command, result))
         return tuple(updates)
+
+    def flatten_and_lock(self, *, event_time_ms: int, reason: str) -> None:
+        """Cancel pending entry work, flatten exposure, and persist the lock."""
+        if not reason.strip():
+            raise ValueError("flatten and lock requires a reason")
+        for intent in self.state.active_intents():
+            identity = str(intent["client_order_id"])
+            if intent["side"] != "BUY":
+                continue
+            try:
+                self.exchange.cancel_order(client_order_id=identity)
+            except Exception as error:
+                self.state.append_audit(
+                    kind="pending-entry-cancel-failed",
+                    event_time_ms=event_time_ms,
+                    details={"client_order_id": identity, "error_type": type(error).__name__},
+                )
+                self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
+                raise
+            self.state.update_order_intent(identity, status="CANCELED")
+            self.state.append_audit(
+                kind="pending-entry-canceled",
+                event_time_ms=event_time_ms,
+                details={"client_order_id": identity},
+            )
+        position = self.state.position()
+        if position is None:
+            self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
+            self.state.append_audit(
+                kind="flattened-and-locked",
+                event_time_ms=event_time_ms,
+                details={"reason": reason, "exposure": "flat"},
+            )
+            return
+        entry_identity = self.state.position_entry_client_order_id()
+        protection = self.state.protection(entry_identity)
+        if protection is not None:
+            try:
+                self.exchange.cancel_protection(client_order_id=str(protection["client_order_id"]))
+            except Exception as error:
+                self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
+                self.state.append_audit(
+                    kind="operator-protection-cancel-failed",
+                    event_time_ms=event_time_ms,
+                    details={"error_type": type(error).__name__},
+                )
+                raise
+        self._flatten_and_lock(
+            entry_identity,
+            Decimal(str(position["quantity"])),
+            event_time_ms=event_time_ms,
+            reason=reason,
+        )
 
     def submit_exit(self, command: ExitMarket, *, event_time_ms: int) -> OrderResult:
         position = self.state.position()

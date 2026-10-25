@@ -292,6 +292,15 @@ class ProductionLiveShadowStream:
                     event = _parse_market_message(message)
                     if event is not None:
                         messages.put(("event", lane, event, time.time_ns() // 1_000_000))
+            if not stop.is_set() and not connection_stop.is_set():
+                messages.put(
+                    (
+                        "error",
+                        lane,
+                        RuntimeError("Live Shadow websocket closed cleanly"),
+                        time.time_ns() // 1_000_000,
+                    )
+                )
         except Exception as error:
             if not stop.is_set() and not connection_stop.is_set():
                 messages.put(("error", lane, error, time.time_ns() // 1_000_000))

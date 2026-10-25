@@ -47,7 +47,7 @@ from scalping_bot.operations.observability import OperationalMetrics
 from scalping_bot.operations.operator_channel import OperatorCommandStore
 from scalping_bot.operations.promoted_risk_trial import run_promoted_risk_trial
 from scalping_bot.operations.promotion import PromotedRiskGate, RiskEvaluation
-from scalping_bot.operations.release import ReleaseVerifier
+from scalping_bot.operations.release import ReleaseProvenance, ReleaseVerifier
 from scalping_bot.research.candidates import first_batch
 from scalping_bot.research.costs import (
     AccountCommissionSnapshot,
@@ -469,9 +469,19 @@ def deployment_check(
 def verify_release(
     manifests: Path = Path("deploy/k8s"),
     application: Path = Path("deploy/argocd/application.yaml"),
+    provenance: Annotated[Path | None, typer.Option("--provenance")] = None,
+    sbom: Annotated[Path | None, typer.Option("--sbom")] = None,
 ) -> None:
     """Verify one immutable image, GitOps revision, and isolated process identities."""
     result = ReleaseVerifier.from_paths(manifests, application).verify()
+    if (provenance is None) != (sbom is None):
+        raise typer.BadParameter("--provenance and --sbom must be supplied together")
+    if provenance is not None and sbom is not None:
+        try:
+            value = json.loads(provenance.read_text(encoding="utf-8"))
+            ReleaseProvenance.from_json(value).verify(result, sbom=sbom.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise typer.BadParameter(f"release provenance verification failed: {error}") from error
     typer.echo(f"release verified: {result.image_revision}")
 
 

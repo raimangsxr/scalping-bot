@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,66 @@ class ReleaseVerification:
 
 class ReleaseVerificationError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class ReleaseProvenance:
+    """Release metadata tying source, image digest, manifests, and SBOM together."""
+
+    source_commit: str
+    image: str
+    image_digest: str
+    manifest_commit: str
+    sbom_sha256: str
+
+    def verify(
+        self,
+        verification: ReleaseVerification,
+        *,
+        sbom: bytes,
+    ) -> None:
+        if self.source_commit.lower() != verification.image_revision:
+            raise ReleaseVerificationError("provenance source commit and image tag differ")
+        if self.manifest_commit.lower() != verification.target_revision.lower():
+            raise ReleaseVerificationError("provenance manifest commit and Argo revision differ")
+        if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", self.image_digest):
+            raise ReleaseVerificationError("provenance image digest is malformed")
+        if "@" in self.image:
+            declared_image_digest = self.image.rsplit("@", 1)[1]
+            if declared_image_digest.lower() != self.image_digest.lower():
+                raise ReleaseVerificationError(
+                    "provenance image digest does not match image reference"
+                )
+        actual_sbom = hashlib.sha256(sbom).hexdigest()
+        if actual_sbom != self.sbom_sha256.lower():
+            raise ReleaseVerificationError("provenance SBOM checksum does not match content")
+
+    @classmethod
+    def from_json(cls, value: object) -> ReleaseProvenance:
+        if not isinstance(value, dict):
+            raise ReleaseVerificationError("release provenance must be a JSON object")
+        try:
+            result = cls(
+                source_commit=str(value["source_commit"]),
+                image=str(value["image"]),
+                image_digest=str(value["image_digest"]),
+                manifest_commit=str(value["manifest_commit"]),
+                sbom_sha256=str(value["sbom_sha256"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ReleaseVerificationError("release provenance is malformed") from error
+        for name, value_text in (
+            ("source_commit", result.source_commit),
+            ("manifest_commit", result.manifest_commit),
+            ("sbom_sha256", result.sbom_sha256),
+        ):
+            if len(value_text) != 40 and name != "sbom_sha256":
+                raise ReleaseVerificationError(f"provenance {name} is malformed")
+            if name == "sbom_sha256" and len(value_text) != 64:
+                raise ReleaseVerificationError("provenance sbom_sha256 is malformed")
+            if any(character not in "0123456789abcdefABCDEF" for character in value_text):
+                raise ReleaseVerificationError(f"provenance {name} is malformed")
+        return result
 
 
 class ReleaseVerifier:

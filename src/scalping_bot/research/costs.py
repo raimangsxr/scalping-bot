@@ -118,6 +118,81 @@ def capture_account_commission_snapshot(
 
 
 @dataclass(frozen=True)
+class CalibrationBucketPlan:
+    """Frozen evidence requirements for one Execution Cost Model."""
+
+    hours_utc: tuple[int, ...]
+    volatility_buckets: tuple[str, ...]
+    size_buckets: tuple[str, ...]
+    minimum_observations: int = 1
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        normalized_hours = tuple(sorted(set(self.hours_utc)))
+        if any(hour < 0 or hour > 23 for hour in normalized_hours) or not normalized_hours:
+            raise ValueError("calibration plan hours must be sorted unique UTC hours")
+        object.__setattr__(self, "hours_utc", normalized_hours)
+        for label, values in (
+            ("volatility", self.volatility_buckets),
+            ("size", self.size_buckets),
+        ):
+            normalized_values = tuple(sorted(set(values)))
+            if not normalized_values or any(not item for item in normalized_values):
+                raise ValueError(f"calibration plan {label} buckets must be sorted and non-empty")
+            object.__setattr__(self, f"{label}_buckets", normalized_values)
+        if self.minimum_observations < 1:
+            raise ValueError("calibration plan minimum observations must be positive")
+
+    @property
+    def required_buckets(self) -> tuple[tuple[int, str, str], ...]:
+        return tuple(
+            (hour, volatility, size)
+            for hour in self.hours_utc
+            for volatility in self.volatility_buckets
+            for size in self.size_buckets
+        )
+
+    def canonical_bytes(self) -> bytes:
+        value = {
+            "schema_version": self.schema_version,
+            "hours_utc": list(self.hours_utc),
+            "volatility_buckets": list(self.volatility_buckets),
+            "size_buckets": list(self.size_buckets),
+            "minimum_observations": self.minimum_observations,
+        }
+        return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    @property
+    def identity(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def persist(self, store: ObjectStore) -> str:
+        key = f"calibration-plans/{self.identity}.json"
+        store.put_immutable(key, self.canonical_bytes())
+        return key
+
+    @classmethod
+    def load(cls, store: ObjectStore, key: str) -> CalibrationBucketPlan:
+        raw = store.read(key)
+        expected = key.rsplit("/", 1)[-1].removesuffix(".json")
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise ValueError("calibration plan checksum does not match its key")
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("calibration plan is malformed")
+        plan = cls(
+            hours_utc=tuple(int(str(item)) for item in value["hours_utc"]),
+            volatility_buckets=tuple(str(item) for item in value["volatility_buckets"]),
+            size_buckets=tuple(str(item) for item in value["size_buckets"]),
+            minimum_observations=int(str(value["minimum_observations"])),
+            schema_version=int(str(value.get("schema_version", 1))),
+        )
+        if plan.identity != expected:
+            raise ValueError("calibration plan identity is invalid")
+        return plan
+
+
+@dataclass(frozen=True)
 class CalibrationObservation:
     time_ms: int
     hour_utc: int
@@ -230,6 +305,7 @@ class ExecutionCostModel:
     scenarios: tuple[Decimal, ...] = (Decimal("1"), Decimal("1.5"), Decimal("2"))
     source_evidence: tuple[str, ...] = ()
     calibration_method: str = "causal-bookticker-v1"
+    bucket_plan_identity: str | None = None
 
     def __post_init__(self) -> None:
         if not self.calibration_method.strip():
@@ -263,6 +339,7 @@ class ExecutionCostModel:
             "scenarios": [str(item) for item in self.scenarios],
             "source_evidence": list(self.source_evidence),
             "calibration_method": self.calibration_method,
+            "bucket_plan_identity": self.bucket_plan_identity,
         }
         return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
@@ -406,6 +483,11 @@ class ExecutionCostModel:
             scenarios=scenarios,
             source_evidence=source_evidence,
             calibration_method=calibration_method,
+            bucket_plan_identity=(
+                str(raw["bucket_plan_identity"])
+                if raw.get("bucket_plan_identity") is not None
+                else None
+            ),
         )
 
 
@@ -417,6 +499,7 @@ class ExecutionCostCalibrator:
         commission: AccountCommissionSnapshot,
         required_buckets: tuple[tuple[int, str, str], ...] = (),
         minimum_observations: int = 1,
+        bucket_plan: CalibrationBucketPlan | None = None,
     ) -> ExecutionCostModel:
         if not observations:
             raise ValueError("cost calibration requires production observations")
@@ -432,6 +515,11 @@ class ExecutionCostCalibrator:
             grouped[(item.hour_utc, item.volatility_bucket, item.size_bucket)].append(
                 (spread_bps, slippage_bps)
             )
+        if bucket_plan is not None:
+            if required_buckets and required_buckets != bucket_plan.required_buckets:
+                raise ValueError("explicit calibration buckets conflict with the frozen plan")
+            required_buckets = bucket_plan.required_buckets
+            minimum_observations = bucket_plan.minimum_observations
         if required_buckets:
             missing = [
                 bucket
@@ -448,7 +536,11 @@ class ExecutionCostCalibrator:
             )
             for key, values in grouped.items()
         }
-        return ExecutionCostModel(commission=commission, buckets=buckets)
+        return ExecutionCostModel(
+            commission=commission,
+            buckets=buckets,
+            bucket_plan_identity=bucket_plan.identity if bucket_plan is not None else None,
+        )
 
 
 class ExecutionCostModelPublisher:
@@ -484,6 +576,7 @@ class ExecutionCostModelPublisher:
             scenarios=model.scenarios,
             source_evidence=tuple(sorted(set(evidence))),
             calibration_method=model.calibration_method,
+            bucket_plan_identity=model.bucket_plan_identity,
         )
         canonical = published.canonical_bytes()
         key = f"cost-models/{published.identity}.json"

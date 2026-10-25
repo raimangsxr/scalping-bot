@@ -44,6 +44,7 @@ from scalping_bot.operations.release import ReleaseVerifier
 from scalping_bot.research.candidates import first_batch
 from scalping_bot.research.costs import (
     AccountCommissionSnapshot,
+    CalibrationBucketPlan,
     CalibrationObservation,
     ExecutionCostCalibrator,
     ExecutionCostModel,
@@ -110,6 +111,7 @@ def publish_cost_model(
     commission: Annotated[Path, typer.Argument(exists=True, readable=True)],
     output: Path = Path("data/cost-model"),
     captured_ms: int = typer.Option(..., help="Capture time for the Account Commission Snapshot"),
+    bucket_plan_key: str | None = typer.Option(None, "--bucket-plan"),
     source_storage: Annotated[
         Path,
         typer.Option("--source-storage", help="Immutable object-store root containing sources"),
@@ -140,6 +142,9 @@ def publish_cost_model(
             "every calibration observation must cite immutable source evidence"
         )
     source_store = LocalObjectStore(source_storage)
+    if bucket_plan_key is None:
+        raise typer.BadParameter("--bucket-plan is required to publish production cost evidence")
+    bucket_plan = CalibrationBucketPlan.load(source_store, bucket_plan_key)
     source_evidence = tuple(
         str(item["source"])
         for item in raw_observations
@@ -155,9 +160,13 @@ def publish_cost_model(
     snapshot = AccountCommissionSnapshot.from_binance_response(
         raw_commission, captured_ms=captured_ms, account_context="configured-account"
     )
-    model = ExecutionCostCalibrator().fit(parsed, commission=snapshot)
+    model = ExecutionCostCalibrator().fit(
+        parsed,
+        commission=snapshot,
+        bucket_plan=bucket_plan,
+    )
     key = ExecutionCostModelPublisher(LocalObjectStore(output)).publish(
-        model, source_evidence=source_evidence
+        model, source_evidence=(*source_evidence, bucket_plan_key)
     )
     typer.echo(f"cost-model={key}")
 
@@ -186,25 +195,52 @@ def capture_commission_snapshot(
 
 
 @app.command()
+def freeze_calibration_plan(
+    output: Annotated[Path, typer.Option("--output")] = Path("data/cost-model"),
+    hours_utc: Annotated[list[int] | None, typer.Option("--hour")] = None,
+    volatility_buckets: Annotated[list[str] | None, typer.Option("--volatility")] = None,
+    size_buckets: Annotated[list[str] | None, typer.Option("--size")] = None,
+    minimum_observations: int = typer.Option(1, "--minimum-observations"),
+) -> None:
+    """Freeze the required production evidence buckets before calibration capture."""
+    plan = CalibrationBucketPlan(
+        hours_utc=tuple(hours_utc or range(24)),
+        volatility_buckets=tuple(volatility_buckets or ("low", "medium", "high")),
+        size_buckets=tuple(size_buckets or ("small", "medium", "large")),
+        minimum_observations=minimum_observations,
+    )
+    typer.echo(f"calibration-plan={plan.persist(LocalObjectStore(output))}")
+
+
+@app.command()
 def publish_cost_model_from_capture(
     commission: Annotated[Path, typer.Argument(exists=True, readable=True)],
     storage: Path = Path("data"),
     output: Path = Path("data/cost-model"),
     captured_ms: int = typer.Option(..., help="Capture time for the Account Commission Snapshot"),
+    bucket_plan_key: str | None = typer.Option(None, "--bucket-plan"),
 ) -> None:
     """Calibrate costs from valid immutable production capture and account commission."""
     raw_commission = json.loads(commission.read_text(encoding="utf-8"))
     if not isinstance(raw_commission, dict):
         raise typer.BadParameter("commission must be a Binance commission JSON object")
-    observations, evidence = calibration_observations_from_capture(LocalObjectStore(storage))
+    source_store = LocalObjectStore(storage)
+    if bucket_plan_key is None:
+        raise typer.BadParameter("--bucket-plan is required to publish production cost evidence")
+    bucket_plan = CalibrationBucketPlan.load(source_store, bucket_plan_key)
+    observations, evidence = calibration_observations_from_capture(source_store)
     if not observations:
         raise RuntimeError("capture contains no quote-matched aggregate-trade observations")
     snapshot = AccountCommissionSnapshot.from_binance_response(
         raw_commission, captured_ms=captured_ms, account_context="configured-account"
     )
-    model = ExecutionCostCalibrator().fit(observations, commission=snapshot)
+    model = ExecutionCostCalibrator().fit(
+        observations,
+        commission=snapshot,
+        bucket_plan=bucket_plan,
+    )
     key = ExecutionCostModelPublisher(LocalObjectStore(output)).publish(
-        model, source_evidence=evidence
+        model, source_evidence=(*evidence, bucket_plan_key)
     )
     typer.echo(f"cost-model={key} observations={len(observations)}")
 

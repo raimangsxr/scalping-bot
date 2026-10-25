@@ -12,6 +12,7 @@ from scalping_bot.domain.costs import ExecutionCostSnapshot
 from scalping_bot.execution.binance import InMemorySpotTransport
 from scalping_bot.research.costs import (
     AccountCommissionSnapshot,
+    CalibrationBucketPlan,
     CalibrationObservation,
     ExecutionCostCalibrator,
     ExecutionCostModel,
@@ -172,3 +173,47 @@ def test_commission_capture_uses_the_exchange_transport_seam() -> None:
         "maker": "0.001",
         "taker": "0.001",
     }
+
+
+def test_calibration_bucket_plan_is_frozen_and_enforced(tmp_path: Path) -> None:
+    plan = CalibrationBucketPlan(
+        hours_utc=(0, 12),
+        volatility_buckets=("low", "high"),
+        size_buckets=("small",),
+        minimum_observations=2,
+    )
+    store = LocalObjectStore(tmp_path / "objects")
+    key = plan.persist(store)
+
+    assert CalibrationBucketPlan.load(store, key) == plan
+    with pytest.raises(ValueError, match="missing calibration bucket"):
+        ExecutionCostCalibrator().fit(
+            (_observation(0),),
+            commission=AccountCommissionSnapshot(
+                symbol="BTCUSDT", maker=Decimal("0.001"), taker=Decimal("0.001"), captured_ms=1
+            ),
+            bucket_plan=plan,
+        )
+
+    complete = tuple(
+        CalibrationObservation(
+            time_ms=100 + index,
+            hour_utc=hour,
+            volatility_bucket=volatility,
+            size_bucket="small",
+            bid=Decimal("99.90"),
+            ask=Decimal("100.10"),
+            simulated_buy_price=Decimal("100.15"),
+        )
+        for index, (hour, volatility) in enumerate(
+            bucket[:2] for bucket in plan.required_buckets for _ in range(2)
+        )
+    )
+    model = ExecutionCostCalibrator().fit(
+        complete,
+        commission=AccountCommissionSnapshot(
+            symbol="BTCUSDT", maker=Decimal("0.001"), taker=Decimal("0.001"), captured_ms=1
+        ),
+        bucket_plan=plan,
+    )
+    assert model.bucket_plan_identity == plan.identity

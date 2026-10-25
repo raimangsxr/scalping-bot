@@ -69,7 +69,7 @@ def test_sqlite_uses_durable_single_writer_settings_and_versioned_migrations(
         assert state.pragma("journal_mode") == "wal"
         assert state.pragma("foreign_keys") == 1
         assert state.pragma("synchronous") == 2
-        assert state.schema_version == 4
+        assert state.schema_version == 5
         with pytest.raises(WriterAlreadyActive):
             SQLiteState(path)
     finally:

@@ -19,7 +19,7 @@ from scalping_bot.research.evidence import (
     HoldoutAccessError,
     HoldoutRegistry,
 )
-from scalping_bot.research.execution import AggTrade
+from scalping_bot.research.execution import AggTrade, canonical_aggregate_trade_bytes
 from scalping_bot.research.runner import ResearchBatchRunner
 
 
@@ -89,6 +89,10 @@ class FinalHoldoutGate:
             raise ValueError("Final Holdout evidence is bound to another dataset")
         if evidence.execution_cost_model_identity != cost_identity:
             raise ValueError("Final Holdout evidence is bound to another cost model")
+        if evidence.frozen_parameters is None or dict(evidence.frozen_parameters) != dict(
+            candidate.parameters
+        ):
+            raise ValueError("Final Holdout evidence is not bound to the frozen parameters")
         if execution_cost_model_key.startswith("cost-models/"):
             ExecutionCostModel.load(self.store, execution_cost_model_key)
         try:
@@ -161,10 +165,28 @@ class FinalHoldoutGate:
         if not aggregate_trades:
             raise ValueError("Final Holdout aggregate-trade evidence cannot be empty")
         months = {_month(item.time_ms) for item in aggregate_trades}
-        if not months or min(months) < "2025-10" or max(months) > "2026-09":
+        required_months = {
+            f"{year:04d}-{month:02d}"
+            for year in (2025, 2026)
+            for month in range(1, 13)
+            if (year, month) >= (2025, 10) and (year, month) <= (2026, 9)
+        }
+        if months != required_months:
             raise ValueError(
-                "Final Holdout trades must be within October 2025 through September 2026"
+                "Final Holdout trades must cover every month from October 2025 "
+                "through September 2026"
             )
+        dataset = self.store.read(holdout_dataset_key)
+        if dataset != canonical_aggregate_trade_bytes(aggregate_trades):
+            raise ValueError(
+                "Final Holdout dataset artifact does not match parsed aggregate trades"
+            )
+        registered = next(
+            (item for item in first_batch().candidates if item.identity == candidate.identity),
+            None,
+        )
+        if registered is None or not _candidate_provenance_matches(candidate, registered):
+            raise HoldoutAccessError("Final Holdout candidate provenance is not preregistered")
         model = ExecutionCostModel.load(self.store, execution_cost_model_key)
         evidence, _trades = ResearchBatchRunner(
             execution_costs=model.as_engine_costs(),
@@ -211,6 +233,19 @@ def _parameters_are_preregistered(
         elif value not in allowed:
             return False
     return True
+
+
+def _candidate_provenance_matches(candidate: CandidateRecord, registered: CandidateRecord) -> bool:
+    return (
+        candidate.family == registered.family
+        and candidate.source_uri == registered.source_uri
+        and candidate.source_license == registered.source_license
+        and candidate.thesis == registered.thesis
+        and dict(candidate.original_rules) == dict(registered.original_rules)
+        and dict(candidate.modifications) == dict(registered.modifications)
+        and tuple(candidate.rejection_criteria) == tuple(registered.rejection_criteria)
+        and tuple(candidate.market_data_dependencies) == tuple(registered.market_data_dependencies)
+    )
 
 
 def _require_content_addressed_key(key: str, content: bytes) -> str:

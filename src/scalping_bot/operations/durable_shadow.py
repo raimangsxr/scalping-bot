@@ -53,6 +53,10 @@ class DurableLiveShadow:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, event_time_ms INTEGER NOT NULL,
                 client_order_id TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS hypothetical_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, event_time_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL
+            );
             """
         )
         candidate = PromotedCandidateManifest.load(candidate_manifest)
@@ -109,6 +113,9 @@ class DurableLiveShadow:
         self.connection.commit()
 
     def record_missing_dependency(self, *, event_time_ms: int, dependency: str) -> None:
+        event_time_ms = max(event_time_ms, self.started_ms)
+        if self.gate.comparisons:
+            event_time_ms = max(event_time_ms, self.gate.comparisons[-1].event_time_ms + 1)
         self.gate.missing_dependency(event_time_ms=event_time_ms, dependency=dependency)
         self._persist_last_comparison()
 
@@ -119,6 +126,15 @@ class DurableLiveShadow:
         self.connection.execute(
             "INSERT INTO order_attempts(event_time_ms, client_order_id) VALUES (?, ?)",
             (event_time_ms, client_order_id),
+        )
+        self.connection.commit()
+
+    def record_hypothetical_decision(self, *, event_time_ms: int, kind: str) -> None:
+        """Persist a proposal or command observed by the no-order shadow lane."""
+        self.gate.record_hypothetical_decision(event_time_ms=event_time_ms, kind=kind)
+        self.connection.execute(
+            "INSERT INTO hypothetical_decisions(event_time_ms, kind) VALUES (?, ?)",
+            (event_time_ms, kind),
         )
         self.connection.commit()
 
@@ -171,6 +187,13 @@ class DurableLiveShadow:
             self.gate.record_order_submission(
                 event_time_ms=int(row["event_time_ms"]),
                 client_order_id=str(row["client_order_id"]),
+            )
+        for row in self.connection.execute(
+            "SELECT event_time_ms, kind FROM hypothetical_decisions ORDER BY id"
+        ):
+            self.gate.record_hypothetical_decision(
+                event_time_ms=int(row["event_time_ms"]),
+                kind=str(row["kind"]),
             )
 
     def _persist_last_comparison(self) -> None:

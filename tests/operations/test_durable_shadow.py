@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from scalping_bot.data.storage import LocalObjectStore
-from scalping_bot.domain.events import CandleClosed
+from scalping_bot.domain.events import CandleClosed, MarketTick
 from scalping_bot.execution.candidate import PromotedCandidateManifest
 from scalping_bot.operations.durable_shadow import DurableLiveShadow
 from scalping_bot.operations.live_shadow_runtime import SharedEngineLiveShadow
@@ -132,7 +132,48 @@ def test_live_shadow_derives_comparisons_from_shared_engines_without_orders(tmp_
             ),
             receipt_time_ms=(minute + 1) * 60_000 + 10,
         )
+    runner.process_event(
+        MarketTick(event_id="tick-3", event_time_ms=180_001, price=Decimal("103")),
+        receipt_time_ms=180_011,
+    )
 
     assert len(process.gate.comparisons) == 3
     assert all(item.orders_submitted == 0 for item in process.gate.comparisons)
     process.close()
+
+    resumed = DurableLiveShadow(
+        tmp_path / "shadow.db",
+        candidate_manifest=candidate_path,
+        cost_model=cost_path,
+        store=LocalObjectStore(tmp_path / "objects"),
+    )
+    assert "Hypothetical decisions: 3" in resumed.gate.evaluate(now_ms=180_011).report
+    resumed.close()
+
+
+def test_live_shadow_persists_missing_dependency_as_degraded_evidence(tmp_path: Path) -> None:
+    candidate_path = tmp_path / "candidate.json"
+    cost_path = tmp_path / "cost.json"
+    _candidate_manifest(candidate_path)
+    _cost_snapshot(cost_path)
+    store = LocalObjectStore(tmp_path / "objects")
+    process = DurableLiveShadow(
+        tmp_path / "shadow.db",
+        candidate_manifest=candidate_path,
+        cost_model=cost_path,
+        store=store,
+        started_ms=100,
+    )
+    process.record_missing_dependency(event_time_ms=100, dependency="live-stream")
+    process.close()
+
+    resumed = DurableLiveShadow(
+        tmp_path / "shadow.db",
+        candidate_manifest=candidate_path,
+        cost_model=cost_path,
+        store=store,
+    )
+    result = resumed.gate.evaluate(now_ms=14 * DAY)
+    assert not result.approved
+    assert "missing dependency: live-stream" in result.report
+    resumed.close()

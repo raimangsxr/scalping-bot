@@ -23,6 +23,7 @@ from scalping_bot.domain.events import (
     MarketTick,
     OperatorConfirmedNewDay,
 )
+from scalping_bot.domain.market_context import MarketContext
 from scalping_bot.domain.state import InMemoryState
 from scalping_bot.execution.candidate import PromotedCandidateManifest
 from scalping_bot.execution.live import _parse_market_message
@@ -139,6 +140,7 @@ class SharedEngineLiveShadow:
         self._replay_adapter = ReplayEventAdapter()
         self._live_candles: dict[str, _LaneCandle] = {}
         self._replay_candles: dict[str, _LaneCandle] = {}
+        self._lane_context: dict[str, tuple[str | None, str | None]] = {}
 
     def process_event(self, event: EngineEvent, *, receipt_time_ms: int) -> None:
         """Process one raw event through live and independently reconstructed lanes."""
@@ -166,7 +168,20 @@ class SharedEngineLiveShadow:
         *,
         receipt_time_ms: int,
     ) -> None:
+        if isinstance(event, MarketTick):
+            self._lane_context[lane] = (event.volatility_bucket, event.size_bucket)
         result = engine.handle(event)
+        if lane == "live":
+            for decision in result.decisions:
+                self.process.record_hypothetical_decision(
+                    event_time_ms=decision.event_time_ms,
+                    kind=f"decision:{decision.kind}",
+                )
+            for command in result.commands:
+                self.process.record_hypothetical_decision(
+                    event_time_ms=event.event_time_ms,
+                    kind=f"hypothetical:{type(command).__name__}",
+                )
         # SubmitEntry and all other commands are hypothetical. No exchange
         # adapter is constructed or called by either lane.
         engine.state.pending_entry = None
@@ -179,7 +194,10 @@ class SharedEngineLiveShadow:
             values=_decision_values(result.decisions),
             receipt_time_ms=receipt_time_ms,
             hypothetical_cost=_hypothetical_cost(
-                engine, event_time_ms=event.event_time_ms, volatility_bucket=None
+                engine,
+                event_time_ms=event.event_time_ms,
+                volatility_bucket=self._lane_context.get(lane, (None, None))[0],
+                size_bucket=self._lane_context.get(lane, (None, None))[1],
             ),
         )
         self._record_if_aligned(event.event_id)
@@ -270,6 +288,10 @@ class ProductionLiveShadowStream:
                 worker.join(timeout=5)
             if failure is not None and not stop.is_set():
                 lane, error = failure
+                self.record_missing_dependency(
+                    dependency=f"{lane}-stream",
+                    event_time_ms=time.time_ns() // 1_000_000,
+                )
                 self.runner.process.mark_continuity_broken(f"{lane}-stream:{type(error).__name__}")
                 stop.wait(1)
 
@@ -280,6 +302,7 @@ class ProductionLiveShadowStream:
         stop: threading.Event,
         connection_stop: threading.Event,
     ) -> None:
+        context = MarketContext()
         try:
             with connect(self.endpoint, open_timeout=10, close_timeout=5) as websocket:
                 while not stop.is_set() and not connection_stop.is_set():
@@ -289,7 +312,7 @@ class ProductionLiveShadowStream:
                         continue
                     if not isinstance(message, str):
                         continue
-                    event = _parse_market_message(message)
+                    event = _parse_market_message(message, context=context)
                     if event is not None:
                         messages.put(("event", lane, event, time.time_ns() // 1_000_000))
             if not stop.is_set() and not connection_stop.is_set():
@@ -305,23 +328,39 @@ class ProductionLiveShadowStream:
             if not stop.is_set() and not connection_stop.is_set():
                 messages.put(("error", lane, error, time.time_ns() // 1_000_000))
 
+    def record_missing_dependency(self, *, dependency: str, event_time_ms: int) -> None:
+        """Persist a degraded observation while keeping evidence chronological."""
+        self.runner.process.record_missing_dependency(
+            event_time_ms=event_time_ms,
+            dependency=dependency,
+        )
 
-def parse_shadow_event(value: dict[str, object]) -> EngineEvent:
+
+def parse_shadow_event(
+    value: dict[str, object], *, context: MarketContext | None = None
+) -> EngineEvent:
     """Parse one raw Binance production event for deterministic file replay."""
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"))
-    event = _parse_market_message(raw)
+    event = _parse_market_message(raw, context=context)
     if event is None:
         raise ValueError("shadow event must be a complete trade or one-minute kline")
     return event
 
 
-def _hypothetical_cost(engine: Engine, *, event_time_ms: int, volatility_bucket: str | None) -> str:
+def _hypothetical_cost(
+    engine: Engine,
+    *,
+    event_time_ms: int,
+    volatility_bucket: str | None,
+    size_bucket: str | None,
+) -> str:
     try:
         return str(
             engine.execution_costs.estimated_close_cost(
                 Decimal("1000"),
                 event_time_ms=event_time_ms,
                 volatility_bucket=volatility_bucket,
+                size_bucket=size_bucket,
             )
         )
     except ValueError:

@@ -15,6 +15,8 @@ import pyarrow.parquet as pq
 
 from scalping_bot.data.archive import ArchiveIntegrityError
 from scalping_bot.data.storage import ObjectStore
+from scalping_bot.domain.events import MarketTick
+from scalping_bot.domain.market_context import MarketContext
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,7 @@ class AggTradeArchivePipeline:
         if not raw_rows:
             raise ArchiveIntegrityError("aggregate-trade archive contains no rows")
         rows: list[dict[str, object]] = []
+        context = MarketContext()
         previous_id: int | None = None
         previous_time: int | None = None
         for index, raw in enumerate(raw_rows, start=1):
@@ -133,6 +136,10 @@ class AggTradeArchivePipeline:
                 raise ArchiveIntegrityError("aggregate-trade IDs are duplicate or out of order")
             if previous_time is not None and time_ms < previous_time:
                 raise ArchiveIntegrityError("aggregate trades are not chronological")
+            annotated = context.annotate_trade(
+                MarketTick(event_id=f"aggTrade-{aggregate_id}", event_time_ms=time_ms, price=price),
+                quantity=quantity,
+            )
             rows.append(
                 {
                     "symbol": "BTCUSDT",
@@ -144,6 +151,8 @@ class AggTradeArchivePipeline:
                     "time_ms": time_ms,
                     "buyer_maker": buyer_maker,
                     "best_match": best_match,
+                    "volatility_bucket": annotated.volatility_bucket,
+                    "size_bucket": annotated.size_bucket,
                 }
             )
             previous_id, previous_time = aggregate_id, time_ms

@@ -15,6 +15,7 @@ import pyarrow.parquet as pq
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.domain.engine import Engine, StrategyPolicy
 from scalping_bot.domain.events import CandleClosed, ExitFillReceived, FillReceived, MarketTick
+from scalping_bot.domain.market_context import MarketContext
 from scalping_bot.domain.models import EntryProposal, ExecutionCosts, ExitMarket, SubmitEntry
 from scalping_bot.domain.state import InMemoryState
 from scalping_bot.research.candidates import CandidateBatch, first_batch
@@ -55,6 +56,7 @@ class ResearchBatchRunner:
         manifest_store: ObjectStore | None = None,
         code_commit: str = "working-tree",
         dataset_checksums: tuple[str, ...] = (),
+        position_risk: Decimal = Decimal("0.0025"),
     ) -> None:
         self.execution_costs = execution_costs
         self.initial_equity = initial_equity
@@ -62,6 +64,7 @@ class ResearchBatchRunner:
         self.manifest_store = manifest_store
         self.code_commit = code_commit
         self.dataset_checksums = dataset_checksums
+        self.position_risk = position_risk
 
     def run(
         self,
@@ -269,10 +272,12 @@ class ResearchBatchRunner:
         execution_cost_model_identity: str | None = None,
     ) -> tuple[EvidenceResult, tuple[ScalpResult, ...]]:
         """Evaluate one frozen parameter choice on an unseen holdout period."""
+        if any(isinstance(value, list) for value in candidate.parameters.values()):
+            raise ValueError("frozen candidate evaluation requires concrete parameters")
         scenarios = {
             multiplier: self._evaluate_period(
                 candidate,
-                _first_parameter_values(candidate.parameters),
+                candidate.parameters,
                 trades,
                 fold=0,
                 stress=multiplier,
@@ -287,6 +292,7 @@ class ResearchBatchRunner:
             cost_stress_multipliers=tuple(scenarios),
             cost_scenario_trades=scenarios,
             fold_count_override=1,
+            frozen_parameters=dict(candidate.parameters),
             dataset_checksum=dataset_checksum,
             execution_cost_model_identity=execution_cost_model_identity,
         )
@@ -314,6 +320,7 @@ class ResearchBatchRunner:
             execution_costs=self.execution_costs,
             stress=stress,
             regime=("lateral" if candidate.family == "regime-conditioned-mean-reversion" else None),
+            position_risk=self.position_risk,
         )
 
 
@@ -342,7 +349,25 @@ def load_aggtrades(paths: tuple[Path, ...]) -> tuple[AggTrade, ...]:
     rows.sort(key=lambda item: (item.time_ms, item.aggregate_trade_id))
     if len({item.aggregate_trade_id for item in rows}) != len(rows):
         raise ValueError("aggregate-trade inputs overlap or contain duplicate identifiers")
-    return tuple(rows)
+    context = MarketContext()
+    return tuple(
+        replace(
+            trade,
+            volatility_bucket=annotated.volatility_bucket,
+            size_bucket=annotated.size_bucket,
+        )
+        for trade in rows
+        for annotated in (
+            context.annotate_trade(
+                MarketTick(
+                    event_id=f"aggTrade-{trade.aggregate_trade_id}",
+                    event_time_ms=trade.time_ms,
+                    price=trade.price,
+                ),
+                quantity=trade.quantity,
+            ),
+        )
+    )
 
 
 def _replay_fold(
@@ -354,12 +379,18 @@ def _replay_fold(
     execution_costs: ExecutionCosts,
     stress: Decimal,
     regime: str | None = None,
+    position_risk: Decimal = Decimal("0.0025"),
 ) -> tuple[ScalpResult, ...]:
     if not _aggregate_trades_are_contiguous(trades):
         return ()
     state = InMemoryState(initial_equity=initial_equity)
     stressed_costs = execution_costs.stressed(stress)
-    engine = Engine(state, policy, execution_costs=stressed_costs)
+    engine = Engine(
+        state,
+        policy,
+        execution_costs=stressed_costs,
+        position_risk=position_risk,
+    )
     completed: list[ScalpResult] = []
     open_trade: tuple[str, int, Decimal, Decimal, Decimal] | None = None
     open_marks: list[tuple[int, Decimal]] = []

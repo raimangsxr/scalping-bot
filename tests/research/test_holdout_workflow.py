@@ -55,6 +55,7 @@ def _evidence(promoted: bool, *, dataset_checksum: str, cost_model_identity: str
         selection_adjusted_alpha=Decimal("0.00625"),
         cost_stress_multipliers=(Decimal("1"), Decimal("1.5"), Decimal("2")),
         market_fidelity_verified=True,
+        frozen_parameters={"window_bars": 3, "threshold": "0.005"},
         dataset_checksum=dataset_checksum,
         execution_cost_model_identity=cost_model_identity,
     )

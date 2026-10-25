@@ -514,6 +514,18 @@ class PromotedRiskGate:
     def __init__(self, store: ObjectStore) -> None:
         self.store = store
 
+    def promotion_evidence_valid(
+        self, key: str | None, candidate_identity: str, candidate_rules_sha256: str
+    ) -> bool:
+        reasons: list[str] = []
+        self._check_promotion_reference(key, candidate_identity, candidate_rules_sha256, reasons)
+        return not reasons
+
+    def soak_evidence_valid(self, key: str | None, candidate_identity: str) -> bool:
+        reasons: list[str] = []
+        self._check_soak_reference(key, candidate_identity, reasons)
+        return not reasons
+
     def evaluate(
         self,
         candidate_identity: str,
@@ -541,6 +553,21 @@ class PromotedRiskGate:
             promotion_artifact_key, candidate_identity, baseline.candidate_rules_sha256, reasons
         )
         self._check_soak_reference(soak_report_key, candidate_identity, reasons)
+        if baseline.experiment_manifest_key or promoted.experiment_manifest_key:
+            self._check_experiment_manifest(
+                baseline.experiment_manifest_key,
+                "baseline",
+                candidate_identity,
+                baseline,
+                reasons,
+            )
+            self._check_experiment_manifest(
+                promoted.experiment_manifest_key,
+                "promoted",
+                candidate_identity,
+                promoted,
+                reasons,
+            )
         self._check_limits(baseline, "baseline", reasons)
         self._check_limits(promoted, "promoted", reasons)
         if baseline.notional_fraction != promoted.notional_fraction:
@@ -837,6 +864,71 @@ class PromotedRiskGate:
                 reasons.append("Testnet Soak report key is not content addressed")
             elif hashlib.sha256(raw_content).hexdigest() != expected.lower():
                 reasons.append("Testnet Soak report checksum does not match its key")
+
+    def _check_experiment_manifest(
+        self,
+        key: str | None,
+        label: str,
+        candidate_identity: str,
+        evaluation: RiskEvaluation,
+        reasons: list[str],
+    ) -> None:
+        if not key:
+            reasons.append(f"{label} experiment manifest is required")
+            return
+        expected = key.rsplit("/", 1)[-1].removesuffix(".json")
+        if len(expected) != 64 or any(item not in "0123456789abcdef" for item in expected.lower()):
+            reasons.append(f"{label} experiment manifest key is not content addressed")
+            return
+        try:
+            content = self.store.read(key)
+            payload = json.loads(content)
+        except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            reasons.append(f"{label} experiment manifest is unavailable or malformed")
+            return
+        if hashlib.sha256(content).hexdigest() != expected.lower():
+            reasons.append(f"{label} experiment manifest checksum does not match its key")
+            return
+        if not isinstance(payload, dict):
+            reasons.append(f"{label} experiment manifest is not an object")
+            return
+        if payload.get("candidate_identity") != candidate_identity:
+            reasons.append(f"{label} experiment manifest targets another candidate")
+        if payload.get("candidate_rules_sha256") != evaluation.candidate_rules_sha256:
+            reasons.append(f"{label} experiment manifest rules are malformed")
+        try:
+            manifest_risk = Decimal(str(payload["position_risk"]))
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            reasons.append(f"{label} experiment manifest omits position risk")
+        else:
+            if manifest_risk != evaluation.position_risk:
+                reasons.append(f"{label} experiment manifest risk does not match evaluation")
+        if payload.get("notional_fraction") != str(evaluation.notional_fraction):
+            reasons.append(f"{label} experiment manifest changed the notional cap")
+        if payload.get("daily_loss_limit") != str(evaluation.daily_loss_limit):
+            reasons.append(f"{label} experiment manifest changed the daily loss cap")
+        if payload.get("drawdown_limit") != str(evaluation.drawdown_limit):
+            reasons.append(f"{label} experiment manifest changed the drawdown cap")
+        if (
+            tuple(str(item) for item in payload.get("risk_controls", ()))
+            != evaluation.risk_controls
+        ):
+            reasons.append(f"{label} experiment manifest changed operational controls")
+        if (
+            tuple(str(item) for item in payload.get("dataset_checksums", ()))
+            != evaluation.dataset_checksums
+        ):
+            reasons.append(f"{label} experiment manifest changed dataset evidence")
+        if payload.get("execution_cost_model_sha256") != evaluation.execution_cost_model_sha256:
+            reasons.append(f"{label} experiment manifest changed cost evidence")
+        stress = evaluation.historical_stress
+        if payload.get("historical_stress_artifact_key") != (
+            stress.artifact_key if stress else None
+        ):
+            reasons.append(f"{label} experiment manifest is not bound to historical stress")
+        stress = evaluation.testnet_stress
+        if payload.get("testnet_stress_artifact_key") != (stress.artifact_key if stress else None):
+            reasons.append(f"{label} experiment manifest is not bound to Testnet stress")
 
     @staticmethod
     def _render_report(

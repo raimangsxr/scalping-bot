@@ -112,6 +112,12 @@ MIGRATIONS = (
     ALTER TABLE runtime_state ADD COLUMN drawdown_locked INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE runtime_state ADD COLUMN operator_confirmed_day INTEGER;
     """,
+    """
+    ALTER TABLE runtime_state ADD COLUMN rate_limit_blocked INTEGER NOT NULL DEFAULT 0
+        CHECK (rate_limit_blocked IN (0, 1));
+    ALTER TABLE protections ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE';
+    ALTER TABLE protections ADD COLUMN closed_ms INTEGER;
+    """,
 )
 
 
@@ -180,6 +186,22 @@ class SQLiteState:
             "SELECT operating_mode FROM runtime_state WHERE singleton = 1"
         ).fetchone()
         return OperationalMode(str(row[0]))
+
+    @property
+    def rate_limit_blocked(self) -> bool:
+        row = self.connection.execute(
+            "SELECT rate_limit_blocked FROM runtime_state WHERE singleton = 1"
+        ).fetchone()
+        return bool(row[0])
+
+    def set_rate_limit_blocked(self, blocked: bool) -> None:
+        self.connection.execute(
+            "UPDATE runtime_state SET rate_limit_blocked = ? WHERE singleton = 1",
+            (int(blocked),),
+        )
+
+    def persistence_healthy(self) -> bool:
+        return str(self.connection.execute("PRAGMA quick_check").fetchone()[0]).lower() == "ok"
 
     def set_operating_mode(self, mode: OperationalMode) -> None:
         self.connection.execute(
@@ -256,6 +278,16 @@ class SQLiteState:
             raise LookupError(f"unknown order intent: {client_order_id}")
         return dict(row)
 
+    def order_intents_for_source(self, source_event_id: str) -> tuple[dict[str, object], ...]:
+        return tuple(
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM order_intents WHERE source_event_id = ? "
+                "ORDER BY created_ms, client_order_id",
+                (source_event_id,),
+            ).fetchall()
+        )
+
     def update_order_intent(
         self,
         client_order_id: str,
@@ -330,7 +362,8 @@ class SQLiteState:
         self.connection.execute(
             "INSERT OR REPLACE INTO protections(client_order_id, entry_client_order_id, "
             "exchange_order_id, "
-            "quantity, stop_price, take_profit_price, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "quantity, stop_price, take_profit_price, created_ms, status, closed_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NULL)",
             (
                 client_order_id,
                 entry_client_order_id,
@@ -344,10 +377,28 @@ class SQLiteState:
 
     def protection(self, entry_client_order_id: str) -> dict[str, object] | None:
         row = self.connection.execute(
-            "SELECT * FROM protections WHERE entry_client_order_id = ?",
+            "SELECT * FROM protections WHERE entry_client_order_id = ? AND status = 'ACTIVE' "
+            "ORDER BY created_ms DESC LIMIT 1",
             (entry_client_order_id,),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    def protection_history(self, entry_client_order_id: str) -> tuple[dict[str, object], ...]:
+        return tuple(
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM protections WHERE entry_client_order_id = ? "
+                "ORDER BY created_ms, client_order_id",
+                (entry_client_order_id,),
+            ).fetchall()
+        )
+
+    def close_protection(self, client_order_id: str, *, closed_ms: int) -> None:
+        self.connection.execute(
+            "UPDATE protections SET status = 'CANCELED', closed_ms = ? "
+            "WHERE client_order_id = ? AND status = 'ACTIVE'",
+            (closed_ms, client_order_id),
+        )
 
     def upsert_position(
         self,
@@ -595,6 +646,7 @@ class SQLiteState:
             "intent": intent,
             "fills": fills,
             "protection": dict(protection_row) if protection_row is not None else None,
+            "protection_history": self.protection_history(client_order_id),
             "audit": self.audit_events(client_order_id),
         }
 
@@ -663,6 +715,7 @@ class SQLiteState:
             "exit_orders": exit_orders,
             "fills": fills,
             "protection": self.protection(entry_client_order_id),
+            "protection_history": self.protection_history(entry_client_order_id),
             "audit": audit,
             "pnl": pnl,
         }
@@ -702,7 +755,7 @@ class SQLiteState:
     def active_protection_ids(self) -> frozenset[str]:
         rows = self.connection.execute(
             "SELECT exchange_order_id FROM protections "
-            "WHERE entry_client_order_id IN "
+            "WHERE status = 'ACTIVE' AND entry_client_order_id IN "
             "(SELECT client_order_id FROM order_intents "
             "WHERE status IN ('PROTECTED', 'PARTIALLY_FILLED'))"
         ).fetchall()

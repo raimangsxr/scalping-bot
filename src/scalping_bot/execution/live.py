@@ -21,6 +21,7 @@ from scalping_bot.domain.events import (
     FillReceived,
     MarketTick,
 )
+from scalping_bot.domain.market_context import MarketContext
 from scalping_bot.domain.models import ExitMarket, PlaceProtection, Position, SubmitEntry
 from scalping_bot.execution.executor import ExecutionService, OrderResult
 from scalping_bot.execution.sqlite_state import SQLiteState
@@ -34,6 +35,7 @@ class BinanceTestnetMarketStream:
         self.url = (
             "wss://stream.testnet.binance.vision/stream?streams=btcusdt@aggTrade/btcusdt@kline_1m"
         )
+        self._market_context = MarketContext()
 
     def events(
         self,
@@ -70,10 +72,10 @@ class BinanceTestnetMarketStream:
                             on_reconnect()
                         last_received_ms = time.time_ns() // 1_000_000
                         stale_notified = False
-                        event = _parse_market_message(message)
+                        event = _parse_market_message(message, context=self._market_context)
                         if event is not None:
                             yield event
-            except (ConnectionClosed, OSError) as error:
+            except (ConnectionClosed, OSError, KeyError, TypeError, ValueError) as error:
                 if on_disconnect is not None:
                     on_disconnect(type(error).__name__)
                 if not stop.wait(1):
@@ -173,8 +175,13 @@ class LiveEngineRunner:
             )
 
 
-def _parse_market_message(message: str) -> EngineEvent | None:
-    envelope = json.loads(message)
+def _parse_market_message(
+    message: str, *, context: MarketContext | None = None
+) -> EngineEvent | None:
+    try:
+        envelope = json.loads(message)
+    except json.JSONDecodeError as error:
+        raise ValueError("Binance market message is not valid JSON") from error
     if not isinstance(envelope, dict):
         raise ValueError("Binance market message is malformed")
     payload = envelope.get("data", envelope)
@@ -184,11 +191,14 @@ def _parse_market_message(message: str) -> EngineEvent | None:
     if event_type in {"trade", "aggTrade"}:
         event_time = int(payload["T"])
         trade_id = int(payload["t"] if event_type == "trade" else payload["a"])
-        return MarketTick(
+        event = MarketTick(
             event_id=f"{event_type}-{trade_id}",
             event_time_ms=event_time,
             price=Decimal(str(payload["p"])),
+            size_bucket=None,
         )
+        quantity = Decimal(str(payload["q"]))
+        return context.annotate_trade(event, quantity=quantity) if context else event
     if event_type == "kline":
         kline = payload.get("k")
         if not isinstance(kline, dict) or not bool(kline.get("x")):
@@ -208,7 +218,7 @@ def _parse_market_message(message: str) -> EngineEvent | None:
             sell_volume=Decimal(str(kline["v"])) - Decimal(str(kline["V"])),
             trade_count=int(kline["n"]),
         )
-    return None
+    raise ValueError(f"unsupported Binance market event: {event_type!r}")
 
 
 def _entry_fill_event(

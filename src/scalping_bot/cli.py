@@ -16,9 +16,9 @@ from scalping_bot.data.acquisition import (
 )
 from scalping_bot.data.live import BinancePublicCollector
 from scalping_bot.data.storage import LocalObjectStore
+from scalping_bot.domain.market_context import MarketContext
 from scalping_bot.execution.binance import BinanceSpotTestnetAdapter, OfficialSpotTransport
-from scalping_bot.execution.executor import ExecutionLimits, ExecutionService
-from scalping_bot.execution.reconcile import Reconciler
+from scalping_bot.execution.executor import ExecutionLimits
 from scalping_bot.execution.runtime import run_executor
 from scalping_bot.execution.sqlite_state import SQLiteState
 from scalping_bot.operations.deployment import DeploymentGate
@@ -29,7 +29,8 @@ from scalping_bot.operations.live_shadow_runtime import (
     SharedEngineLiveShadow,
     parse_shadow_event,
 )
-from scalping_bot.operations.operator import OperatorControls
+from scalping_bot.operations.operator_channel import OperatorCommandStore
+from scalping_bot.operations.promoted_risk_trial import run_promoted_risk_trial
 from scalping_bot.operations.promotion import PromotedRiskGate, RiskEvaluation
 from scalping_bot.operations.release import ReleaseVerifier
 from scalping_bot.research.candidates import first_batch
@@ -39,8 +40,10 @@ from scalping_bot.research.costs import (
     ExecutionCostCalibrator,
     ExecutionCostModel,
     ExecutionCostModelPublisher,
+    calibration_observations_from_capture,
 )
 from scalping_bot.research.evidence import CandidateLifecycle, CandidateRecord
+from scalping_bot.research.execution import canonical_aggregate_trade_bytes
 from scalping_bot.research.holdout import FinalHoldoutGate
 from scalping_bot.research.runner import ResearchBatchRunner, load_aggtrades
 from scalping_bot.research.workflow import ResearchArtifactWriter, ResearchRunManifest
@@ -97,8 +100,12 @@ def publish_cost_model(
     commission: Annotated[Path, typer.Argument(exists=True, readable=True)],
     output: Path = Path("data/cost-model"),
     captured_ms: int = typer.Option(..., help="Capture time for the Account Commission Snapshot"),
+    source_storage: Annotated[
+        Path,
+        typer.Option("--source-storage", help="Immutable object-store root containing sources"),
+    ] = Path("data"),
 ) -> None:
-    """Calibrate and publish one immutable Execution Cost Model."""
+    """Calibrate explicit observations only when every source resolves immutably."""
     raw_observations = json.loads(observations.read_text(encoding="utf-8"))
     raw_commission = json.loads(commission.read_text(encoding="utf-8"))
     if not isinstance(raw_observations, list) or not isinstance(raw_commission, dict):
@@ -116,19 +123,57 @@ def publish_cost_model(
         for item in raw_observations
         if isinstance(item, dict)
     )
-    snapshot = AccountCommissionSnapshot.from_binance_response(
-        raw_commission, captured_ms=captured_ms, account_context="configured-account"
-    )
-    model = ExecutionCostCalibrator().fit(parsed, commission=snapshot)
+    if not parsed or any(
+        not item.get("source") for item in raw_observations if isinstance(item, dict)
+    ):
+        raise typer.BadParameter(
+            "every calibration observation must cite immutable source evidence"
+        )
+    source_store = LocalObjectStore(source_storage)
     source_evidence = tuple(
         str(item["source"])
         for item in raw_observations
         if isinstance(item, dict) and item.get("source")
     )
+    try:
+        for source in source_evidence:
+            source_store.read(source)
+    except (FileNotFoundError, KeyError, ValueError) as error:
+        raise typer.BadParameter(
+            "every calibration source must resolve in the immutable source storage"
+        ) from error
+    snapshot = AccountCommissionSnapshot.from_binance_response(
+        raw_commission, captured_ms=captured_ms, account_context="configured-account"
+    )
+    model = ExecutionCostCalibrator().fit(parsed, commission=snapshot)
     key = ExecutionCostModelPublisher(LocalObjectStore(output)).publish(
         model, source_evidence=source_evidence
     )
     typer.echo(f"cost-model={key}")
+
+
+@app.command()
+def publish_cost_model_from_capture(
+    commission: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    storage: Path = Path("data"),
+    output: Path = Path("data/cost-model"),
+    captured_ms: int = typer.Option(..., help="Capture time for the Account Commission Snapshot"),
+) -> None:
+    """Calibrate costs from valid immutable production capture and account commission."""
+    raw_commission = json.loads(commission.read_text(encoding="utf-8"))
+    if not isinstance(raw_commission, dict):
+        raise typer.BadParameter("commission must be a Binance commission JSON object")
+    observations, evidence = calibration_observations_from_capture(LocalObjectStore(storage))
+    if not observations:
+        raise RuntimeError("capture contains no quote-matched aggregate-trade observations")
+    snapshot = AccountCommissionSnapshot.from_binance_response(
+        raw_commission, captured_ms=captured_ms, account_context="configured-account"
+    )
+    model = ExecutionCostCalibrator().fit(observations, commission=snapshot)
+    key = ExecutionCostModelPublisher(LocalObjectStore(output)).publish(
+        model, source_evidence=evidence
+    )
+    typer.echo(f"cost-model={key} observations={len(observations)}")
 
 
 @app.command()
@@ -168,6 +213,8 @@ def run_research(
     manifest = ResearchRunManifest.load(store, manifest_key)
     if not manifest.verify(store):
         raise RuntimeError("research manifest inputs are no longer verifiable")
+    if not historical_parquet:
+        raise RuntimeError("research requires the complete Historical Stress parquet input set")
     bound_paths = (*parquet, *(historical_parquet or ()))
     if not manifest.verify_dataset_paths(bound_paths, store):
         raise RuntimeError(
@@ -204,7 +251,7 @@ def run_research(
 def deployment_check(
     database: Path = Path("state/scalping-bot.db"),
     backup: Path = Path("state/backups/latest.sqlite.fernet"),
-    target_schema: int = 4,
+    target_schema: int = 5,
 ) -> None:
     """Block a planned rollout unless the executor is flat and recoverable."""
     DeploymentGate.assert_path_safe(database, backup=backup, target_schema=target_schema)
@@ -227,9 +274,12 @@ def pause_executor(
     reason: str = typer.Option(...),
 ) -> None:
     """Pause new entries while retaining reconciliation and protection."""
-    with SQLiteState(database) as state:
-        result = OperatorControls(state).pause(reason=reason, event_time_ms=_now_ms())
-        typer.echo(f"{result.mode.value} entries_allowed={result.entries_allowed}")
+    channel = OperatorCommandStore(_operator_channel_path(database))
+    try:
+        command_id = channel.enqueue(kind="pause", reason=reason, event_time_ms=_now_ms())
+    finally:
+        channel.close()
+    typer.echo(f"operator command queued id={command_id}")
 
 
 @app.command()
@@ -238,28 +288,25 @@ def flatten_and_lock(
     reason: str = typer.Option(...),
 ) -> None:
     """Cancel pending work, flatten exposure through the executor, and lock entries."""
-    settings = Settings()
-    with SQLiteState(database) as state:
-        exchange, limits = _configured_exchange(settings)
-        result = OperatorControls(
-            state, ExecutionService(state, exchange, limits)
-        ).flatten_and_lock(reason=reason, event_time_ms=_now_ms())
-        typer.echo(f"{result.mode.value} entries_allowed={result.entries_allowed}")
+    channel = OperatorCommandStore(_operator_channel_path(database))
+    try:
+        command_id = channel.enqueue(
+            kind="flatten-and-lock", reason=reason, event_time_ms=_now_ms()
+        )
+    finally:
+        channel.close()
+    typer.echo(f"operator command queued id={command_id}")
 
 
 @app.command()
 def request_reconciliation(database: Path = Path("state/scalping-bot.db")) -> None:
     """Request an explicit exchange reconciliation and block new entries."""
-    settings = Settings()
-    with SQLiteState(database) as state:
-        OperatorControls(state).request_reconciliation(event_time_ms=_now_ms())
-        exchange, _limits = _configured_exchange(settings)
-        reconciliation = Reconciler(state, exchange).run(
-            reason="operator-request", event_time_ms=_now_ms()
-        )
-        typer.echo(
-            f"reconciled={reconciliation.consistent} divergences={len(reconciliation.divergences)}"
-        )
+    channel = OperatorCommandStore(_operator_channel_path(database))
+    try:
+        command_id = channel.enqueue(kind="reconcile", event_time_ms=_now_ms())
+    finally:
+        channel.close()
+    typer.echo(f"operator command queued id={command_id}")
 
 
 @app.command()
@@ -268,11 +315,14 @@ def unlock_executor(
     operator_confirmed: bool = typer.Option(...),
 ) -> None:
     """Unlock entries only after a consistent reconciliation and Operator confirmation."""
-    with SQLiteState(database) as state:
-        result = OperatorControls(state).unlock(
-            event_time_ms=_now_ms(), operator_confirmed=operator_confirmed
+    channel = OperatorCommandStore(_operator_channel_path(database))
+    try:
+        command_id = channel.enqueue(
+            kind="unlock", event_time_ms=_now_ms(), operator_confirmed=operator_confirmed
         )
-        typer.echo(f"{result.mode.value} entries_allowed={result.entries_allowed}")
+    finally:
+        channel.close()
+    typer.echo(f"operator command queued id={command_id}")
 
 
 @app.command()
@@ -300,12 +350,13 @@ def run_live_shadow(
     )
     try:
         if event_file is not None:
+            context = MarketContext()
             for line in event_file.read_text(encoding="utf-8").splitlines():
                 value = json.loads(line)
                 if not isinstance(value, dict):
                     raise ValueError("Live Shadow event files must contain JSON objects")
                 runner.process_event(
-                    parse_shadow_event(value),
+                    parse_shadow_event(value, context=context),
                     receipt_time_ms=int(str(value.get("receipt_time_ms", _now_ms()))),
                 )
             if finalize_at_ms is not None:
@@ -349,14 +400,15 @@ def evaluate_final_holdout(
     if not isinstance(value, dict):
         raise typer.BadParameter("candidate must be a JSON object")
     record = _candidate_record_from_json(value)
-    raw_dataset = b"".join(path.read_bytes() for path in parquet)
-    dataset_checksum = hashlib.sha256(raw_dataset).hexdigest()
+    aggregate_trades = load_aggtrades(tuple(parquet))
+    dataset_bytes = canonical_aggregate_trade_bytes(aggregate_trades)
+    dataset_checksum = hashlib.sha256(dataset_bytes).hexdigest()
     store = LocalObjectStore(artifacts)
-    dataset_key = f"holdout-datasets/{dataset_checksum}.parquet"
-    store.put_immutable(dataset_key, raw_dataset)
+    dataset_key = f"holdout-datasets/{dataset_checksum}.json"
+    store.put_immutable(dataset_key, dataset_bytes)
     decision = FinalHoldoutGate(store).evaluate_aggregate_trades(
         record,
-        aggregate_trades=load_aggtrades(tuple(parquet)),
+        aggregate_trades=aggregate_trades,
         holdout_dataset_key=dataset_key,
         holdout_dataset_checksum=dataset_checksum,
         execution_cost_model_key=execution_cost_model_key,
@@ -380,18 +432,68 @@ def evaluate_promoted_risk(
     promoted_value = json.loads(promoted.read_text(encoding="utf-8"))
     if not isinstance(baseline_value, dict) or not isinstance(promoted_value, dict):
         raise typer.BadParameter("risk evaluations must be JSON objects")
-    result = PromotedRiskGate(store).evaluate(
+    baseline_evaluation = RiskEvaluation.from_mapping(baseline_value)
+    promoted_evaluation = RiskEvaluation.from_mapping(promoted_value)
+    if (
+        not baseline_evaluation.experiment_manifest_key
+        or not promoted_evaluation.experiment_manifest_key
+    ):
+        raise typer.BadParameter(
+            "both risk evaluations must reference content-addressed experiment manifests"
+        )
+    gate = PromotedRiskGate(store)
+    result = gate.evaluate(
         candidate_identity,
-        baseline=RiskEvaluation.from_mapping(baseline_value),
-        promoted=RiskEvaluation.from_mapping(promoted_value),
-        baseline_promoted=True,
-        soak_complete=True,
+        baseline=baseline_evaluation,
+        promoted=promoted_evaluation,
+        baseline_promoted=gate.promotion_evidence_valid(
+            promotion_artifact_key,
+            candidate_identity,
+            baseline_evaluation.candidate_rules_sha256,
+        ),
+        soak_complete=gate.soak_evidence_valid(soak_report_key, candidate_identity),
         promotion_artifact_key=promotion_artifact_key,
         soak_report_key=soak_report_key,
     )
     report_key = f"{result.manifest_key.removesuffix('.json')}.md"
     store.put_immutable(report_key, result.report.encode())
     typer.echo(f"promoted-risk={report_key} accepted={result.accepted}")
+
+
+@app.command("run-promoted-risk-trial")
+def run_promoted_risk_trial_command(
+    candidate_manifest: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    historical_parquet: Annotated[
+        list[Path], typer.Option("--historical-parquet", exists=True, readable=True)
+    ],
+    execution_cost_model_key: Annotated[str, typer.Option("--execution-cost-model-key")],
+    promotion_artifact_key: Annotated[str, typer.Option("--promotion-artifact-key")],
+    soak_report_key: Annotated[str, typer.Option("--soak-report-key")],
+    testnet_baseline: Annotated[Path, typer.Option(exists=True, readable=True)],
+    testnet_promoted: Annotated[Path, typer.Option(exists=True, readable=True)],
+    code_commit: Annotated[str, typer.Option("--code-commit")],
+    artifacts: Path = Path("data/promoted-risk"),
+) -> None:
+    """Run the engine-backed 0.25%/0.5% comparison and persist its decision."""
+    if not historical_parquet:
+        raise typer.BadParameter("at least one Historical Stress parquet file is required")
+    trial = run_promoted_risk_trial(
+        store=LocalObjectStore(artifacts),
+        candidate_manifest_path=candidate_manifest,
+        historical_parquet=tuple(historical_parquet),
+        execution_cost_model_key=execution_cost_model_key,
+        promotion_artifact_key=promotion_artifact_key,
+        soak_report_key=soak_report_key,
+        testnet_baseline_path=testnet_baseline,
+        testnet_promoted_path=testnet_promoted,
+        code_commit=code_commit,
+    )
+    report_key = f"{trial.result.manifest_key.removesuffix('.json')}.md"
+    LocalObjectStore(artifacts).put_immutable(report_key, trial.result.report.encode())
+    typer.echo(
+        f"promoted-risk={report_key} accepted={trial.result.accepted} "
+        f"baseline-risk={trial.result.proven_baseline_risk}"
+    )
 
 
 @app.command()
@@ -524,6 +626,10 @@ def _candidate_record_from_json(value: dict[str, object]) -> CandidateRecord:
 
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def _operator_channel_path(database: Path) -> Path:
+    return database.with_suffix(database.suffix + ".operator.db")
 
 
 def _configured_exchange(

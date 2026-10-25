@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from decimal import Decimal
 from itertools import pairwise
 
 from scalping_bot.domain.events import MarketTick
+from scalping_bot.domain.market_context import MarketContext
 
 
 @dataclass(frozen=True)
@@ -16,6 +18,29 @@ class AggTrade:
     buyer_maker: bool
     volatility_bucket: str | None = None
     size_bucket: str | None = None
+
+
+def canonical_aggregate_trade_bytes(trades: tuple[AggTrade, ...]) -> bytes:
+    """Serialize parsed aggregate trades for content-addressed evidence."""
+    ordered = tuple(sorted(trades, key=lambda item: (item.time_ms, item.aggregate_trade_id)))
+    if len({item.aggregate_trade_id for item in ordered}) != len(ordered):
+        raise ValueError("aggregate-trade dataset contains duplicate identifiers")
+    value = {
+        "schema_version": 1,
+        "trades": [
+            {
+                "aggregate_trade_id": item.aggregate_trade_id,
+                "time_ms": item.time_ms,
+                "price": str(item.price),
+                "quantity": str(item.quantity),
+                "buyer_maker": item.buyer_maker,
+                "volatility_bucket": item.volatility_bucket,
+                "size_bucket": item.size_bucket,
+            }
+            for item in ordered
+        ],
+    }
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 class AggTradeReplay:
@@ -30,14 +55,19 @@ class AggTradeReplay:
                 previous.aggregate_trade_id,
             ):
                 raise ValueError("aggregate trades must be chronological")
-        return tuple(
-            MarketTick(
-                event_id=f"aggTrade-{trade.aggregate_trade_id}",
-                event_time_ms=trade.time_ms,
-                price=trade.price,
-                volatility_bucket=trade.volatility_bucket,
-                size_bucket=trade.size_bucket,
+        context = MarketContext()
+        events: list[MarketTick] = []
+        for trade in trades:
+            event = context.annotate_trade(
+                MarketTick(
+                    event_id=f"aggTrade-{trade.aggregate_trade_id}",
+                    event_time_ms=trade.time_ms,
+                    price=trade.price,
+                    volatility_bucket=trade.volatility_bucket,
+                    size_bucket=trade.size_bucket,
+                ),
+                quantity=trade.quantity,
             )
-            for trade in trades
-            if trade.time_ms > confirmed_ms
-        )
+            if trade.time_ms > confirmed_ms:
+                events.append(event)
+        return tuple(events)

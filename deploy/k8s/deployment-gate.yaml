@@ -6,6 +6,7 @@ metadata:
   annotations:
     argocd.argoproj.io/hook: PreSync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-e4db243a44280223d5a959bbb93850cd7df7f37e.spdx.json
 spec:
   backoffLimit: 0
   template:

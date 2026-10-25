@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from statistics import median
 
+from scalping_bot.data.capture import CaptureLedger, RawSegment
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.domain.costs import EngineCostBucket, ExecutionCosts
+from scalping_bot.domain.events import MarketTick
+from scalping_bot.domain.market_context import MarketContext
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,94 @@ class CalibrationObservation:
     bid: Decimal
     ask: Decimal
     simulated_buy_price: Decimal
+
+
+def calibration_observations_from_capture(
+    store: ObjectStore,
+    *,
+    trade_stream: str = "btcusdt-aggTrade",
+    quote_stream: str = "btcusdt-bookTicker",
+) -> tuple[tuple[CalibrationObservation, ...], tuple[str, ...]]:
+    """Derive causal calibration observations from valid immutable capture segments."""
+    trade_catalog = CaptureLedger(store).catalog(trade_stream)
+    quote_catalog = CaptureLedger(store).catalog(quote_stream)
+    trade_events = _capture_events(store, trade_catalog.valid_trade_segments)
+    quote_events = _capture_events(store, quote_catalog.valid_quote_segments)
+    quotes: list[tuple[int, Decimal, Decimal]] = []
+    for event in quote_events:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        try:
+            bid = Decimal(str(payload["b"]))
+            ask = Decimal(str(payload["a"]))
+        except (KeyError, ValueError):
+            continue
+        if bid <= 0 or ask < bid:
+            continue
+        quotes.append((int(str(event["exchange_time_ms"])), bid, ask))
+    quotes.sort(key=lambda item: item[0])
+    context = MarketContext()
+    observations: list[CalibrationObservation] = []
+    quote_index = 0
+    latest: tuple[int, Decimal, Decimal] | None = None
+    for event in sorted(trade_events, key=lambda item: int(str(item["exchange_time_ms"]))):
+        timestamp = int(str(event["exchange_time_ms"]))
+        while quote_index < len(quotes) and quotes[quote_index][0] <= timestamp:
+            latest = quotes[quote_index]
+            quote_index += 1
+        payload = event.get("payload")
+        if latest is None or not isinstance(payload, dict):
+            continue
+        try:
+            price = Decimal(str(payload["p"]))
+            quantity = Decimal(str(payload["q"]))
+        except (KeyError, ValueError):
+            continue
+        annotated = context.annotate_trade(
+            MarketTick(event_id=f"calibration-{timestamp}", event_time_ms=timestamp, price=price),
+            quantity=quantity,
+        )
+        _quote_time, bid, ask = latest
+        simulated_buy_price = max(ask, price)
+        observations.append(
+            CalibrationObservation(
+                time_ms=timestamp,
+                hour_utc=datetime.fromtimestamp(timestamp / 1000, tz=UTC).hour,
+                volatility_bucket=str(annotated.volatility_bucket),
+                size_bucket=str(annotated.size_bucket),
+                bid=bid,
+                ask=ask,
+                simulated_buy_price=simulated_buy_price,
+            )
+        )
+    evidence = tuple(
+        sorted(
+            {
+                segment.object_key
+                for segment in (
+                    *trade_catalog.valid_trade_segments,
+                    *quote_catalog.valid_quote_segments,
+                )
+            }
+        )
+    )
+    return tuple(observations), evidence
+
+
+def _capture_events(
+    store: ObjectStore, segments: tuple[RawSegment, ...]
+) -> tuple[dict[str, object], ...]:
+    events: list[dict[str, object]] = []
+    for segment in segments:
+        compressed = store.read(segment.object_key)
+        if hashlib.sha256(compressed).hexdigest() != segment.sha256:
+            raise ValueError(f"capture segment checksum does not match: {segment.object_key}")
+        for line in gzip.decompress(compressed).splitlines():
+            value = json.loads(line)
+            if isinstance(value, dict):
+                events.append(value)
+    return tuple(events)
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,8 @@ from scalping_bot.operations.backup import EncryptedSQLiteBackup
 from scalping_bot.operations.durable_soak import DurableTestnetSoak
 from scalping_bot.operations.health import HealthSignals, OperationalHealthController
 from scalping_bot.operations.observability import OperationalMetrics
+from scalping_bot.operations.operator import OperatorControls
+from scalping_bot.operations.operator_channel import OperatorCommandStore
 from scalping_bot.operations.safety import OperationalMode
 
 
@@ -111,6 +113,9 @@ def run_executor(settings: Settings) -> None:
                 event_time_ms=event_time_ms
             ),
         )
+        operator_commands = OperatorCommandStore(
+            settings.state_path.with_suffix(settings.state_path.suffix + ".operator.db")
+        )
         runner = LiveEngineRunner(engine=engine, execution=execution, durable_state=state)
         soak = DurableTestnetSoak(
             settings.state_path.with_name("testnet-soak.db"),
@@ -182,11 +187,23 @@ def run_executor(settings: Settings) -> None:
 
         storage_ok = True
         notification_ok = True
-        dependency_status = {dependency: False for dependency in candidate.market_data_dependencies}
+        dependency_last_seen: dict[str, int | None] = {
+            dependency: None for dependency in candidate.market_data_dependencies
+        }
 
         def mark_dependencies_unavailable() -> None:
-            for dependency in dependency_status:
-                dependency_status[dependency] = False
+            for dependency in dependency_last_seen:
+                dependency_last_seen[dependency] = None
+
+        def mark_dependency_seen(dependency: str, event_time_ms: int) -> None:
+            if dependency in dependency_last_seen:
+                dependency_last_seen[dependency] = event_time_ms
+
+        def dependency_status(now_ms: int) -> dict[str, bool]:
+            return {
+                dependency: last_seen is not None and now_ms - last_seen <= 5_000
+                for dependency, last_seen in dependency_last_seen.items()
+            }
 
         def reconcile_after_reconnect() -> None:
             nonlocal reconciliation
@@ -208,6 +225,42 @@ def run_executor(settings: Settings) -> None:
             mark_dependencies_unavailable()
             event_applier.stream_lost(event_time_ms=time.time_ns() // 1_000_000, reason=reason)
 
+        def drain_operator_commands(event_time_ms: int) -> None:
+            nonlocal reconciliation
+            for command in operator_commands.pending():
+                try:
+                    controls = OperatorControls(state, execution)
+                    if command.kind == "pause":
+                        controls.pause(reason=str(command.reason), event_time_ms=event_time_ms)
+                    elif command.kind == "flatten-and-lock":
+                        controls.flatten_and_lock(
+                            reason=str(command.reason), event_time_ms=event_time_ms
+                        )
+                    elif command.kind == "reconcile":
+                        controls.request_reconciliation(event_time_ms=event_time_ms)
+                        reconciliation = Reconciler(state, exchange).run(
+                            reason="operator-request", event_time_ms=event_time_ms
+                        )
+                        metrics.reconciliation_divergences.set(len(reconciliation.divergences))
+                    elif command.kind == "unlock":
+                        controls.unlock(
+                            event_time_ms=event_time_ms,
+                            operator_confirmed=bool(command.operator_confirmed),
+                        )
+                    operator_commands.complete(command.command_id)
+                except Exception as error:
+                    state.set_operating_mode(OperationalMode.DEGRADED)
+                    state.append_audit(
+                        kind="operator-command-failed",
+                        event_time_ms=event_time_ms,
+                        details={
+                            "command_id": command.command_id,
+                            "command_kind": command.kind,
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    operator_commands.complete(command.command_id, error=type(error).__name__)
+
         try:
             for event in stream.events(
                 stop,
@@ -216,27 +269,55 @@ def run_executor(settings: Settings) -> None:
             ):
                 now_ms = time.time_ns() // 1_000_000
                 if isinstance(event, CandleClosed):
-                    if "closed-1m-klines" in dependency_status:
-                        dependency_status["closed-1m-klines"] = True
+                    mark_dependency_seen("closed-1m-klines", now_ms)
                 elif isinstance(event, MarketTick):
-                    for dependency in ("aggTrades", "tradeTicks"):
-                        if dependency in dependency_status:
-                            dependency_status[dependency] = True
+                    mark_dependency_seen("aggTrades", now_ms)
+                    mark_dependency_seen("tradeTicks", now_ms)
+                drain_operator_commands(now_ms)
                 prior_entry_id: str | None = None
                 prior_position = state.position()
                 if prior_position is not None:
                     prior_entry_id = state.position_entry_client_order_id()
                 drain_user_events(now_ms)
-                health.apply(
+                try:
+                    persistence_ok = state.persistence_healthy()
+                except Exception:
+                    persistence_ok = False
+                prior_mode = state.operating_mode
+                health_result = health.apply(
                     HealthSignals(
                         market_data_freshness_ms=max(0, now_ms - event.event_time_ms),
+                        clock_drift_ms=now_ms - event.event_time_ms,
+                        persistence_ok=persistence_ok,
                         reconciliation_ok=reconciliation.consistent,
                         storage_ok=storage_ok,
                         notification_ok=notification_ok,
-                        dependency_status=dependency_status,
+                        rate_limit_blocked=state.rate_limit_blocked,
+                        dependency_status=dependency_status(now_ms),
                     ),
                     event_time_ms=now_ms,
                 )
+                if (
+                    health_result.mode is OperationalMode.DEGRADED
+                    and prior_mode is not OperationalMode.DEGRADED
+                    and notifier is not None
+                ):
+                    try:
+                        asyncio.run(
+                            notifier.send(
+                                "CRITICAL scalping-bot health degraded: "
+                                + "; ".join(health_result.reasons),
+                                critical=True,
+                            )
+                        )
+                    except CriticalAlertFailure as error:
+                        notification_ok = False
+                        metrics.alert_failures_total.inc()
+                        state.append_audit(
+                            kind="critical-health-alert-failed",
+                            event_time_ms=now_ms,
+                            details={"error_type": type(error).__name__},
+                        )
                 runner.process(event)
                 if prior_entry_id is not None and state.position() is None:
                     try:
@@ -314,3 +395,4 @@ def run_executor(settings: Settings) -> None:
             stop.set()
             user_thread.join(timeout=5)
             soak.close()
+            operator_commands.close()

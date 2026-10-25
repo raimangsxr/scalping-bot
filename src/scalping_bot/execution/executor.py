@@ -153,6 +153,9 @@ class ExecutionService:
                     self.exchange.cancel_protection(
                         client_order_id=str(protection["client_order_id"])
                     )
+                    self.state.close_protection(
+                        str(protection["client_order_id"]), closed_ms=event_time_ms
+                    )
                 except Exception as error:
                     self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
                     self.state.append_audit(
@@ -203,6 +206,9 @@ class ExecutionService:
         if protection is not None:
             try:
                 self.exchange.cancel_protection(client_order_id=str(protection["client_order_id"]))
+                self.state.close_protection(
+                    str(protection["client_order_id"]), closed_ms=event_time_ms
+                )
             except Exception as error:
                 self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
                 self.state.append_audit(
@@ -549,6 +555,7 @@ class ExecutionService:
     def _cancel_protection_before_exit(self, client_order_id: str, *, event_time_ms: int) -> None:
         try:
             self.exchange.cancel_protection(client_order_id=client_order_id)
+            self.state.close_protection(client_order_id, closed_ms=event_time_ms)
         except Exception as error:
             self.state.set_operating_mode(OperationalMode.DEGRADED)
             self.state.append_audit(
@@ -727,6 +734,7 @@ class ExecutionService:
             raise RuntimeError("partial streamed exit has no protection to replace")
         try:
             self.exchange.cancel_protection(client_order_id=str(protection["client_order_id"]))
+            self.state.close_protection(str(protection["client_order_id"]), closed_ms=event_time_ms)
         except Exception as error:
             self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
             raise RuntimeError("partial streamed exit protection could not be canceled") from error
@@ -876,5 +884,6 @@ class ExecutionService:
             self.metrics.unknown_order_outcomes_total.inc()
 
     def _record_rate_limit(self) -> None:
+        self.state.set_rate_limit_blocked(True)
         if self.metrics is not None:
             self.metrics.rate_limit_events_total.inc()

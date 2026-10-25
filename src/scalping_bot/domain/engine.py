@@ -39,10 +39,18 @@ class Engine:
         policy: StrategyPolicy,
         *,
         execution_costs: ExecutionCosts | None = None,
+        position_risk: Decimal = Decimal("0.0025"),
+        notional_fraction: Decimal = Decimal("0.50"),
     ) -> None:
+        if not 0 < position_risk <= Decimal("0.005"):
+            raise ValueError("position risk must be positive and no greater than 0.5%")
+        if not 0 < notional_fraction <= Decimal("0.50"):
+            raise ValueError("notional fraction must be positive and no greater than 50%")
         self.state = state
         self.policy = policy
         self.execution_costs = execution_costs or ExecutionCosts(commission_rate=Decimal(0))
+        self.position_risk = position_risk
+        self.notional_fraction = notional_fraction
 
     def handle(self, event: EngineEvent) -> EngineResult:
         if self.state.already_processed(event.event_id):
@@ -179,6 +187,8 @@ class Engine:
             initial_capital=self.state.initial_equity,
             entry_price=event.price,
             invalidation_price=proposal.invalidation_price,
+            risk_fraction=self.position_risk,
+            notional_fraction=self.notional_fraction,
         )
         if quantity <= 0:
             return

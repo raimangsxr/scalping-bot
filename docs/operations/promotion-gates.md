@@ -54,3 +54,13 @@ rejected.
 These classes validate and persist evidence; they do not manufacture elapsed time or Testnet
 fills. Issues #19 and #20 remain operationally open until the real fourteen- and thirty-day
 windows, with their reports and audit evidence, have completed.
+
+The reproducible command for issue #34 is `scalping-bot run-promoted-risk-trial`. It accepts the
+Testnet Ready candidate manifest, the complete Historical Stress Parquet set, the immutable cost
+model, completed promotion and Soak references, and two source-backed Testnet stress JSON files.
+It runs the frozen candidate through the shared engine at both `0.0025` and `0.005`, writes separate
+content-addressed historical/Testnet stress artifacts and Experiment Manifests, and then invokes
+`PromotedRiskGate`. The Testnet JSON files must identify their candidate, rules hash, exact risk,
+sample, metrics, boolean gate results, and non-empty `source_evidence`; the command adds the
+completed Soak report to that provenance. It rejects missing or unverifiable operational evidence
+before starting the trial and never synthesizes Testnet fills.

@@ -57,6 +57,14 @@ class CaptureCatalog:
         )
 
     @property
+    def valid_quote_segments(self) -> tuple[RawSegment, ...]:
+        return tuple(
+            item.segment
+            for item in self.entries
+            if item.segment.valid and "bookTicker" in item.segment.stream
+        )
+
+    @property
     def market_calibration_sample(self) -> tuple[RawSegment, ...]:
         """Return valid Trade Flow segments eligible for cost calibration."""
         return self.valid_trade_segments

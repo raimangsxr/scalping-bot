@@ -53,6 +53,11 @@ class ReleaseVerifier:
         return cls(tuple(documents), app_documents[0])
 
     def verify(self) -> ReleaseVerification:
+        release_documents = [
+            document
+            for document in self.documents
+            if document.get("kind") in {"StatefulSet", "Deployment", "Job"}
+        ]
         workloads: dict[str, dict[str, Any]] = {}
         for document in self.documents:
             if document.get("kind") not in {"StatefulSet", "Deployment"}:
@@ -67,7 +72,7 @@ class ReleaseVerifier:
             )
         images = {
             _container(document)["image"]
-            for document in workloads.values()
+            for document in release_documents
             if isinstance(_container(document).get("image"), str)
         }
         if len(images) != 1:
@@ -77,7 +82,7 @@ class ReleaseVerifier:
         if match is None:
             raise ReleaseVerificationError("release image must be pinned to a full commit")
         image_revision = match.group(1).lower()
-        for document in workloads.values():
+        for document in release_documents:
             workload_annotations = document.get("metadata", {}).get("annotations", {})
             template_annotations = (
                 document.get("spec", {})

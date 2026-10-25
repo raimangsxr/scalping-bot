@@ -150,6 +150,7 @@ class DurableTestnetSoak:
         notional_fraction: Decimal,
     ) -> None:
         trace = state.reconstruct_scalp(entry_client_order_id)
+        protection_history = trace.get("protection_history", ())
         protection = trace["protection"]
         pnl_value = trace.get("pnl")
         pnl = pnl_value.get("net_pnl") if isinstance(pnl_value, dict) else None
@@ -157,10 +158,11 @@ class DurableTestnetSoak:
             Decimal(str(pnl)) if pnl is not None and not str(pnl).startswith("non-") else Decimal(0)
         )
         reconciliation = state.latest_reconciliation()
+        exit_orders = trace.get("exit_orders")
         self.record_scalp(
             event_time_ms=event_time_ms,
-            protected=protection is not None,
-            duplicate_order=False,
+            protected=bool(protection_history) or protection is not None,
+            duplicate_order=isinstance(exit_orders, tuple) and len(exit_orders) > 1,
             reconciled=bool(reconciliation["consistent"]),
             testnet_pnl=testnet_pnl,
             position_risk=position_risk,

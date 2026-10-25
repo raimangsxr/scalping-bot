@@ -217,6 +217,7 @@ class EvidenceProtocol:
         baseline_trades: tuple[ScalpResult, ...] | None = None,
         baseline_cost_scenario_trades: Mapping[Decimal, tuple[ScalpResult, ...]] | None = None,
         fold_count_override: int | None = None,
+        frozen_parameters: Mapping[str, object] | None = None,
         dataset_checksum: str | None = None,
         execution_cost_model_identity: str | None = None,
     ) -> EvidenceResult:
@@ -290,6 +291,7 @@ class EvidenceProtocol:
                 multiplier: _metrics(scenario, initial_equity)
                 for multiplier, scenario in (baseline_cost_scenario_trades or {}).items()
             },
+            frozen_parameters=(dict(frozen_parameters) if frozen_parameters is not None else None),
             dataset_checksum=dataset_checksum,
             execution_cost_model_identity=execution_cost_model_identity,
         )

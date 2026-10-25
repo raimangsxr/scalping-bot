@@ -10,7 +10,13 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from scalping_bot.data.acquisition import ArchiveKind, ResearchArchiveCatalog
+from scalping_bot.data.acquisition import (
+    HISTORICAL_STRESS,
+    PRIMARY_RESEARCH,
+    ArchiveCatalogEntry,
+    ArchiveKind,
+    ResearchArchiveCatalog,
+)
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.research.batch import BatchReview
 from scalping_bot.research.candidates import CandidateBatch
@@ -66,14 +72,11 @@ class ResearchRunManifest:
         if dataset_catalog_key.startswith("catalogs/research-market/") and dataset_is_json:
             catalog = ResearchArchiveCatalog.load(store, dataset_catalog_key)
             catalog.require_complete()
-            dataset_checksums.extend(sorted({entry.source_sha256 for entry in catalog.entries}))
+            selected = _research_trade_entries(catalog)
+            _require_research_months(selected)
+            dataset_checksums.extend(sorted({entry.source_sha256 for entry in selected}))
             dataset_derived_keys = tuple(
-                sorted(
-                    derived_key
-                    for entry in catalog.entries
-                    if entry.kind is ArchiveKind.AGG_TRADES
-                    for derived_key in entry.derived_keys
-                )
+                sorted(derived_key for entry in selected for derived_key in entry.derived_keys)
             )
             for derived_key in dataset_derived_keys:
                 dataset_checksums.append(hashlib.sha256(store.read(derived_key)).hexdigest())
@@ -151,7 +154,9 @@ class ResearchRunManifest:
         if self.dataset_catalog_key.startswith("catalogs/research-market/") and dataset_is_json:
             catalog = ResearchArchiveCatalog.load(store, self.dataset_catalog_key)
             catalog.require_complete()
-            checksums.extend(sorted({entry.source_sha256 for entry in catalog.entries}))
+            selected = _research_trade_entries(catalog)
+            _require_research_months(selected)
+            checksums.extend(sorted({entry.source_sha256 for entry in selected}))
             for derived_key in self.dataset_derived_keys:
                 checksums.append(hashlib.sha256(store.read(derived_key)).hexdigest())
         checksums.append(hashlib.sha256(cost_model).hexdigest())
@@ -170,7 +175,7 @@ class ResearchRunManifest:
             hashlib.sha256(store.read(key)).hexdigest() for key in self.dataset_derived_keys
         )
         actual = sorted(hashlib.sha256(path.read_bytes()).hexdigest() for path in paths)
-        return len(actual) == len(set(actual)) and all(item in expected for item in actual)
+        return actual == expected and len(actual) == len(set(actual))
 
 
 class PersistentAttemptLedger:
@@ -512,6 +517,23 @@ def _empty_evidence() -> EvidenceResult:
     )
 
 
+def _research_trade_entries(catalog: ResearchArchiveCatalog) -> tuple[ArchiveCatalogEntry, ...]:
+    return tuple(
+        entry
+        for entry in catalog.entries
+        if entry.kind is ArchiveKind.AGG_TRADES
+        and entry.period in {HISTORICAL_STRESS.name, PRIMARY_RESEARCH.name}
+    )
+
+
+def _require_research_months(entries: tuple[ArchiveCatalogEntry, ...]) -> None:
+    months = {entry.month for entry in entries}
+    required = {*HISTORICAL_STRESS.months, *PRIMARY_RESEARCH.months}
+    missing = sorted(required - months)
+    if missing:
+        raise ValueError(f"research aggregate-trade catalog is missing {missing[0]}")
+
+
 def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), default=str) + "\n").encode()
 
@@ -523,21 +545,20 @@ def _digest(content: bytes) -> str:
 def _verify_content_addressed_key(key: str, content: bytes, label: str) -> None:
     filename = key.rsplit("/", 1)[-1]
     expected = filename.removesuffix(".json")
-    if len(expected) == 64 and all(item in "0123456789abcdefABCDEF" for item in expected):
-        actual = _digest(content)
-        try:
-            payload = json.loads(content)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            payload = None
-        if isinstance(payload, dict) and isinstance(payload.get("sha256"), str):
-            canonical = {
-                item_key: item for item_key, item in payload.items() if item_key != "sha256"
-            }
-            actual = _digest(
-                (json.dumps(canonical, sort_keys=True, separators=(",", ":")) + "\n").encode()
-            )
-        if actual != expected.lower():
-            raise ValueError(f"{label} checksum does not match its immutable key")
+    if len(expected) != 64 or not all(item in "0123456789abcdefABCDEF" for item in expected):
+        raise ValueError(f"{label} key is not content addressed")
+    actual = _digest(content)
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("sha256"), str):
+        canonical = {item_key: item for item_key, item in payload.items() if item_key != "sha256"}
+        actual = _digest(
+            (json.dumps(canonical, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        )
+    if actual != expected.lower():
+        raise ValueError(f"{label} checksum does not match its immutable key")
 
 
 def _attempt_sort_key(item: Attempt) -> tuple[str, str, str, str]:

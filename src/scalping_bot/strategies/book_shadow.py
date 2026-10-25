@@ -19,6 +19,77 @@ from scalping_bot.research.features import (
 
 
 @dataclass(frozen=True)
+class BookShadowProtocol:
+    """Frozen, content-addressed rules for one prospective Book Flow study."""
+
+    candidate_identities: tuple[str, ...]
+    start_ms: int
+    end_ms: int
+    min_imbalance: Decimal = Decimal("0.10")
+    max_gap_ms: int = 60_000
+    minimum_valid_coverage: Decimal = Decimal("0")
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        identities = tuple(sorted(set(self.candidate_identities)))
+        if not identities or any(not item.strip() for item in identities):
+            raise ValueError("Book Shadow protocol requires candidate identities")
+        if identities != self.candidate_identities:
+            raise ValueError("Book Shadow candidate identities must be sorted and unique")
+        if self.start_ms < 0 or self.end_ms < self.start_ms:
+            raise ValueError("Book Shadow protocol window must be ordered")
+        if self.max_gap_ms <= 0:
+            raise ValueError("Book Shadow protocol max gap must be positive")
+        if not self.min_imbalance.is_finite() or self.min_imbalance < 0:
+            raise ValueError("Book Shadow protocol imbalance must be non-negative")
+        if not self.minimum_valid_coverage.is_finite() or not 0 <= self.minimum_valid_coverage <= 1:
+            raise ValueError("Book Shadow protocol coverage must be between zero and one")
+
+    def canonical_bytes(self) -> bytes:
+        value = {
+            "schema_version": self.schema_version,
+            "candidate_identities": list(self.candidate_identities),
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "min_imbalance": str(self.min_imbalance),
+            "max_gap_ms": self.max_gap_ms,
+            "minimum_valid_coverage": str(self.minimum_valid_coverage),
+        }
+        return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    @property
+    def identity(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def persist(self, store: ObjectStore) -> str:
+        key = f"shadow/protocols/{self.identity}.json"
+        store.put_immutable(key, self.canonical_bytes())
+        return key
+
+    @classmethod
+    def load(cls, store: ObjectStore, key: str) -> "BookShadowProtocol":
+        raw = store.read(key)
+        expected = key.rsplit("/", 1)[-1].removesuffix(".json")
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise ValueError("Book Shadow protocol checksum does not match its key")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or not isinstance(value.get("candidate_identities"), list):
+            raise ValueError("Book Shadow protocol is malformed")
+        protocol = cls(
+            candidate_identities=tuple(str(item) for item in value["candidate_identities"]),
+            start_ms=int(str(value["start_ms"])),
+            end_ms=int(str(value["end_ms"])),
+            min_imbalance=Decimal(str(value.get("min_imbalance", "0.10"))),
+            max_gap_ms=int(str(value.get("max_gap_ms", 60_000))),
+            minimum_valid_coverage=Decimal(str(value.get("minimum_valid_coverage", "0"))),
+            schema_version=int(str(value.get("schema_version", 1))),
+        )
+        if protocol.identity != expected:
+            raise ValueError("Book Shadow protocol identity is invalid")
+        return protocol
+
+
+@dataclass(frozen=True)
 class ShadowDecision:
     hypothetical_allow: bool
     executable: bool = False
@@ -91,8 +162,26 @@ class BookShadowReport:
 class BookShadowEvaluator:
     """Collect prospective Book Flow observations without an executable path."""
 
-    def __init__(self, confirmation: ShadowBookConfirmation | None = None) -> None:
-        self.confirmation = confirmation
+    def __init__(
+        self,
+        confirmation: ShadowBookConfirmation | None = None,
+        protocol: BookShadowProtocol | None = None,
+    ) -> None:
+        if protocol is None:
+            protocol = BookShadowProtocol(
+                candidate_identities=("book-shadow-default",),
+                start_ms=0,
+                end_ms=2**63 - 1,
+                min_imbalance=(
+                    confirmation.min_imbalance
+                    if confirmation is not None
+                    else DEFAULT_BOOK_CONFIRMATION_IMBALANCE
+                ),
+            )
+        if confirmation is not None and confirmation.min_imbalance != protocol.min_imbalance:
+            raise ValueError("Book Shadow confirmation must match the frozen protocol")
+        self.protocol = protocol
+        self.confirmation = confirmation or ShadowBookConfirmation(protocol.min_imbalance)
         self._observations: list[BookShadowObservation] = []
         self._last_event_time_ms: int | None = None
         self._gaps = 0
@@ -105,12 +194,13 @@ class BookShadowEvaluator:
         depth_stream: str = "btcusdt-depth-100ms",
         trade_stream: str = "btcusdt-aggTrade",
         confirmation: ShadowBookConfirmation | None = None,
+        protocol: BookShadowProtocol | None = None,
         entry_proposal: Callable[[int, BookFlowFeatures], bool] | None = None,
     ) -> "BookShadowEvaluator":
         """Derive prospective observations directly from immutable capture segments."""
         evaluator = cls(
-            confirmation
-            or ShadowBookConfirmation(min_imbalance=DEFAULT_BOOK_CONFIRMATION_IMBALANCE)
+            confirmation=confirmation,
+            protocol=protocol,
         )
         ledger = CaptureLedger(store)
         depth_catalog = ledger.catalog(depth_stream)
@@ -210,6 +300,8 @@ class BookShadowEvaluator:
         return evaluator
 
     def record(self, observation: BookShadowObservation) -> ShadowDecision:
+        if not self.protocol.start_ms <= observation.event_time_ms <= self.protocol.end_ms:
+            raise ValueError("Book Flow observation is outside the frozen protocol window")
         if (
             self._last_event_time_ms is not None
             and observation.event_time_ms <= self._last_event_time_ms
@@ -217,7 +309,7 @@ class BookShadowEvaluator:
             raise ValueError("Book Flow shadow observations must be chronological")
         if (
             self._last_event_time_ms is not None
-            and observation.event_time_ms - self._last_event_time_ms > 60_000
+            and observation.event_time_ms - self._last_event_time_ms > self.protocol.max_gap_ms
         ):
             self._gaps += 1
         self._last_event_time_ms = observation.event_time_ms
@@ -295,6 +387,8 @@ class BookShadowEvaluator:
         report = self.report()
         payload = {
             "schema_version": 1,
+            "protocol_identity": self.protocol.identity,
+            "protocol": json.loads(self.protocol.canonical_bytes()),
             "report": {
                 "observations": report.observations,
                 "valid_observations": report.valid_observations,

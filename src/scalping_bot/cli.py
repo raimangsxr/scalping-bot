@@ -58,6 +58,7 @@ from scalping_bot.research.workflow import ResearchArtifactWriter, ResearchRunMa
 from scalping_bot.strategies.book_shadow import (
     DEFAULT_BOOK_CONFIRMATION_IMBALANCE,
     BookShadowEvaluator,
+    BookShadowProtocol,
     ShadowBookConfirmation,
 )
 
@@ -397,9 +398,38 @@ def run_live_shadow(
 
 
 @app.command()
+def freeze_book_shadow_protocol(
+    candidates: Annotated[list[str] | None, typer.Option("--candidate")] = None,
+    start_ms: Annotated[int, typer.Option(..., "--start-ms")] = 0,
+    end_ms: Annotated[int, typer.Option(..., "--end-ms")] = 0,
+    min_imbalance: Annotated[str, typer.Option("--min-imbalance")] = str(
+        DEFAULT_BOOK_CONFIRMATION_IMBALANCE
+    ),
+    max_gap_ms: Annotated[int, typer.Option("--max-gap-ms")] = 60_000,
+    minimum_valid_coverage: Annotated[str, typer.Option("--minimum-valid-coverage")] = "0",
+    storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
+) -> None:
+    """Freeze and persist the audited Book Flow Shadow protocol."""
+    if not candidates:
+        raise typer.BadParameter("at least one --candidate is required")
+    if start_ms <= 0 or end_ms <= 0:
+        raise typer.BadParameter("--start-ms and --end-ms must be provided as positive timestamps")
+    protocol = BookShadowProtocol(
+        candidate_identities=tuple(sorted(candidates)),
+        start_ms=start_ms,
+        end_ms=end_ms,
+        min_imbalance=Decimal(min_imbalance),
+        max_gap_ms=max_gap_ms,
+        minimum_valid_coverage=Decimal(minimum_valid_coverage),
+    )
+    key = protocol.persist(LocalObjectStore(storage))
+    typer.echo(f"book-shadow-protocol={key}")
+
+
+@app.command()
 def evaluate_book_shadow(
     storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
-    min_imbalance: Annotated[str, typer.Option()] = str(DEFAULT_BOOK_CONFIRMATION_IMBALANCE),
+    protocol_key: Annotated[str, typer.Option("--protocol")] = "",
     entry_proposals: Annotated[
         Path | None,
         typer.Option(
@@ -411,6 +441,8 @@ def evaluate_book_shadow(
     """Build non-promotable Book Flow Shadow evidence from captured segments."""
     if entry_proposals is None:
         raise typer.BadParameter("Book Shadow requires frozen candidate Entry Proposals")
+    if not protocol_key:
+        raise typer.BadParameter("Book Shadow requires a frozen --protocol")
     raw_proposals = json.loads(entry_proposals.read_text(encoding="utf-8"))
     if not isinstance(raw_proposals, dict) or any(
         not isinstance(value, bool) for value in raw_proposals.values()
@@ -418,9 +450,11 @@ def evaluate_book_shadow(
         raise typer.BadParameter("entry proposals must be a JSON object of boolean decisions")
     proposals = {int(str(key)): value for key, value in raw_proposals.items()}
     store = LocalObjectStore(storage)
+    protocol = BookShadowProtocol.load(store, protocol_key)
     evaluator = BookShadowEvaluator.from_capture(
         store,
-        confirmation=ShadowBookConfirmation(min_imbalance=Decimal(min_imbalance)),
+        protocol=protocol,
+        confirmation=ShadowBookConfirmation(min_imbalance=protocol.min_imbalance),
         entry_proposal=lambda event_time_ms, _features: proposals.get(event_time_ms, False),
     )
     typer.echo(f"book-shadow-report={evaluator.persist_report(store)}")

@@ -6,6 +6,18 @@ from urllib.parse import urlparse
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+RUNTIME_SECRET_ENV_NAMES = {
+    "collector": (),
+    "live-shadow": ("backup_encryption_key",),
+    "executor": (
+        "binance_api_key",
+        "binance_api_secret",
+        "telegram_bot_token",
+        "telegram_chat_id",
+        "backup_encryption_key",
+    ),
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -46,3 +58,11 @@ class Settings(BaseSettings):
             if urlparse(endpoint).hostname not in allowed_hosts:
                 raise ValueError("endpoint must be an official Binance Spot Testnet endpoint")
         return self
+
+    def missing_runtime_secrets(self, role: str) -> tuple[str, ...]:
+        """Return missing secret field names without exposing any secret value."""
+        try:
+            fields = RUNTIME_SECRET_ENV_NAMES[role]
+        except KeyError as error:
+            raise ValueError(f"unknown runtime role: {role}") from error
+        return tuple(field for field in fields if not getattr(self, field))

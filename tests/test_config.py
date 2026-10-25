@@ -47,3 +47,15 @@ def test_only_the_research_market_is_accepted(tmp_path: Path) -> None:
 def test_testnet_executor_rejects_any_position_risk_other_than_baseline(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match=r"0\.25%"):
         Settings(position_risk="0.005", state_path=tmp_path / "state.db")
+
+
+def test_runtime_secret_check_is_role_scoped_and_value_free() -> None:
+    settings = Settings()
+    assert settings.missing_runtime_secrets("collector") == ()
+    assert set(settings.missing_runtime_secrets("executor")) == {
+        "binance_api_key",
+        "binance_api_secret",
+        "telegram_bot_token",
+        "telegram_chat_id",
+        "backup_encryption_key",
+    }

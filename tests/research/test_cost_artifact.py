@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -71,6 +72,61 @@ def test_cost_model_requires_evidence_for_declared_buckets_and_is_content_addres
     snapshot = ExecutionCostSnapshot.load(runtime_path)
     assert snapshot.snapshot_id == loaded.identity
     assert snapshot.commission_rate == commission.taker
+    event_time_ms = int(datetime(2024, 1, 1, 10, tzinfo=UTC).timestamp() * 1000)
+    assert snapshot.as_engine_costs().estimated_close_cost(
+        Decimal("1000"),
+        event_time_ms=event_time_ms,
+        volatility_bucket="low",
+        size_bucket="small",
+    ) == loaded.estimate(
+        notional=Decimal("1000"), hour_utc=10, volatility_bucket="low", size_bucket="small"
+    )
     mounted_path = tmp_path / "snapshot.json"
     mounted_path.write_bytes(store.read(key))
     assert ExecutionCostSnapshot.load(mounted_path).snapshot_id == loaded.identity
+
+
+def test_engine_cost_adapter_preserves_time_volatility_and_size_buckets() -> None:
+    observations = (
+        CalibrationObservation(
+            time_ms=1,
+            hour_utc=10,
+            volatility_bucket="low",
+            size_bucket="small",
+            bid=Decimal("99.99"),
+            ask=Decimal("100.01"),
+            simulated_buy_price=Decimal("100.02"),
+        ),
+        CalibrationObservation(
+            time_ms=2,
+            hour_utc=10,
+            volatility_bucket="high",
+            size_bucket="large",
+            bid=Decimal("99.50"),
+            ask=Decimal("100.50"),
+            simulated_buy_price=Decimal("101.50"),
+        ),
+    )
+    model = ExecutionCostCalibrator().fit(
+        observations,
+        commission=AccountCommissionSnapshot(
+            symbol="BTCUSDT", maker=Decimal("0.001"), taker=Decimal("0.001"), captured_ms=1
+        ),
+    )
+    engine_costs = model.as_engine_costs()
+    event_time_ms = int(datetime(2024, 1, 1, 10, tzinfo=UTC).timestamp() * 1000)
+
+    low = engine_costs.estimated_close_cost(
+        Decimal("1000"),
+        event_time_ms=event_time_ms,
+        volatility_bucket="low",
+        size_bucket="small",
+    )
+    high = engine_costs.estimated_close_cost(
+        Decimal("1000"),
+        event_time_ms=event_time_ms,
+        volatility_bucket="high",
+        size_bucket="large",
+    )
+
+    assert high > low

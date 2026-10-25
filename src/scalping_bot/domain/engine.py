@@ -114,6 +114,7 @@ class Engine:
                     "candidate_version": proposal.candidate_version,
                     "source_event_id": proposal.source_event_id,
                     "rationale": dict(proposal.rationale),
+                    "features": dict(proposal.feature_snapshot),
                     "dependencies": proposal.market_data_dependencies,
                     "expiry_ms": proposal.expiry_ms,
                 },
@@ -266,7 +267,10 @@ class Engine:
         if position is None or self.state.pending_exit is not None:
             return
         estimated_close_commission = self.execution_costs.estimated_close_cost(
-            event.price * position.quantity
+            event.price * position.quantity,
+            event_time_ms=event.event_time_ms,
+            volatility_bucket=event.volatility_bucket,
+            size_bucket=event.size_bucket,
         )
         mark_equity = (
             self.state.current_equity

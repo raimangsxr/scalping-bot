@@ -13,6 +13,8 @@ spec:
       app.kubernetes.io/component: collector
   template:
     metadata:
+      annotations:
+        scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-3638bbe3d4b76af39a3e6ae87c3ceb97101d1be6.spdx.json
       labels:
         app.kubernetes.io/name: scalping-bot
         app.kubernetes.io/component: collector

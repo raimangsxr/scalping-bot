@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 
@@ -24,7 +25,7 @@ def _finalist() -> CandidateRecord:
         thesis="completed returns may persist",
         original_rules={"window": 3},
         modifications={},
-        parameters={"window": [3]},
+        parameters={"window_bars": [3, 5], "threshold": ["0.005", "0.01"]},
         rejection_criteria=("negative expectancy",),
         lifecycle=CandidateLifecycle.WALK_FORWARD_VALIDATED,
         frozen=True,
@@ -59,11 +60,21 @@ def _evidence(promoted: bool) -> EvidenceResult:
 
 def test_final_holdout_reveal_creates_one_decision_and_ready_manifest(tmp_path: Path) -> None:
     store = LocalObjectStore(tmp_path / "objects")
+    dataset = b"final-holdout-dataset"
+    cost_model = b"final-holdout-cost-model"
+    dataset_checksum = hashlib.sha256(dataset).hexdigest()
+    cost_checksum = hashlib.sha256(cost_model).hexdigest()
+    dataset_key = f"holdout-datasets/{dataset_checksum}.parquet"
+    cost_key = f"cost-artifacts/{cost_checksum}.json"
+    store.put_immutable(dataset_key, dataset)
+    store.put_immutable(cost_key, cost_model)
     decision = FinalHoldoutGate(store, HoldoutRegistry(store)).evaluate(
         _finalist(),
         evidence=_evidence(True),
-        holdout_dataset_checksum="a" * 64,
+        holdout_dataset_checksum=dataset_checksum,
         actor="operator",
+        holdout_dataset_key=dataset_key,
+        execution_cost_model_key=cost_key,
     )
 
     assert decision.decision == "Testnet Ready"

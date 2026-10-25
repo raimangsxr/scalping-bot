@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from decimal import Decimal
 from pathlib import Path
 
 from scalping_bot.data.storage import LocalObjectStore
+from scalping_bot.domain.events import CandleClosed
 from scalping_bot.execution.candidate import PromotedCandidateManifest
 from scalping_bot.operations.durable_shadow import DurableLiveShadow
+from scalping_bot.operations.live_shadow_runtime import SharedEngineLiveShadow
 from scalping_bot.operations.promotion import LiveReplayComparison
 from scalping_bot.research.candidates import first_batch
 from scalping_bot.research.evidence import CandidateLifecycle
@@ -94,3 +97,42 @@ def test_live_shadow_state_survives_restart_and_only_finalizes_after_fourteen_da
     assert store.read(key).decode().startswith("# Live Shadow")
     assert "APPROVE Testnet Soak" in store.read(key).decode()
     resumed.close()
+
+
+def test_live_shadow_derives_comparisons_from_shared_engines_without_orders(tmp_path: Path) -> None:
+    candidate_path = tmp_path / "candidate.json"
+    cost_path = tmp_path / "cost.json"
+    _candidate_manifest(candidate_path)
+    _cost_snapshot(cost_path)
+    process = DurableLiveShadow(
+        tmp_path / "shadow.db",
+        candidate_manifest=candidate_path,
+        cost_model=cost_path,
+        store=LocalObjectStore(tmp_path / "objects"),
+        started_ms=0,
+    )
+    runner = SharedEngineLiveShadow(
+        process, candidate_manifest=candidate_path, cost_model=cost_path
+    )
+    for minute in range(3):
+        runner.process_event(
+            CandleClosed(
+                event_id=f"kline-{minute}",
+                event_time_ms=(minute + 1) * 60_000,
+                sequence=minute,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal(str(100 + minute)),
+                complete=True,
+                volume=Decimal("10"),
+                buy_volume=Decimal("7"),
+                sell_volume=Decimal("3"),
+                trade_count=10,
+            ),
+            receipt_time_ms=(minute + 1) * 60_000 + 10,
+        )
+
+    assert len(process.gate.comparisons) == 3
+    assert all(item.orders_submitted == 0 for item in process.gate.comparisons)
+    process.close()

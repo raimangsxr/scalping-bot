@@ -415,6 +415,57 @@ class SQLiteState:
         )
         return True
 
+    def apply_exit_fills(self, client_order_id: str, *, event_time_ms: int) -> bool:
+        """Apply cumulative streamed SELL fills to the durable open position."""
+        intent = self.order_intent(client_order_id)
+        if intent["side"] != "SELL":
+            return False
+        position = self.position()
+        if position is None:
+            return False
+        fills = self.fills_for_order(client_order_id)
+        executed = sum((Decimal(str(item["quantity"])) for item in fills), Decimal(0))
+        open_quantity = Decimal(str(position["quantity"]))
+        if executed <= 0:
+            return False
+        if executed >= open_quantity:
+            entry_client_order_id = self.position_entry_client_order_id()
+            self.update_order_intent(entry_client_order_id, status="CLOSED")
+            self.clear_position()
+            self.append_audit(
+                kind="streamed-position-closed",
+                event_time_ms=event_time_ms,
+                details={
+                    "entry_client_order_id": entry_client_order_id,
+                    "exit_client_order_id": client_order_id,
+                    "executed_quantity": str(executed),
+                },
+            )
+            return True
+        remaining = open_quantity - executed
+        self.upsert_position(
+            candidate_version=str(position["candidate_version"]),
+            source_event_id=str(position["source_event_id"]),
+            entry_fill_id=str(position["entry_fill_id"]),
+            entry_time_ms=int(str(position["entry_time_ms"])),
+            entry_price=str(position["entry_price"]),
+            quantity=str(remaining),
+            invalidation_price=str(position["invalidation_price"]),
+            commission=str(position["commission"]),
+            protected=False,
+        )
+        self.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
+        self.append_audit(
+            kind="streamed-partial-position-exit",
+            event_time_ms=event_time_ms,
+            details={
+                "exit_client_order_id": client_order_id,
+                "executed_quantity": str(executed),
+                "remaining_quantity": str(remaining),
+            },
+        )
+        return True
+
     def position_entry_client_order_id(self) -> str:
         row = self.connection.execute(
             "SELECT f.client_order_id FROM positions p "

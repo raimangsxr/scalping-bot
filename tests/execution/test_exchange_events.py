@@ -80,3 +80,57 @@ def test_user_data_stream_reconciliation_reopens_entries_only_after_consistency(
 
         assert applier.stream_reconciled(event_time_ms=12, reconcile=lambda: True)
         assert state.entries_allowed
+
+
+def test_streamed_sell_fill_closes_the_durable_position(tmp_path: Path) -> None:
+    with SQLiteState(tmp_path / "state.db") as state:
+        state.persist_order_intent(
+            client_order_id="entry-1",
+            side="BUY",
+            quantity="0.01",
+            status="FILLED",
+            created_ms=1,
+            candidate_version="candidate-v1",
+            source_event_id="signal-1",
+            invalidation_price="89000",
+        )
+        state.record_fill(
+            fill_id="entry-fill",
+            client_order_id="entry-1",
+            price="90000",
+            quantity="0.01",
+            commission="0.9",
+            commission_asset="USDT",
+            event_time_ms=2,
+        )
+        state.rebuild_position_from_order("entry-1")
+        state.persist_order_intent(
+            client_order_id="exit-1",
+            side="SELL",
+            quantity="0.01",
+            status="SUBMITTING",
+            created_ms=3,
+            candidate_version="candidate-v1",
+            source_event_id="signal-1",
+            invalidation_price="89000",
+        )
+        applier = ExchangeEventApplier(state)
+        applier.apply(
+            parse_user_data_message(
+                {
+                    "e": "executionReport",
+                    "E": 4,
+                    "i": 8,
+                    "c": "exit-1",
+                    "X": "FILLED",
+                    "t": 12,
+                    "L": "90100",
+                    "l": "0.01",
+                    "n": "0.91",
+                    "N": "USDT",
+                }
+            )
+        )
+
+        assert state.position() is None
+        assert state.order_intent("entry-1")["status"] == "CLOSED"

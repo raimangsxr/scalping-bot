@@ -25,6 +25,8 @@ class CandleClosed(Event):
 @dataclass(frozen=True, kw_only=True)
 class MarketTick(Event):
     price: Decimal
+    volatility_bucket: str | None = None
+    size_bucket: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)

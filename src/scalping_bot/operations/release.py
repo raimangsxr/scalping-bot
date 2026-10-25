@@ -77,6 +77,23 @@ class ReleaseVerifier:
         if match is None:
             raise ReleaseVerificationError("release image must be pinned to a full commit")
         image_revision = match.group(1).lower()
+        for document in workloads.values():
+            workload_annotations = document.get("metadata", {}).get("annotations", {})
+            template_annotations = (
+                document.get("spec", {})
+                .get("template", {})
+                .get("metadata", {})
+                .get("annotations", {})
+            )
+            annotations = {
+                **(workload_annotations if isinstance(workload_annotations, dict) else {}),
+                **(template_annotations if isinstance(template_annotations, dict) else {}),
+            }
+            sbom = (
+                annotations.get("scalping-bot.io/sbom") if isinstance(annotations, dict) else None
+            )
+            if not isinstance(sbom, str) or not sbom.endswith(f":git-{image_revision}.spdx.json"):
+                raise ReleaseVerificationError("SBOM must be pinned to the release image commit")
         target_revision = str(
             self.application.get("spec", {}).get("source", {}).get("targetRevision", "")
         )

@@ -106,6 +106,7 @@ class DurableLiveShadow:
             "INSERT INTO comparisons(event_time_ms, payload) VALUES (?, ?)",
             (comparison.event_time_ms, payload.decode()),
         )
+        self.connection.commit()
 
     def record_missing_dependency(self, *, event_time_ms: int, dependency: str) -> None:
         self.gate.missing_dependency(event_time_ms=event_time_ms, dependency=dependency)
@@ -119,6 +120,7 @@ class DurableLiveShadow:
             "INSERT INTO order_attempts(event_time_ms, client_order_id) VALUES (?, ?)",
             (event_time_ms, client_order_id),
         )
+        self.connection.commit()
 
     def resolve_divergence(self, divergence: str, *, resolution: str, regression: str) -> None:
         self.gate.resolve_divergence(divergence, resolution=resolution, regression=regression)
@@ -127,10 +129,12 @@ class DurableLiveShadow:
             "VALUES (?, ?, ?)",
             (divergence, resolution, regression),
         )
+        self.connection.commit()
 
     def mark_continuity_broken(self, reason: str) -> None:
         self.gate.mark_continuity_broken(reason)
         self.connection.execute("INSERT INTO continuity(reason) VALUES (?)", (reason,))
+        self.connection.commit()
 
     def finalize(self, *, now_ms: int) -> str:
         if now_ms - self.started_ms < LIVE_SHADOW_DAYS * DAY_MS:

@@ -66,8 +66,23 @@ class BinancePublicCollector:
                 exchange_time_ms=now,
                 receipt_time_ms=now,
             )
+            snapshot_writer = self._writer("btcusdt@depth@100ms", now)
+            snapshot_writer.append(
+                {
+                    "event_type": "depth-snapshot",
+                    "exchange_time_ms": now,
+                    "receipt_time_ms": now,
+                    "payload": {
+                        "lastUpdateId": int(snapshot["lastUpdateId"]),
+                        "bids": snapshot["bids"],
+                        "asks": snapshot["asks"],
+                    },
+                }
+            )
+            self._counts["btcusdt@depth@100ms"] += 1
             async for message in socket:
                 await self.handle_message(json.loads(message), receipt_time_ms=self.clock_ms())
+            self._close_all(valid=False, invalid_reason="market-data connection closed")
 
     async def _snapshot(self) -> dict[str, Any]:
         async with httpx.AsyncClient(base_url=PRODUCTION_PUBLIC_REST, timeout=10) as client:
@@ -141,6 +156,6 @@ class BinancePublicCollector:
         for stream in tuple(self._writers):
             self._rotate(
                 stream,
-                valid=valid if "@depth" in stream else True,
-                invalid_reason=invalid_reason if "@depth" in stream else None,
+                valid=valid,
+                invalid_reason=invalid_reason,
             )

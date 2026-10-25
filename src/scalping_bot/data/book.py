@@ -85,6 +85,16 @@ class LocalOrderBook:
         price = min(self._asks)
         return price, self._asks[price]
 
+    @property
+    def bid_depth(self) -> Decimal:
+        self._require_valid()
+        return sum(self._bids.values(), Decimal(0))
+
+    @property
+    def ask_depth(self) -> Decimal:
+        self._require_valid()
+        return sum(self._asks.values(), Decimal(0))
+
     def _require_valid(self) -> None:
         if not self.valid:
             raise BookGap("book segment is invalid; a new snapshot is required")

@@ -26,6 +26,11 @@ from scalping_bot.execution.sqlite_state import SQLiteState
 from scalping_bot.operations.deployment import DeploymentGate
 from scalping_bot.operations.durable_shadow import DurableLiveShadow
 from scalping_bot.operations.durable_soak import DurableTestnetSoak
+from scalping_bot.operations.live_shadow_runtime import (
+    ProductionLiveShadowStream,
+    SharedEngineLiveShadow,
+    parse_shadow_event,
+)
 from scalping_bot.operations.operator import OperatorControls
 from scalping_bot.operations.promotion import PromotedRiskGate, RiskEvaluation
 from scalping_bot.operations.release import ReleaseVerifier
@@ -37,9 +42,12 @@ from scalping_bot.research.costs import (
     ExecutionCostModel,
     ExecutionCostModelPublisher,
 )
+from scalping_bot.research.evidence import CandidateLifecycle, CandidateRecord
+from scalping_bot.research.holdout import FinalHoldoutGate
 from scalping_bot.research.reporting import render_evidence_markdown
 from scalping_bot.research.runner import ResearchBatchRunner, load_aggtrades
 from scalping_bot.research.workflow import ResearchArtifactWriter, ResearchRunManifest
+from scalping_bot.strategies.book_shadow import BookShadowEvaluator
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -159,8 +167,14 @@ def run_research(
     manifest = ResearchRunManifest.load(store, manifest_key)
     if not manifest.verify(store):
         raise RuntimeError("research manifest inputs are no longer verifiable")
+    if not manifest.verify_dataset_paths(tuple(parquet), store):
+        raise RuntimeError(
+            "research Parquet inputs are not the immutable files bound by the manifest"
+        )
     model = ExecutionCostModel.load(store, manifest.execution_cost_model_key)
     batch = first_batch()
+    if not manifest.verify_candidate_batch(batch):
+        raise RuntimeError("the preregistered candidate batch does not match the manifest")
     evaluation = ResearchBatchRunner(
         execution_costs=model.as_engine_costs(),
         manifest_store=store,
@@ -265,7 +279,7 @@ def run_live_shadow(
     event_file: Annotated[Path | None, typer.Option(exists=True, readable=True)] = None,
     finalize_at_ms: Annotated[int | None, typer.Option()] = None,
 ) -> None:
-    """Run the restartable no-order Live Shadow process from comparison observations."""
+    """Run restartable no-order Live Shadow from production or raw event observations."""
     settings = Settings()
     if settings.candidate_manifest is None or settings.cost_model_snapshot is None:
         raise RuntimeError("Live Shadow requires a Testnet Ready candidate and cost snapshot")
@@ -277,25 +291,73 @@ def run_live_shadow(
         store=store,
         started_ms=_now_ms() if not state.exists() else None,
     )
+    runner = SharedEngineLiveShadow(
+        process,
+        candidate_manifest=settings.candidate_manifest,
+        cost_model=Path(settings.cost_model_snapshot),
+    )
     try:
         if event_file is not None:
-            from scalping_bot.operations.promotion import LiveReplayComparison
-
             for line in event_file.read_text(encoding="utf-8").splitlines():
                 value = json.loads(line)
-                process.record_comparison(LiveReplayComparison(**value))
+                if not isinstance(value, dict):
+                    raise ValueError("Live Shadow event files must contain JSON objects")
+                runner.process_event(
+                    parse_shadow_event(value),
+                    receipt_time_ms=int(str(value.get("receipt_time_ms", _now_ms()))),
+                )
             if finalize_at_ms is not None:
                 typer.echo(f"live-shadow-report={process.finalize(now_ms=finalize_at_ms)}")
             else:
                 typer.echo("live-shadow observations persisted")
             return
         typer.echo("live-shadow process running; press Ctrl-C to stop")
-        while True:
-            time.sleep(60)
+        import threading
+
+        ProductionLiveShadowStream(runner).run_forever(threading.Event())
     except KeyboardInterrupt:
         return
     finally:
         process.close()
+
+
+@app.command()
+def evaluate_book_shadow(
+    storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
+) -> None:
+    """Build non-promotable Book Flow Shadow evidence from captured segments."""
+    store = LocalObjectStore(storage)
+    evaluator = BookShadowEvaluator.from_capture(store)
+    typer.echo(f"book-shadow-report={evaluator.persist_report(store)}")
+
+
+@app.command()
+def evaluate_final_holdout(
+    candidate: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    parquet: Annotated[list[Path], typer.Argument(exists=True, readable=True)],
+    execution_cost_model_key: Annotated[str, typer.Option("--execution-cost-model-key")],
+    artifacts: Path = Path("data/research-artifacts"),
+    actor: str = typer.Option(...),
+) -> None:
+    """Reveal and evaluate the immutable Final Holdout through the shared engine."""
+    value = json.loads(candidate.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise typer.BadParameter("candidate must be a JSON object")
+    record = _candidate_record_from_json(value)
+    raw_dataset = b"".join(path.read_bytes() for path in parquet)
+    dataset_checksum = hashlib.sha256(raw_dataset).hexdigest()
+    store = LocalObjectStore(artifacts)
+    dataset_key = f"holdout-datasets/{dataset_checksum}.parquet"
+    store.put_immutable(dataset_key, raw_dataset)
+    decision = FinalHoldoutGate(store).evaluate_aggregate_trades(
+        record,
+        aggregate_trades=load_aggtrades(tuple(parquet)),
+        holdout_dataset_key=dataset_key,
+        holdout_dataset_checksum=dataset_checksum,
+        execution_cost_model_key=execution_cost_model_key,
+        actor=actor,
+    )
+    typer.echo(f"final-holdout={decision.report_key} decision={decision.decision}")
 
 
 @app.command()
@@ -469,6 +531,42 @@ def evaluate_first_batch(
 def run_testnet_executor() -> None:
     """Run the single-writer reconciled Binance Testnet executor."""
     run_executor(Settings())
+
+
+def _candidate_record_from_json(value: dict[str, object]) -> CandidateRecord:
+    try:
+        original_rules = value["original_rules"]
+        modifications = value["modifications"]
+        parameters = value["parameters"]
+        rejections = value["rejection_criteria"]
+        dependencies = value.get("market_data_dependencies", [])
+        if (
+            not isinstance(original_rules, dict)
+            or not isinstance(modifications, dict)
+            or not isinstance(parameters, dict)
+            or not isinstance(rejections, list)
+            or not isinstance(dependencies, list)
+        ):
+            raise ValueError("candidate JSON contains malformed rule fields")
+        return CandidateRecord(
+            candidate_id=str(value["candidate_id"]),
+            version=int(str(value["version"])),
+            family=str(value["family"]),
+            source_uri=str(value["source_uri"]),
+            source_license=str(value["source_license"]),
+            thesis=str(value["thesis"]),
+            original_rules=original_rules,
+            modifications=modifications,
+            parameters=parameters,
+            rejection_criteria=tuple(str(item) for item in rejections),
+            lifecycle=CandidateLifecycle(str(value["lifecycle"])),
+            frozen=bool(value["frozen"]),
+            market_data_dependencies=tuple(str(item) for item in dependencies),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise typer.BadParameter(
+            "candidate JSON does not describe a valid frozen finalist"
+        ) from error
 
 
 def _now_ms() -> int:

@@ -8,8 +8,9 @@ import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from decimal import Decimal
+from pathlib import Path
 
-from scalping_bot.data.acquisition import ResearchArchiveCatalog
+from scalping_bot.data.acquisition import ArchiveKind, ResearchArchiveCatalog
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.research.batch import BatchReview
 from scalping_bot.research.candidates import CandidateBatch
@@ -35,6 +36,7 @@ class ResearchRunManifest:
     period: tuple[str, str]
     random_seed: int
     schema_version: int = 1
+    dataset_derived_keys: tuple[str, ...] = ()
 
     @classmethod
     def create(
@@ -58,12 +60,23 @@ class ResearchRunManifest:
         _verify_content_addressed_key(dataset_catalog_key, dataset, "dataset catalog")
         _verify_content_addressed_key(execution_cost_model_key, cost_model, "cost model")
         dataset_checksums = [hashlib.sha256(dataset).hexdigest()]
+        dataset_derived_keys: tuple[str, ...] = ()
         dataset_is_json = dataset.lstrip().startswith(b"{")
         cost_model_is_json = cost_model.lstrip().startswith(b"{")
         if dataset_catalog_key.startswith("catalogs/research-market/") and dataset_is_json:
             catalog = ResearchArchiveCatalog.load(store, dataset_catalog_key)
             catalog.require_complete()
             dataset_checksums.extend(sorted({entry.source_sha256 for entry in catalog.entries}))
+            dataset_derived_keys = tuple(
+                sorted(
+                    derived_key
+                    for entry in catalog.entries
+                    if entry.kind is ArchiveKind.AGG_TRADES
+                    for derived_key in entry.derived_keys
+                )
+            )
+            for derived_key in dataset_derived_keys:
+                dataset_checksums.append(hashlib.sha256(store.read(derived_key)).hexdigest())
         if execution_cost_model_key.startswith("cost-models/") and cost_model_is_json:
             ExecutionCostModel.load(store, execution_cost_model_key)
         return cls(
@@ -75,6 +88,7 @@ class ResearchRunManifest:
             configuration=dict(configuration),
             period=period,
             random_seed=random_seed,
+            dataset_derived_keys=dataset_derived_keys,
         )
 
     def canonical_bytes(self) -> bytes:
@@ -120,6 +134,7 @@ class ResearchRunManifest:
             period=(period[0], period[1]),
             random_seed=int(str(value["random_seed"])),
             schema_version=int(str(value.get("schema_version", 1))),
+            dataset_derived_keys=tuple(str(item) for item in value.get("dataset_derived_keys", [])),
         )
         if manifest.identity != expected:
             raise ValueError("research run manifest canonical identity is invalid")
@@ -137,10 +152,25 @@ class ResearchRunManifest:
             catalog = ResearchArchiveCatalog.load(store, self.dataset_catalog_key)
             catalog.require_complete()
             checksums.extend(sorted({entry.source_sha256 for entry in catalog.entries}))
+            for derived_key in self.dataset_derived_keys:
+                checksums.append(hashlib.sha256(store.read(derived_key)).hexdigest())
         checksums.append(hashlib.sha256(cost_model).hexdigest())
         if self.execution_cost_model_key.startswith("cost-models/") and cost_model_is_json:
             ExecutionCostModel.load(store, self.execution_cost_model_key)
         return tuple(checksums) == self.dataset_checksums and self.random_seed >= 0
+
+    def verify_candidate_batch(self, candidate_batch: CandidateBatch) -> bool:
+        return _candidate_batch_sha256(candidate_batch) == self.candidate_batch_sha256
+
+    def verify_dataset_paths(self, paths: tuple[Path, ...], store: ObjectStore) -> bool:
+        """Allow only Parquet files whose bytes are bound by the catalog."""
+        if not self.dataset_derived_keys or not paths:
+            return False
+        expected = sorted(
+            hashlib.sha256(store.read(key)).hexdigest() for key in self.dataset_derived_keys
+        )
+        actual = sorted(hashlib.sha256(path.read_bytes()).hexdigest() for path in paths)
+        return actual == expected
 
 
 class PersistentAttemptLedger:

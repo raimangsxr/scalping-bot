@@ -213,6 +213,7 @@ class EvidenceProtocol:
         cost_scenario_trades: Mapping[Decimal, tuple[ScalpResult, ...]] | None = None,
         baseline_trades: tuple[ScalpResult, ...] | None = None,
         baseline_cost_scenario_trades: Mapping[Decimal, tuple[ScalpResult, ...]] | None = None,
+        fold_count_override: int | None = None,
     ) -> EvidenceResult:
         if attempts < 1:
             raise ValueError("selection attempt count must be positive")
@@ -222,7 +223,9 @@ class EvidenceProtocol:
         by_fold: dict[int, Decimal] = defaultdict(Decimal)
         for trade in trades:
             by_fold[trade.fold] += trade.net_pnl
-        fold_count = len(self.walk_forward_folds())
+        fold_count = fold_count_override or len(self.walk_forward_folds())
+        if fold_count < 1:
+            raise ValueError("evidence evaluation requires at least one fold")
         positive_fraction = Decimal(
             sum(by_fold.get(index, Decimal(0)) > 0 for index in range(fold_count))
         ) / Decimal(fold_count)

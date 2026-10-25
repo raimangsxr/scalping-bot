@@ -10,6 +10,8 @@ from decimal import Decimal
 
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.execution.candidate import PromotedCandidateManifest
+from scalping_bot.research.candidates import first_batch
+from scalping_bot.research.costs import ExecutionCostModel
 from scalping_bot.research.evidence import (
     CandidateLifecycle,
     CandidateRecord,
@@ -17,6 +19,8 @@ from scalping_bot.research.evidence import (
     HoldoutAccessError,
     HoldoutRegistry,
 )
+from scalping_bot.research.execution import AggTrade
+from scalping_bot.research.runner import ResearchBatchRunner
 
 
 @dataclass(frozen=True)
@@ -49,10 +53,20 @@ class FinalHoldoutGate:
             or candidate.lifecycle is not CandidateLifecycle.WALK_FORWARD_VALIDATED
         ):
             raise HoldoutAccessError("candidate must be a frozen walk-forward finalist")
+        registered = next(
+            (item for item in first_batch().candidates if item.identity == candidate.identity),
+            None,
+        )
+        if registered is None or candidate.parameters != registered.parameters:
+            raise HoldoutAccessError("candidate is not the preregistered first-batch identity")
         if len(holdout_dataset_checksum) != 64 or any(
             item not in "0123456789abcdefABCDEF" for item in holdout_dataset_checksum
         ):
             raise ValueError("Final Holdout requires a checksum-verified dataset")
+        if holdout_dataset_key is None or execution_cost_model_key is None:
+            raise ValueError(
+                "Final Holdout requires immutable dataset and Execution Cost Model artifacts"
+            )
         if holdout_dataset_key is not None:
             try:
                 dataset = self.store.read(holdout_dataset_key)
@@ -85,6 +99,8 @@ class FinalHoldoutGate:
                     ).hexdigest()
                 if canonical != cost_key_identity:
                     raise ValueError("Final Holdout cost checksum does not match its artifact")
+            if execution_cost_model_key.startswith("cost-models/"):
+                ExecutionCostModel.load(self.store, execution_cost_model_key)
         try:
             reveal_key = self.registry.reveal(
                 candidate, command="reveal-final-holdout", actor=actor
@@ -141,6 +157,39 @@ class FinalHoldoutGate:
             reasons=tuple(reasons),
         )
 
+    def evaluate_aggregate_trades(
+        self,
+        candidate: CandidateRecord,
+        *,
+        aggregate_trades: tuple[AggTrade, ...],
+        holdout_dataset_key: str,
+        holdout_dataset_checksum: str,
+        execution_cost_model_key: str,
+        actor: str,
+    ) -> FinalHoldoutDecision:
+        """Evaluate the immutable Final Holdout through the shared replay engine."""
+        if not aggregate_trades:
+            raise ValueError("Final Holdout aggregate-trade evidence cannot be empty")
+        months = {_month(item.time_ms) for item in aggregate_trades}
+        if not months or min(months) < "2025-10" or max(months) > "2026-09":
+            raise ValueError(
+                "Final Holdout trades must be within October 2025 through September 2026"
+            )
+        model = ExecutionCostModel.load(self.store, execution_cost_model_key)
+        evidence, _trades = ResearchBatchRunner(
+            execution_costs=model.as_engine_costs(),
+            code_commit="final-holdout",
+            dataset_checksums=(holdout_dataset_checksum, model.identity),
+        ).evaluate_frozen_candidate(candidate, aggregate_trades)
+        return self.evaluate(
+            candidate,
+            evidence=evidence,
+            holdout_dataset_checksum=holdout_dataset_checksum,
+            actor=actor,
+            holdout_dataset_key=holdout_dataset_key,
+            execution_cost_model_key=execution_cost_model_key,
+        )
+
 
 def _concrete_parameters(parameters: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(parameters, Mapping):
@@ -184,3 +233,9 @@ def _render_report(
         "Reasons:\n"
         f"{reason_lines}\n"
     )
+
+
+def _month(time_ms: int) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(time_ms / 1000, tz=UTC).strftime("%Y-%m")

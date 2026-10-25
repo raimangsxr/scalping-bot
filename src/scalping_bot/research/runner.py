@@ -251,6 +251,31 @@ class ResearchBatchRunner:
             )
         return evidence, results
 
+    def evaluate_frozen_candidate(
+        self, candidate: CandidateRecord, trades: tuple[AggTrade, ...]
+    ) -> tuple[EvidenceResult, tuple[ScalpResult, ...]]:
+        """Evaluate one frozen parameter choice on an unseen holdout period."""
+        scenarios = {
+            multiplier: self._evaluate_period(
+                candidate,
+                _first_parameter_values(candidate.parameters),
+                trades,
+                fold=0,
+                stress=multiplier,
+            )
+            for multiplier in (Decimal("1"), Decimal("1.5"), Decimal("2"))
+        }
+        worst = scenarios[Decimal("2")]
+        evidence = self.protocol.evaluate(
+            worst,
+            initial_equity=self.initial_equity,
+            attempts=1,
+            cost_stress_multipliers=tuple(scenarios),
+            cost_scenario_trades=scenarios,
+            fold_count_override=1,
+        )
+        return evidence, worst
+
     def _evaluate_period(
         self,
         candidate: CandidateRecord,
@@ -288,6 +313,14 @@ def load_aggtrades(paths: tuple[Path, ...]) -> tuple[AggTrade, ...]:
                     price=Decimal(str(item["price"])),
                     quantity=Decimal(str(item["quantity"])),
                     buyer_maker=bool(item["buyer_maker"]),
+                    volatility_bucket=(
+                        str(item["volatility_bucket"])
+                        if item.get("volatility_bucket") is not None
+                        else None
+                    ),
+                    size_bucket=(
+                        str(item["size_bucket"]) if item.get("size_bucket") is not None else None
+                    ),
                 )
             )
     rows.sort(key=lambda item: (item.time_ms, item.aggregate_trade_id))
@@ -309,11 +342,7 @@ def _replay_fold(
     if not _aggregate_trades_are_contiguous(trades):
         return ()
     state = InMemoryState(initial_equity=initial_equity)
-    stressed_costs = ExecutionCosts(
-        commission_rate=execution_costs.commission_rate * stress,
-        half_spread_rate=execution_costs.half_spread_rate * stress,
-        slippage_rate=execution_costs.slippage_rate * stress,
-    )
+    stressed_costs = execution_costs.stressed(stress)
     engine = Engine(state, policy, execution_costs=stressed_costs)
     completed: list[ScalpResult] = []
     open_trade: tuple[str, int, Decimal, Decimal, Decimal] | None = None
@@ -326,8 +355,13 @@ def _replay_fold(
         result = engine.handle(event)
         for command in result.commands:
             if isinstance(command, SubmitEntry):
+                if not isinstance(event, MarketTick):
+                    raise TypeError("simulated entries must be emitted from a market tick")
                 commission = stressed_costs.estimated_close_cost(
-                    command.price_reference * command.quantity
+                    command.price_reference * command.quantity,
+                    event_time_ms=event.event_time_ms,
+                    volatility_bucket=event.volatility_bucket,
+                    size_bucket=event.size_bucket,
                 )
                 fill = FillReceived(
                     event_id=f"sim-entry-{command.client_order_id}",
@@ -348,9 +382,16 @@ def _replay_fold(
                 )
                 open_marks = [(event.event_time_ms, command.price_reference)]
             elif isinstance(command, ExitMarket) and open_trade is not None:
+                if not isinstance(event, MarketTick):
+                    raise TypeError("simulated exits must be emitted from a market tick")
                 identity, opened_ms, entry_price, quantity, entry_cost = open_trade
                 exit_price = event.price if isinstance(event, MarketTick) else event.close
-                exit_cost = stressed_costs.estimated_close_cost(exit_price * quantity)
+                exit_cost = stressed_costs.estimated_close_cost(
+                    exit_price * quantity,
+                    event_time_ms=event.event_time_ms,
+                    volatility_bucket=event.volatility_bucket,
+                    size_bucket=event.size_bucket,
+                )
                 engine.handle(
                     ExitFillReceived(
                         event_id=f"sim-exit-{command.client_order_id}",
@@ -387,6 +428,8 @@ def _replay_fold(
                     event_id=f"aggTrade-{trade.aggregate_trade_id}",
                     event_time_ms=trade.time_ms,
                     price=trade.price,
+                    volatility_bucket=trade.volatility_bucket,
+                    size_bucket=trade.size_bucket,
                 )
             )
         process(candle)
@@ -397,6 +440,8 @@ def _replay_fold(
                 event_id=f"force-{last.aggregate_trade_id}",
                 event_time_ms=max(last.time_ms + 30 * 60_000, open_trade[1] + 30 * 60_000),
                 price=last.price,
+                volatility_bucket=last.volatility_bucket,
+                size_bucket=last.size_bucket,
             )
         )
     return tuple(completed)

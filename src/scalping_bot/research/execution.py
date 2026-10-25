@@ -14,6 +14,8 @@ class AggTrade:
     price: Decimal
     quantity: Decimal
     buyer_maker: bool
+    volatility_bucket: str | None = None
+    size_bucket: str | None = None
 
 
 class AggTradeReplay:
@@ -33,6 +35,8 @@ class AggTradeReplay:
                 event_id=f"aggTrade-{trade.aggregate_trade_id}",
                 event_time_ms=trade.time_ms,
                 price=trade.price,
+                volatility_bucket=trade.volatility_bucket,
+                size_bucket=trade.size_bucket,
             )
             for trade in trades
             if trade.time_ms > confirmed_ms

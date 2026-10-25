@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from scalping_bot.data.capture import CaptureLedger, RawSegmentWriter
 from scalping_bot.data.storage import LocalObjectStore
 from scalping_bot.research.candidates import first_batch
 from scalping_bot.research.costs import (
@@ -173,3 +174,51 @@ def test_book_shadow_evidence_is_persisted_as_non_promotable_artifact(tmp_path: 
 
     assert "Shadow Evaluation" in report
     assert "Promotion: prohibited" in report
+
+
+def test_book_shadow_can_derive_valid_observations_from_capture_segments(tmp_path: Path) -> None:
+    store = LocalObjectStore(tmp_path / "objects")
+    ledger = CaptureLedger(store)
+    trade_writer = RawSegmentWriter(store, stream="btcusdt-aggTrade", segment_started_ms=1_000)
+    trade_writer.append(
+        {
+            "event_type": "aggTrade",
+            "exchange_time_ms": 1_001,
+            "receipt_time_ms": 1_002,
+            "payload": {"a": 1, "T": 1_001, "p": "100", "q": "1", "m": False},
+        }
+    )
+    trade_segment = trade_writer.close(valid=True)
+    ledger.record(trade_segment, health={})
+
+    depth_writer = RawSegmentWriter(store, stream="btcusdt-depth-100ms", segment_started_ms=1_000)
+    depth_writer.append(
+        {
+            "event_type": "depth-snapshot",
+            "exchange_time_ms": 1_000,
+            "receipt_time_ms": 1_000,
+            "payload": {
+                "lastUpdateId": 100,
+                "bids": [["99", "1"]],
+                "asks": [["101", "1"]],
+            },
+        }
+    )
+    depth_writer.append(
+        {
+            "event_type": "depth@100ms",
+            "exchange_time_ms": 1_001,
+            "receipt_time_ms": 1_002,
+            "payload": {"U": 101, "u": 101, "b": [["99", "2"]], "a": []},
+        }
+    )
+    depth_segment = depth_writer.close(valid=True)
+    ledger.record(depth_segment, health={})
+
+    evaluator = BookShadowEvaluator.from_capture(store)
+    report = evaluator.report()
+
+    assert report.observations == 1
+    assert report.valid_observations == 1
+    assert report.gaps == 0
+    assert evaluator.observations[0].hypothetical_entry

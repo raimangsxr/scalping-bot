@@ -8,7 +8,7 @@ from decimal import Decimal
 from statistics import median
 
 from scalping_bot.data.storage import ObjectStore
-from scalping_bot.domain.costs import ExecutionCosts
+from scalping_bot.domain.costs import EngineCostBucket, ExecutionCosts
 
 
 @dataclass(frozen=True)
@@ -136,6 +136,17 @@ class ExecutionCostModel:
             commission_rate=self.commission.taker,
             half_spread_rate=half_spread,
             slippage_rate=slippage,
+            calibrated_buckets=tuple(
+                EngineCostBucket(
+                    hour_utc=hour,
+                    volatility_bucket=volatility,
+                    size_bucket=size,
+                    half_spread_rate=bucket.spread_bps / Decimal("20000"),
+                    slippage_rate=bucket.slippage_bps / Decimal("10000"),
+                    observations=bucket.observations,
+                )
+                for (hour, volatility, size), bucket in sorted(self.buckets.items())
+            ),
         )
 
     @classmethod

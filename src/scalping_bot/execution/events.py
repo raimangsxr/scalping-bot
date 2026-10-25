@@ -228,6 +228,8 @@ class ExchangeEventApplier:
         )
         if intent["side"] == "BUY":
             self.state.rebuild_position_from_order(event.client_order_id)
+        elif intent["side"] == "SELL":
+            self.state.apply_exit_fills(event.client_order_id, event_time_ms=event.event_time_ms)
         self.state.append_audit(
             kind="exchange-order-updated",
             event_time_ms=event.event_time_ms,

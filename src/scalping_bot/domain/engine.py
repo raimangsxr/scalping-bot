@@ -13,6 +13,7 @@ from scalping_bot.domain.events import (
     MarketTick,
     OperatorConfirmedNewDay,
 )
+from scalping_bot.domain.market_context import size_bucket as notional_size_bucket
 from scalping_bot.domain.models import (
     AuditDecision,
     Command,
@@ -280,7 +281,7 @@ class Engine:
             event.price * position.quantity,
             event_time_ms=event.event_time_ms,
             volatility_bucket=event.volatility_bucket,
-            size_bucket=event.size_bucket,
+            size_bucket=notional_size_bucket(event.price * position.quantity),
         )
         mark_equity = (
             self.state.current_equity

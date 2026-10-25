@@ -11,6 +11,22 @@ from scalping_bot.data.storage import ObjectStore
 from scalping_bot.execution.sqlite_state import SQLiteState
 from scalping_bot.operations.promotion import SoakGate, SoakResult
 
+_MIGRATIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS supervised_windows (
+        start_ms INTEGER PRIMARY KEY, end_ms INTEGER NOT NULL,
+        alerts_verified INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS scalps (
+        event_time_ms INTEGER PRIMARY KEY, payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS incidents (
+        event_time_ms INTEGER PRIMARY KEY, payload TEXT NOT NULL
+    );
+    """,
+)
+
 
 class DurableTestnetSoak:
     def __init__(
@@ -22,25 +38,13 @@ class DurableTestnetSoak:
         started_ms: int | None = None,
     ) -> None:
         self.store = store
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
-        self.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS supervised_windows (
-                start_ms INTEGER PRIMARY KEY, end_ms INTEGER NOT NULL,
-                alerts_verified INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS scalps (
-                event_time_ms INTEGER PRIMARY KEY, payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS incidents (
-                event_time_ms INTEGER PRIMARY KEY, payload TEXT NOT NULL
-            );
-            """
-        )
+        self._migrate()
         metadata = self._metadata()
         if not metadata:
             if started_ms is None or started_ms < 0:
@@ -63,6 +67,14 @@ class DurableTestnetSoak:
     @property
     def scalps(self) -> int:
         return self.gate.scalps
+
+    @property
+    def supervised_windows(self) -> tuple[tuple[int, int, bool], ...]:
+        return tuple(self.gate.supervised_windows)
+
+    @property
+    def continuous_started_ms(self) -> int | None:
+        return self.gate.continuous_started_ms
 
     def record_supervised_window(
         self, *, start_ms: int, end_ms: int, alerts_verified: bool
@@ -208,6 +220,23 @@ class DurableTestnetSoak:
     def close(self) -> None:
         self.connection.commit()
         self.connection.close()
+
+    def _migrate(self) -> None:
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        applied = {
+            int(row[0])
+            for row in self.connection.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        for version, migration in enumerate(_MIGRATIONS, start=1):
+            if version in applied:
+                continue
+            self.connection.executescript(
+                f"BEGIN IMMEDIATE;\n{migration}\n"
+                f"INSERT INTO schema_migrations(version) VALUES ({version});\nCOMMIT;"
+            )
 
     def _restore(self) -> None:
         for row in self.connection.execute(

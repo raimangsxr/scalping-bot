@@ -16,6 +16,7 @@ from scalping_bot.data.storage import ObjectStore
 from scalping_bot.domain.engine import Engine, StrategyPolicy
 from scalping_bot.domain.events import CandleClosed, ExitFillReceived, FillReceived, MarketTick
 from scalping_bot.domain.market_context import MarketContext
+from scalping_bot.domain.market_context import size_bucket as notional_size_bucket
 from scalping_bot.domain.models import EntryProposal, ExecutionCosts, ExitMarket, SubmitEntry
 from scalping_bot.domain.state import InMemoryState
 from scalping_bot.research.candidates import CandidateBatch, first_batch
@@ -29,6 +30,7 @@ from scalping_bot.research.evidence import (
 )
 from scalping_bot.research.execution import AggTrade
 from scalping_bot.research.screening import AttemptLedger
+from scalping_bot.research.workflow import PersistentAttemptLedger
 from scalping_bot.strategies.breakout import BreakoutPolicy
 from scalping_bot.strategies.mean_reversion import RegimeVwapPolicy
 from scalping_bot.strategies.momentum import MomentumPolicy
@@ -37,7 +39,7 @@ from scalping_bot.strategies.momentum import MomentumPolicy
 @dataclass(frozen=True)
 class BatchEvaluation:
     evidence: Mapping[str, EvidenceResult]
-    ledger: AttemptLedger
+    ledger: AttemptLedger | PersistentAttemptLedger
     trades: Mapping[str, tuple[ScalpResult, ...]]
     candidate_records: Mapping[str, CandidateRecord] = field(default_factory=dict)
     manifest_keys: Mapping[str, str] = field(default_factory=dict)
@@ -57,7 +59,19 @@ class ResearchBatchRunner:
         code_commit: str = "working-tree",
         dataset_checksums: tuple[str, ...] = (),
         position_risk: Decimal = Decimal("0.0025"),
+        random_seed: int = 7,
+        run_identity: str | None = None,
     ) -> None:
+        if random_seed < 0:
+            raise ValueError("research random seed cannot be negative")
+        if manifest_store is not None and (
+            not execution_costs.commission_snapshot
+            or not execution_costs.execution_cost_model_identity
+            or not execution_costs.calibration_method
+        ):
+            raise ValueError(
+                "manifest-backed research requires commission and cost-model provenance"
+            )
         self.execution_costs = execution_costs
         self.initial_equity = initial_equity
         self.protocol = EvidenceProtocol()
@@ -65,6 +79,8 @@ class ResearchBatchRunner:
         self.code_commit = code_commit
         self.dataset_checksums = dataset_checksums
         self.position_risk = position_risk
+        self.random_seed = random_seed
+        self.run_identity = run_identity
 
     def run(
         self,
@@ -74,7 +90,11 @@ class ResearchBatchRunner:
         historical_trades: tuple[AggTrade, ...] = (),
     ) -> BatchEvaluation:
         selected_batch = batch or first_batch()
-        ledger = AttemptLedger()
+        ledger: AttemptLedger | PersistentAttemptLedger
+        if self.manifest_store is not None and self.run_identity:
+            ledger = PersistentAttemptLedger(self.manifest_store, run_identity=self.run_identity)
+        else:
+            ledger = AttemptLedger()
         evidence: dict[str, EvidenceResult] = {}
         evidence_trades: dict[str, tuple[ScalpResult, ...]] = {}
         for candidate in selected_batch.candidates:
@@ -185,6 +205,7 @@ class ResearchBatchRunner:
                     multiplier: tuple(results)
                     for multiplier, results in baseline_scenario_results.items()
                 },
+                random_seed=self.random_seed,
             )
             evidence[candidate.identity] = replace(
                 evaluated,
@@ -208,17 +229,19 @@ class ResearchBatchRunner:
                     },
                     dataset_checksums=self.dataset_checksums,
                     commission_snapshot={
-                        "taker": str(self.execution_costs.commission_rate),
+                        **dict(self.execution_costs.commission_snapshot),
                     },
                     execution_cost_model={
+                        "identity": self.execution_costs.execution_cost_model_identity or "",
                         "half_spread_rate": str(self.execution_costs.half_spread_rate),
                         "slippage_rate": str(self.execution_costs.slippage_rate),
+                        "calibration_method": self.execution_costs.calibration_method,
                     },
                     period=(
                         f"{self.protocol.PRIMARY_START[0]:04d}-{self.protocol.PRIMARY_START[1]:02d}",
                         f"{self.protocol.PRIMARY_END[0]:04d}-{self.protocol.PRIMARY_END[1]:02d}",
                     ),
-                    random_seed=7,
+                    random_seed=self.random_seed,
                 )
                 manifest_keys[candidate.identity] = manifest.persist(self.manifest_store)
         historical_evidence, historical_results = self._historical_stress(
@@ -258,6 +281,7 @@ class ResearchBatchRunner:
                 worst,
                 initial_equity=self.initial_equity,
                 attempts=1,
+                random_seed=self.random_seed,
                 cost_stress_multipliers=tuple(scenario_results),
                 cost_scenario_trades=scenario_results,
             )
@@ -289,6 +313,7 @@ class ResearchBatchRunner:
             worst,
             initial_equity=self.initial_equity,
             attempts=1,
+            random_seed=self.random_seed,
             cost_stress_multipliers=tuple(scenarios),
             cost_scenario_trades=scenarios,
             fold_count_override=1,
@@ -408,7 +433,7 @@ def _replay_fold(
                     command.price_reference * command.quantity,
                     event_time_ms=event.event_time_ms,
                     volatility_bucket=event.volatility_bucket,
-                    size_bucket=event.size_bucket,
+                    size_bucket=notional_size_bucket(command.price_reference * command.quantity),
                 )
                 fill = FillReceived(
                     event_id=f"sim-entry-{command.client_order_id}",
@@ -437,7 +462,7 @@ def _replay_fold(
                     exit_price * quantity,
                     event_time_ms=event.event_time_ms,
                     volatility_bucket=event.volatility_bucket,
-                    size_bucket=event.size_bucket,
+                    size_bucket=notional_size_bucket(exit_price * quantity),
                 )
                 engine.handle(
                     ExitFillReceived(

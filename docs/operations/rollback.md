@@ -14,6 +14,17 @@ Before sync, the `PreSync` deployment gate reads SQLite without becoming a write
 
 If any prerequisite fails, the ArgoCD sync fails without replacing the executor.
 
+The executor publishes encrypted five-minute backups for its primary SQLite database and the
+separate operator-command and Testnet-Soak databases under `state/backups/`. Live Shadow keeps its
+own SQLite state and, when `SCALPING_BACKUP_ENCRYPTION_KEY` is configured, publishes a shutdown
+backup under `state/backups/live-shadow/`. Auxiliary databases have their own migration history and
+must be restored together with the primary state when investigating an operational incident.
+
+The collector publishes immutable health heartbeats under `health/collector/`; the Live Shadow
+database records the last event and receipt timestamps. Kubernetes readiness and liveness probes
+consume these health records, so a stale stream, storage failure, or broken shadow continuity is
+visible as an unhealthy process rather than silently appearing operational.
+
 ## Rollback drill
 
 1. Keep the current pod stopped and retain its PVC. Never run two executors.

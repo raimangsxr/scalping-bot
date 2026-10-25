@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import queue
 import signal
 import threading
@@ -113,9 +114,10 @@ def run_executor(settings: Settings) -> None:
                 event_time_ms=event_time_ms
             ),
         )
-        operator_commands = OperatorCommandStore(
-            settings.state_path.with_suffix(settings.state_path.suffix + ".operator.db")
+        operator_database_path = settings.state_path.with_suffix(
+            settings.state_path.suffix + ".operator.db"
         )
+        operator_commands = OperatorCommandStore(operator_database_path)
         runner = LiveEngineRunner(engine=engine, execution=execution, durable_state=state)
         soak = DurableTestnetSoak(
             settings.state_path.with_name("testnet-soak.db"),
@@ -124,6 +126,8 @@ def run_executor(settings: Settings) -> None:
             started_ms=time.time_ns() // 1_000_000,
         )
         stream = BinanceTestnetMarketStream(settings.binance_ws_url)
+        market_events: queue.Queue[object] = queue.Queue()
+        market_notifications: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
         user_events: queue.SimpleQueue[tuple[str, object]] = queue.SimpleQueue()
 
         def user_stream_disconnected(reason: str) -> None:
@@ -191,6 +195,58 @@ def run_executor(settings: Settings) -> None:
             dependency: None for dependency in candidate.market_data_dependencies
         }
 
+        def record_soak_incident(event_time_ms: int, regression: str) -> None:
+            try:
+                soak.record_incident(
+                    event_time_ms=event_time_ms, critical=True, regression=regression
+                )
+            except ValueError as error:
+                state.set_operating_mode(OperationalMode.DEGRADED)
+                state.append_audit(
+                    kind="testnet-soak-incident-evidence-failed",
+                    event_time_ms=event_time_ms,
+                    details={"error_type": type(error).__name__},
+                )
+
+        executor_started_ms = time.time_ns() // 1_000_000
+        supervision_cursor: int | None = (
+            soak.started_ms if not soak.supervised_windows else None
+        )
+        if soak.supervised_windows:
+            # A restart is an operational incident.  Do not bridge the gap
+            # between two processes with synthetic supervised coverage.
+            record_soak_incident(executor_started_ms, "executor-restart")
+
+        def record_soak_supervision(event_time_ms: int) -> None:
+            nonlocal supervision_cursor
+            if supervision_cursor is None:
+                supervision_cursor = event_time_ms
+                return
+            if event_time_ms > supervision_cursor:
+                try:
+                    soak.record_supervised_window(
+                        start_ms=supervision_cursor,
+                        end_ms=event_time_ms,
+                        alerts_verified=notification_ok,
+                    )
+                    supervision_cursor = event_time_ms
+                except ValueError as error:
+                    state.set_operating_mode(OperationalMode.DEGRADED)
+                    state.append_audit(
+                        kind="testnet-soak-supervision-evidence-failed",
+                        event_time_ms=event_time_ms,
+                        details={"error_type": type(error).__name__},
+                    )
+            if (
+                soak.continuous_started_ms is None
+                and event_time_ms - soak.started_ms >= 7 * 86_400_000
+            ):
+                with contextlib.suppress(ValueError):
+                    soak.begin_continuous(
+                        now_ms=event_time_ms,
+                        alerts_verified=notification_ok,
+                    )
+
         def mark_dependencies_unavailable() -> None:
             for dependency in dependency_last_seen:
                 dependency_last_seen[dependency] = None
@@ -222,12 +278,35 @@ def run_executor(settings: Settings) -> None:
             )
 
         def market_stream_disconnected(reason: str) -> None:
-            mark_dependencies_unavailable()
-            event_applier.stream_lost(event_time_ms=time.time_ns() // 1_000_000, reason=reason)
+            market_notifications.put(("lost", reason))
+
+        def market_stream_reconnected() -> None:
+            market_notifications.put(("reconnected", ""))
+
+        def drain_market_notifications(event_time_ms: int) -> None:
+            while True:
+                try:
+                    kind, reason = market_notifications.get_nowait()
+                except queue.Empty:
+                    return
+                if kind == "lost":
+                    mark_dependencies_unavailable()
+                    event_applier.stream_lost(event_time_ms=event_time_ms, reason=reason)
+                    record_soak_incident(event_time_ms, f"market-stream:{reason}")
+                elif kind == "reconnected":
+                    try:
+                        reconcile_after_reconnect()
+                    except Exception as error:
+                        state.set_operating_mode(OperationalMode.DEGRADED)
+                        state.append_audit(
+                            kind="market-stream-reconnect-reconciliation-failed",
+                            event_time_ms=event_time_ms,
+                            details={"error_type": type(error).__name__},
+                        )
 
         def drain_operator_commands(event_time_ms: int) -> None:
             nonlocal reconciliation
-            for command in operator_commands.pending():
+            for command in operator_commands.claim_pending():
                 try:
                     controls = OperatorControls(state, execution)
                     if command.kind == "pause":
@@ -261,24 +340,54 @@ def run_executor(settings: Settings) -> None:
                     )
                     operator_commands.complete(command.command_id, error=type(error).__name__)
 
+        def collect_market_events() -> None:
+            try:
+                for market_event in stream.events(
+                    stop,
+                    on_disconnect=market_stream_disconnected,
+                    on_reconnect=market_stream_reconnected,
+                ):
+                    market_events.put(market_event)
+            finally:
+                market_events.put(None)
+
+        market_thread = threading.Thread(
+            target=collect_market_events, name="binance-market-stream", daemon=True
+        )
+        market_thread.start()
+
         try:
-            for event in stream.events(
-                stop,
-                on_disconnect=market_stream_disconnected,
-                on_reconnect=reconcile_after_reconnect,
-            ):
+            while not stop.is_set():
                 now_ms = time.time_ns() // 1_000_000
+                drain_market_notifications(now_ms)
+                drain_user_events(now_ms)
+                drain_operator_commands(now_ms)
+                try:
+                    queued_event = market_events.get(timeout=1)
+                except queue.Empty:
+                    continue
+                if queued_event is None:
+                    if not stop.is_set():
+                        drain_market_notifications(now_ms)
+                        mark_dependencies_unavailable()
+                        event_applier.stream_lost(
+                            event_time_ms=now_ms, reason="market stream stopped"
+                        )
+                    break
+                event = queued_event
+                if not isinstance(event, (CandleClosed, MarketTick)):
+                    raise TypeError("Market Stream emitted a non-market event")
+                now_ms = time.time_ns() // 1_000_000
+                record_soak_supervision(now_ms)
                 if isinstance(event, CandleClosed):
                     mark_dependency_seen("closed-1m-klines", now_ms)
                 elif isinstance(event, MarketTick):
                     mark_dependency_seen("aggTrades", now_ms)
                     mark_dependency_seen("tradeTicks", now_ms)
-                drain_operator_commands(now_ms)
                 prior_entry_id: str | None = None
                 prior_position = state.position()
                 if prior_position is not None:
                     prior_entry_id = state.position_entry_client_order_id()
-                drain_user_events(now_ms)
                 try:
                     persistence_ok = state.persistence_healthy()
                 except Exception:
@@ -318,6 +427,11 @@ def run_executor(settings: Settings) -> None:
                             event_time_ms=now_ms,
                             details={"error_type": type(error).__name__},
                         )
+                if health_result.mode is OperationalMode.DEGRADED:
+                    record_soak_incident(
+                        now_ms,
+                        "health-degraded:" + ";".join(health_result.reasons),
+                    )
                 runner.process(event)
                 if prior_entry_id is not None and state.position() is None:
                     try:
@@ -364,6 +478,16 @@ def run_executor(settings: Settings) -> None:
                             created_ms=now_ms,
                         )
                         backup.publish_latest(artifact)
+                        for auxiliary_path, auxiliary_name in (
+                            (operator_database_path, "operator"),
+                            (soak.path, "testnet-soak"),
+                        ):
+                            auxiliary_artifact = backup.create(
+                                auxiliary_path,
+                                destination=settings.state_path.parent / "backups" / auxiliary_name,
+                                created_ms=now_ms,
+                            )
+                            backup.publish_latest(auxiliary_artifact)
                         metrics.storage_health.set(1)
                         last_backup_ms = now_ms
                         storage_ok = True
@@ -393,6 +517,7 @@ def run_executor(settings: Settings) -> None:
                 metrics.operating_mode.set(float(list(OperationalMode).index(state.operating_mode)))
         finally:
             stop.set()
+            market_thread.join(timeout=5)
             user_thread.join(timeout=5)
             soak.close()
             operator_commands.close()

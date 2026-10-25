@@ -89,7 +89,9 @@ def _historical_parquet(path: Path) -> None:
     pq.write_table(table, path)
 
 
-def _testnet_stress(path: Path, manifest: PromotedCandidateManifest, risk: str) -> None:
+def _testnet_stress(
+    path: Path, manifest: PromotedCandidateManifest, risk: str, source_key: str
+) -> None:
     path.write_text(
         json.dumps(
             {
@@ -103,7 +105,7 @@ def _testnet_stress(path: Path, manifest: PromotedCandidateManifest, risk: str) 
                 "cost_stress_passed": True,
                 "operational_controls_passed": True,
                 "concentration_passed": True,
-                "source_evidence": ["testnet-run-immutable-artifact"],
+                "source_evidence": [source_key],
             },
             sort_keys=True,
         ),
@@ -118,6 +120,9 @@ def test_promoted_risk_trial_runs_both_risks_and_binds_immutable_manifests(
     candidate_path = tmp_path / "candidate.json"
     manifest = _ready_candidate_manifest(candidate_path)
     promotion_key, soak_key = _promotion_and_soak(store, manifest)
+    store.put_immutable("capture/immutable-segment", b"immutable capture segment\n")
+    source_key = "testnet/source-evidence.json"
+    store.put_immutable(source_key, b"immutable testnet source\n")
     cost_model = ExecutionCostCalibrator().fit(
         (
             CalibrationObservation(
@@ -144,8 +149,8 @@ def test_promoted_risk_trial_runs_both_risks_and_binds_immutable_manifests(
     _historical_parquet(historical_path)
     baseline_path = tmp_path / "testnet-baseline.json"
     promoted_path = tmp_path / "testnet-promoted.json"
-    _testnet_stress(baseline_path, manifest, "0.0025")
-    _testnet_stress(promoted_path, manifest, "0.005")
+    _testnet_stress(baseline_path, manifest, "0.0025", source_key)
+    _testnet_stress(promoted_path, manifest, "0.005", source_key)
 
     trial = run_promoted_risk_trial(
         store=store,

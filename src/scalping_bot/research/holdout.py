@@ -7,7 +7,9 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 
+from scalping_bot.data.acquisition import FINAL_HOLDOUT, ArchiveKind, ResearchArchiveCatalog
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.execution.candidate import PromotedCandidateManifest
 from scalping_bot.research.candidates import first_batch
@@ -156,6 +158,8 @@ class FinalHoldoutGate:
         candidate: CandidateRecord,
         *,
         aggregate_trades: tuple[AggTrade, ...],
+        holdout_parquet_paths: tuple[Path, ...],
+        holdout_catalog_key: str,
         holdout_dataset_key: str,
         holdout_dataset_checksum: str,
         execution_cost_model_key: str,
@@ -164,6 +168,11 @@ class FinalHoldoutGate:
         """Evaluate the immutable Final Holdout through the shared replay engine."""
         if not aggregate_trades:
             raise ValueError("Final Holdout aggregate-trade evidence cannot be empty")
+        _verify_official_holdout_inputs(
+            self.store,
+            holdout_catalog_key=holdout_catalog_key,
+            parquet_paths=holdout_parquet_paths,
+        )
         months = {_month(item.time_ms) for item in aggregate_trades}
         required_months = {
             f"{year:04d}-{month:02d}"
@@ -215,6 +224,37 @@ def _concrete_parameters(parameters: Mapping[str, object]) -> dict[str, object]:
         name: value[0] if isinstance(value, list) and value else value
         for name, value in parameters.items()
     }
+
+
+def _verify_official_holdout_inputs(
+    store: ObjectStore,
+    *,
+    holdout_catalog_key: str,
+    parquet_paths: tuple[Path, ...],
+) -> None:
+    catalog = ResearchArchiveCatalog.load(store, holdout_catalog_key)
+    catalog.require_complete()
+    entries = tuple(
+        sorted(
+            (
+                entry
+                for entry in catalog.entries
+                if entry.period == FINAL_HOLDOUT.name and entry.kind is ArchiveKind.AGG_TRADES
+            ),
+            key=lambda entry: entry.month,
+        )
+    )
+    if tuple(entry.month for entry in entries) != FINAL_HOLDOUT.months:
+        raise ValueError("Final Holdout catalog must contain every official aggregate-trade month")
+    if any(not entry.source_uri.startswith("https://data.binance.vision/") for entry in entries):
+        raise ValueError("Final Holdout catalog contains a non-official archive source")
+    expected_keys = tuple(key for entry in entries for key in entry.derived_keys)
+    if not expected_keys or len(expected_keys) != len(parquet_paths):
+        raise ValueError("Final Holdout Parquet inputs do not match the official catalog")
+    expected_hashes = sorted(hashlib.sha256(store.read(key)).hexdigest() for key in expected_keys)
+    actual_hashes = sorted(hashlib.sha256(path.read_bytes()).hexdigest() for path in parquet_paths)
+    if actual_hashes != expected_hashes:
+        raise ValueError("Final Holdout Parquet inputs are not the catalog-bound Binance artifacts")
 
 
 def _parameters_are_preregistered(

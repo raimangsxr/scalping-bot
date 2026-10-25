@@ -215,9 +215,11 @@ class CaptureHealth:
         clock_drift = snapshot["clock_drift_ms"]
         healthy = (
             freshness is not None
+            and freshness >= 0
             and freshness <= stale_after_ms
             and clock_drift is not None
             and abs(clock_drift) <= max_clock_drift_ms
+            and snapshot["gaps"] == 0
             and snapshot["storage_failures"] == 0
         )
         return {**snapshot, "healthy": healthy}

@@ -74,6 +74,7 @@ class ResearchRunManifest:
             catalog.require_complete()
             selected = _research_trade_entries(catalog)
             _require_research_months(selected)
+            _verify_archive_provenance(store, selected)
             dataset_checksums.extend(sorted({entry.source_sha256 for entry in selected}))
             dataset_derived_keys = tuple(
                 sorted(derived_key for entry in selected for derived_key in entry.derived_keys)
@@ -156,6 +157,12 @@ class ResearchRunManifest:
             catalog.require_complete()
             selected = _research_trade_entries(catalog)
             _require_research_months(selected)
+            _verify_archive_provenance(store, selected)
+            expected_derived_keys = tuple(
+                sorted(derived_key for entry in selected for derived_key in entry.derived_keys)
+            )
+            if expected_derived_keys != tuple(sorted(self.dataset_derived_keys)):
+                return False
             checksums.extend(sorted({entry.source_sha256 for entry in selected}))
             for derived_key in self.dataset_derived_keys:
                 checksums.append(hashlib.sha256(store.read(derived_key)).hexdigest())
@@ -248,6 +255,14 @@ class PersistentAttemptLedger:
                 )
             )
         return tuple(sorted(attempts, key=lambda item: _attempt_sort_key(item)))
+
+    @property
+    def attempts(self) -> tuple[Attempt, ...]:
+        return tuple(item for item in self.all_attempts if not item.is_baseline)
+
+    @property
+    def baseline_attempts(self) -> tuple[Attempt, ...]:
+        return tuple(item for item in self.all_attempts if item.is_baseline)
 
 
 class ResearchArtifactWriter:
@@ -529,9 +544,58 @@ def _research_trade_entries(catalog: ResearchArchiveCatalog) -> tuple[ArchiveCat
 def _require_research_months(entries: tuple[ArchiveCatalogEntry, ...]) -> None:
     months = {entry.month for entry in entries}
     required = {*HISTORICAL_STRESS.months, *PRIMARY_RESEARCH.months}
-    missing = sorted(required - months)
-    if missing:
-        raise ValueError(f"research aggregate-trade catalog is missing {missing[0]}")
+    if months != required or len(entries) != len(required):
+        missing = sorted(required - months)
+        extra = sorted(months - required)
+        detail = missing[0] if missing else f"unexpected {extra[0]}"
+        raise ValueError(f"research aggregate-trade catalog has an invalid month set: {detail}")
+    identities = {(entry.period, entry.month) for entry in entries}
+    expected = {
+        *{(HISTORICAL_STRESS.name, month) for month in HISTORICAL_STRESS.months},
+        *{(PRIMARY_RESEARCH.name, month) for month in PRIMARY_RESEARCH.months},
+    }
+    if identities != expected:
+        raise ValueError("research aggregate-trade catalog has duplicate or wrong period entries")
+
+
+def _verify_archive_provenance(
+    store: ObjectStore, entries: tuple[ArchiveCatalogEntry, ...]
+) -> None:
+    for entry in entries:
+        if not entry.source_uri.startswith("https://data.binance.vision/"):
+            raise ValueError("research catalog contains a non-official archive source")
+        raw_manifest = json.loads(store.read(entry.manifest_key))
+        if not isinstance(raw_manifest, dict):
+            raise ValueError("research catalog archive manifest is malformed")
+        if any(
+            raw_manifest.get(field) != expected
+            for field, expected in {
+                "source_uri": entry.source_uri,
+                "source_sha256": entry.source_sha256,
+                "row_count": entry.row_count,
+                "start_time_ms": entry.start_time_ms,
+                "end_time_ms": entry.end_time_ms,
+            }.items()
+        ):
+            raise ValueError("research catalog archive manifest is not bound to its entry")
+        raw_key = raw_manifest.get("raw_key")
+        if not isinstance(raw_key, str) or not raw_key:
+            raise ValueError("research catalog archive manifest has no immutable raw input")
+        try:
+            if hashlib.sha256(store.read(raw_key)).hexdigest() != entry.source_sha256:
+                raise ValueError("research catalog raw archive checksum does not match its entry")
+        except (KeyError, OSError) as error:
+            raise ValueError("research catalog raw archive is unavailable") from error
+        if tuple(entry.derived_keys) != tuple(
+            str(raw_manifest.get("parquet_key"))
+            for _ in entry.derived_keys
+        ):
+            raise ValueError("research catalog derived artifact is not bound to its manifest")
+        try:
+            for derived_key in entry.derived_keys:
+                store.read(derived_key)
+        except (KeyError, OSError) as error:
+            raise ValueError("research catalog derived artifact is unavailable") from error
 
 
 def _json_bytes(value: object) -> bytes:

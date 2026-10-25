@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -35,6 +36,9 @@ def _stress_evidence(
     max_daily_loss: str,
     max_drawdown: str,
 ) -> StressEvaluation:
+    source_key = f"{key}.source"
+    source_content = b"immutable stress source\n"
+    LocalObjectStore(root).put_immutable(source_key, source_content)
     content = json.dumps(
         {
             "candidate_identity": candidate_identity,
@@ -47,6 +51,9 @@ def _stress_evidence(
             "cost_stress_passed": True,
             "operational_controls_passed": True,
             "concentration_passed": True,
+            "source_evidence": [
+                f"{source_key}#{hashlib.sha256(source_content).hexdigest()}"
+            ],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -90,6 +97,52 @@ def _promoted_evaluation(rules: str, *, max_drawdown: str = "0.08") -> RiskEvalu
         operational_controls_passed=True,
         concentration_passed=True,
     )
+
+
+def _with_experiment_manifest(
+    store: LocalObjectStore,
+    evaluation: RiskEvaluation,
+    *,
+    candidate_identity: str,
+) -> RiskEvaluation:
+    payload = {
+        "schema_version": 1,
+        "code_commit": "test-commit",
+        "candidate_identity": candidate_identity,
+        "candidate_rules_sha256": evaluation.candidate_rules_sha256,
+        "configuration": {"candidate_parameters": {"window": 2}},
+        "commission_snapshot": {
+            "symbol": "BTCUSDT",
+            "maker": "0.0002",
+            "taker": "0.0004",
+            "captured_ms": 1,
+        },
+        "execution_cost_model": {
+            "identity": evaluation.execution_cost_model_sha256,
+            "half_spread_rate": "0",
+            "slippage_rate": "0",
+        },
+        "period": ["2020-01", "2025-09"],
+        "random_seed": 7,
+        "position_risk": str(evaluation.position_risk),
+        "notional_fraction": str(evaluation.notional_fraction),
+        "daily_loss_limit": str(evaluation.daily_loss_limit),
+        "drawdown_limit": str(evaluation.drawdown_limit),
+        "risk_controls": list(evaluation.risk_controls),
+        "dataset_checksums": list(evaluation.dataset_checksums),
+        "execution_cost_model_sha256": evaluation.execution_cost_model_sha256,
+        "historical_stress_artifact_key": (
+            evaluation.historical_stress.artifact_key if evaluation.historical_stress else None
+        ),
+        "testnet_stress_artifact_key": (
+            evaluation.testnet_stress.artifact_key if evaluation.testnet_stress else None
+        ),
+    }
+    content = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    identity = hashlib.sha256(content).hexdigest()
+    key = f"promoted-risk/experiments/{candidate_identity}/{identity}.json"
+    store.put_immutable(key, content)
+    return replace(evaluation, experiment_manifest_key=key)
 
 
 def test_live_shadow_requires_fourteen_continuous_days_and_resolved_divergences() -> None:
@@ -439,6 +492,12 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
             max_daily_loss="0.019",
             max_drawdown="0.09",
         ),
+    )
+    baseline = _with_experiment_manifest(
+        store, baseline, candidate_identity="momentum-001-v1"
+    )
+    promoted = _with_experiment_manifest(
+        store, promoted, candidate_identity="momentum-001-v1"
     )
 
     result = gate.evaluate(

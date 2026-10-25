@@ -118,6 +118,32 @@ MIGRATIONS = (
     ALTER TABLE protections ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE';
     ALTER TABLE protections ADD COLUMN closed_ms INTEGER;
     """,
+    """
+    CREATE TABLE IF NOT EXISTS account_balances (
+        asset TEXT PRIMARY KEY,
+        free TEXT NOT NULL,
+        locked TEXT NOT NULL,
+        updated_ms INTEGER NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS protection_lifecycle (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        list_id TEXT NOT NULL,
+        client_order_id TEXT,
+        status TEXT NOT NULL,
+        event_time_ms INTEGER NOT NULL,
+        details_json TEXT NOT NULL
+    );
+    CREATE TRIGGER IF NOT EXISTS protection_lifecycle_no_update
+    BEFORE UPDATE ON protection_lifecycle BEGIN
+        SELECT RAISE(ABORT, 'protection_lifecycle is append-only');
+    END;
+    CREATE TRIGGER IF NOT EXISTS protection_lifecycle_no_delete
+    BEFORE DELETE ON protection_lifecycle BEGIN
+        SELECT RAISE(ABORT, 'protection_lifecycle is append-only');
+    END;
+    """,
 )
 
 
@@ -138,11 +164,6 @@ class SQLiteState:
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA busy_timeout=5000")
         self._migrate()
-        self.connection.execute(
-            "CREATE TABLE IF NOT EXISTS account_balances ("
-            "asset TEXT PRIMARY KEY, free TEXT NOT NULL, locked TEXT NOT NULL, "
-            "updated_ms INTEGER NOT NULL)"
-        )
 
     def _migrate(self) -> None:
         self.connection.execute(
@@ -398,6 +419,51 @@ class SQLiteState:
             "UPDATE protections SET status = 'CANCELED', closed_ms = ? "
             "WHERE client_order_id = ? AND status = 'ACTIVE'",
             (closed_ms, client_order_id),
+        )
+
+    def record_protection_list_status(
+        self,
+        *,
+        list_id: str,
+        status: str,
+        client_order_id: str | None,
+        event_time_ms: int,
+        order_reports: tuple[dict[str, str], ...] = (),
+    ) -> None:
+        if not list_id or not status:
+            raise ValueError("protection list lifecycle requires an id and status")
+        details = json.dumps(
+            {"order_reports": order_reports}, sort_keys=True, separators=(",", ":")
+        )
+        existing = self.connection.execute(
+            "SELECT details_json FROM protection_lifecycle WHERE list_id = ? "
+            "AND status = ? AND event_time_ms = ? "
+            "AND (client_order_id = ? OR (client_order_id IS NULL AND ? IS NULL))",
+            (list_id, status, event_time_ms, client_order_id, client_order_id),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["details_json"]) != details:
+                raise ValueError("protection list lifecycle event is immutable")
+            return
+        self.connection.execute(
+            "INSERT INTO protection_lifecycle(list_id, client_order_id, status, event_time_ms, "
+            "details_json) VALUES (?, ?, ?, ?, ?)",
+            (list_id, client_order_id, status, event_time_ms, details),
+        )
+        lifecycle_status = {
+            "EXEC_STARTED": "ACTIVE",
+            "EXECUTING": "ACTIVE",
+            "ALL_DONE": "TRIGGERED",
+            "CANCELED": "CANCELED",
+            "REJECT": "REJECTED",
+        }.get(status)
+        if lifecycle_status is None:
+            return
+        closed_ms = event_time_ms if lifecycle_status != "ACTIVE" else None
+        self.connection.execute(
+            "UPDATE protections SET status = ?, closed_ms = COALESCE(?, closed_ms) "
+            "WHERE exchange_order_id = ? OR client_order_id = ?",
+            (lifecycle_status, closed_ms, list_id, client_order_id),
         )
 
     def upsert_position(
@@ -716,9 +782,22 @@ class SQLiteState:
             "fills": fills,
             "protection": self.protection(entry_client_order_id),
             "protection_history": self.protection_history(entry_client_order_id),
+            "protection_lifecycle": self.protection_lifecycle(entry_client_order_id),
             "audit": audit,
             "pnl": pnl,
         }
+
+    def protection_lifecycle(self, entry_client_order_id: str) -> tuple[dict[str, object], ...]:
+        return tuple(
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM protection_lifecycle WHERE list_id IN ("
+                "SELECT exchange_order_id FROM protections WHERE entry_client_order_id = ?) "
+                "OR client_order_id IN (SELECT client_order_id FROM protections "
+                "WHERE entry_client_order_id = ?) ORDER BY event_time_ms, id",
+                (entry_client_order_id, entry_client_order_id),
+            ).fetchall()
+        )
 
     def active_intents(self) -> tuple[dict[str, object], ...]:
         rows = self.connection.execute(

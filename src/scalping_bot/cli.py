@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+import signal
+import threading
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -21,6 +23,7 @@ from scalping_bot.execution.binance import BinanceSpotTestnetAdapter, OfficialSp
 from scalping_bot.execution.executor import ExecutionLimits
 from scalping_bot.execution.runtime import run_executor
 from scalping_bot.execution.sqlite_state import SQLiteState
+from scalping_bot.operations.backup import EncryptedSQLiteBackup
 from scalping_bot.operations.deployment import DeploymentGate
 from scalping_bot.operations.durable_shadow import DurableLiveShadow
 from scalping_bot.operations.durable_soak import DurableTestnetSoak
@@ -229,6 +232,8 @@ def run_research(
         manifest_store=store,
         code_commit=manifest.code_commit,
         dataset_checksums=manifest.dataset_checksums,
+        random_seed=manifest.random_seed,
+        run_identity=manifest.identity,
     ).run(
         load_aggtrades(tuple(parquet)),
         batch=batch,
@@ -251,7 +256,7 @@ def run_research(
 def deployment_check(
     database: Path = Path("state/scalping-bot.db"),
     backup: Path = Path("state/backups/latest.sqlite.fernet"),
-    target_schema: int = 5,
+    target_schema: int = 7,
 ) -> None:
     """Block a planned rollout unless the executor is flat and recoverable."""
     DeploymentGate.assert_path_safe(database, backup=backup, target_schema=target_schema)
@@ -365,13 +370,22 @@ def run_live_shadow(
                 typer.echo("live-shadow observations persisted")
             return
         typer.echo("live-shadow process running; press Ctrl-C to stop")
-        import threading
-
-        ProductionLiveShadowStream(runner).run_forever(threading.Event())
+        stop = threading.Event()
+        signal.signal(signal.SIGTERM, lambda *_args: stop.set())
+        signal.signal(signal.SIGINT, lambda *_args: stop.set())
+        ProductionLiveShadowStream(runner).run_forever(stop)
     except KeyboardInterrupt:
         return
     finally:
         process.close()
+        if settings.backup_encryption_key:
+            backup = EncryptedSQLiteBackup(settings.backup_encryption_key.encode())
+            artifact = backup.create(
+                state,
+                destination=state.parent / "backups" / "live-shadow",
+                created_ms=_now_ms(),
+            )
+            backup.publish_latest(artifact)
 
 
 @app.command()
@@ -391,6 +405,7 @@ def evaluate_book_shadow(
 def evaluate_final_holdout(
     candidate: Annotated[Path, typer.Argument(exists=True, readable=True)],
     parquet: Annotated[list[Path], typer.Argument(exists=True, readable=True)],
+    dataset_catalog_key: Annotated[str, typer.Option("--dataset-catalog-key")],
     execution_cost_model_key: Annotated[str, typer.Option("--execution-cost-model-key")],
     artifacts: Path = Path("data/research-artifacts"),
     actor: str = typer.Option(...),
@@ -409,6 +424,8 @@ def evaluate_final_holdout(
     decision = FinalHoldoutGate(store).evaluate_aggregate_trades(
         record,
         aggregate_trades=aggregate_trades,
+        holdout_parquet_paths=tuple(parquet),
+        holdout_catalog_key=dataset_catalog_key,
         holdout_dataset_key=dataset_key,
         holdout_dataset_checksum=dataset_checksum,
         execution_cost_model_key=execution_cost_model_key,

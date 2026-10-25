@@ -78,7 +78,17 @@ def test_batch_runner_persists_an_immutable_experiment_manifest(tmp_path) -> Non
         rejection_criteria=("negative expectancy",),
     )
     evaluation = ResearchBatchRunner(
-        execution_costs=ExecutionCosts(commission_rate=Decimal("0.001")),
+        execution_costs=ExecutionCosts(
+            commission_rate=Decimal("0.001"),
+            commission_snapshot={
+                "symbol": "BTCUSDT",
+                "maker": "0.0002",
+                "taker": "0.001",
+                "captured_ms": "1",
+            },
+            execution_cost_model_identity="cost-model-test",
+            calibration_method="test-calibration",
+        ),
         manifest_store=LocalObjectStore(tmp_path),
         code_commit="abc123",
         dataset_checksums=("sha256:data",),

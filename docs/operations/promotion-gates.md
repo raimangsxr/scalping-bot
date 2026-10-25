@@ -64,3 +64,8 @@ content-addressed historical/Testnet stress artifacts and Experiment Manifests, 
 sample, metrics, boolean gate results, and non-empty `source_evidence`; the command adds the
 completed Soak report to that provenance. It rejects missing or unverifiable operational evidence
 before starting the trial and never synthesizes Testnet fills.
+
+Every source reference in a published cost model or Testnet stress artifact is stored as
+`object-key#sha256`. Loading the artifact re-reads each referenced object and verifies the declared
+digest before the shared engine can consume the model or the promotion gate can consume the stress
+result.

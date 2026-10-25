@@ -89,6 +89,7 @@ def test_research_manifest_accepts_the_published_runtime_cost_artifact(tmp_path:
     dataset = b"verified-catalog"
     dataset_key = f"catalogs/{hashlib.sha256(dataset).hexdigest()}.json"
     store.put_immutable(dataset_key, dataset)
+    store.put_immutable("capture/immutable-segment", b"immutable capture segment\n")
     model = ExecutionCostCalibrator().fit(
         (
             CalibrationObservation(
@@ -108,7 +109,9 @@ def test_research_manifest_accepts_the_published_runtime_cost_artifact(tmp_path:
             captured_ms=1,
         ),
     )
-    cost_key = ExecutionCostModelPublisher(store).publish(model)
+    cost_key = ExecutionCostModelPublisher(store).publish(
+        model, source_evidence=("capture/immutable-segment",)
+    )
 
     manifest = ResearchRunManifest.create(
         store=store,

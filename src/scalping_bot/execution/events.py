@@ -49,6 +49,7 @@ class ListStatusEvent:
     list_id: str
     status: str
     client_order_id: str | None
+    order_reports: tuple[dict[str, str], ...] = ()
 
 
 ExchangeEvent = ExecutionReportEvent | AccountBalanceEvent | AccountSnapshotEvent | ListStatusEvent
@@ -155,6 +156,13 @@ class ExchangeEventApplier:
             for balance in event.balances:
                 self.apply(balance)
         else:
+            self.state.record_protection_list_status(
+                list_id=event.list_id,
+                status=event.status,
+                client_order_id=event.client_order_id,
+                event_time_ms=event.event_time_ms,
+                order_reports=event.order_reports,
+            )
             self.state.append_audit(
                 kind="protection-list-updated",
                 event_time_ms=event.event_time_ms,
@@ -162,6 +170,7 @@ class ExchangeEventApplier:
                     "list_id": event.list_id,
                     "status": event.status,
                     "client_order_id": event.client_order_id,
+                    "order_reports": event.order_reports,
                 },
             )
 
@@ -299,10 +308,25 @@ def parse_user_data_message(value: dict[str, Any]) -> ExchangeEvent:
             )
         return AccountSnapshotEvent(int(value["E"]), tuple(parsed))
     if event_type == "listStatus":
+        raw_reports = value.get("O", ())
+        if not isinstance(raw_reports, list):
+            raise ValueError("protection list status order reports are malformed")
+        raw_list_id = value.get("g", value.get("orderListId"))
+        if raw_list_id is None or raw_list_id == "":
+            raise ValueError("protection list status is missing its list id")
+        raw_status = value.get("l", value.get("listStatusType", "UNKNOWN"))
+        if raw_status is None or raw_status == "":
+            raise ValueError("protection list status is missing its status")
+        order_reports = tuple(
+            {str(key): str(item) for key, item in report.items()}
+            for report in raw_reports
+            if isinstance(report, dict)
+        )
         return ListStatusEvent(
             event_time_ms=int(value["E"]),
-            list_id=str(value.get("g", value.get("orderListId"))),
-            status=str(value.get("l", value.get("listStatusType", "UNKNOWN"))),
+            list_id=str(raw_list_id),
+            status=str(raw_status),
             client_order_id=(str(value["C"]) if value.get("C") not in {None, ""} else None),
+            order_reports=order_reports,
         )
     raise ValueError(f"unsupported Binance User Data event: {event_type}")

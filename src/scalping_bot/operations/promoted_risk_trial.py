@@ -23,7 +23,12 @@ from scalping_bot.operations.promotion import (
 )
 from scalping_bot.research.candidates import first_batch
 from scalping_bot.research.costs import ExecutionCostModel
-from scalping_bot.research.evidence import CandidateRecord, EvidenceResult, ScalpResult
+from scalping_bot.research.evidence import (
+    CandidateRecord,
+    EvidenceProtocol,
+    EvidenceResult,
+    ScalpResult,
+)
 from scalping_bot.research.execution import AggTrade, canonical_aggregate_trade_bytes
 from scalping_bot.research.runner import ResearchBatchRunner, load_aggtrades
 
@@ -137,10 +142,12 @@ def run_promoted_risk_trial(
     baseline_manifest_key = _persist_experiment_manifest(
         store,
         candidate_identity=candidate.identity,
+        candidate_parameters=candidate.parameters,
         candidate_rules_sha256=candidate_manifest.rules_sha256,
         position_risk=INITIAL_POSITION_RISK,
         dataset_checksums=dataset_checksums,
         cost_model_identity=cost_model.identity,
+        cost_model=cost_model,
         code_commit=code_commit,
         historical_stress=baseline_historical,
         testnet_stress=baseline_testnet,
@@ -148,10 +155,12 @@ def run_promoted_risk_trial(
     promoted_manifest_key = _persist_experiment_manifest(
         store,
         candidate_identity=candidate.identity,
+        candidate_parameters=candidate.parameters,
         candidate_rules_sha256=candidate_manifest.rules_sha256,
         position_risk=PROMOTED_POSITION_RISK,
         dataset_checksums=dataset_checksums,
         cost_model_identity=cost_model.identity,
+        cost_model=cost_model,
         code_commit=code_commit,
         historical_stress=promoted_historical,
         testnet_stress=promoted_testnet,
@@ -320,6 +329,26 @@ def _persist_testnet_stress(
         or any(not isinstance(item, str) or not item for item in source_evidence)
     ):
         raise ValueError("Testnet stress evidence requires immutable source_evidence")
+    resolved_sources: list[str] = []
+    for source_reference in source_evidence:
+        source_key, declared_checksum = (
+            source_reference.rsplit("#", 1)
+            if "#" in source_reference
+            else (source_reference, None)
+        )
+        try:
+            source_content = store.read(source_key)
+        except (KeyError, OSError) as error:
+            raise ValueError(f"Testnet source evidence is unavailable: {source_key}") from error
+        source_checksum = hashlib.sha256(source_content).hexdigest()
+        if declared_checksum is not None and declared_checksum.lower() != source_checksum:
+            raise ValueError(f"Testnet source evidence checksum does not match: {source_key}")
+        resolved_sources.append(f"{source_key}#{source_checksum}")
+    try:
+        soak_content = store.read(soak_report_key)
+    except (KeyError, OSError) as error:
+        raise ValueError("Testnet Soak source evidence is unavailable") from error
+    resolved_sources.append(f"{soak_report_key}#{hashlib.sha256(soak_content).hexdigest()}")
     payload = {
         "schema_version": 1,
         "candidate_identity": candidate_identity,
@@ -332,7 +361,7 @@ def _persist_testnet_stress(
         "cost_stress_passed": _required_bool(raw, "cost_stress_passed"),
         "operational_controls_passed": _required_bool(raw, "operational_controls_passed"),
         "concentration_passed": _required_bool(raw, "concentration_passed"),
-        "source_evidence": sorted({*source_evidence, soak_report_key}),
+        "source_evidence": sorted(set(resolved_sources)),
         "source_sha256": hashlib.sha256(raw_bytes).hexdigest(),
     }
     return _persist_stress(store, payload)
@@ -362,18 +391,46 @@ def _persist_experiment_manifest(
     store: ObjectStore,
     *,
     candidate_identity: str,
+    candidate_parameters: Mapping[str, object],
     candidate_rules_sha256: str,
     position_risk: Decimal,
     dataset_checksums: tuple[str, ...],
     cost_model_identity: str,
+    cost_model: ExecutionCostModel,
     code_commit: str,
     historical_stress: StressEvaluation,
     testnet_stress: StressEvaluation,
 ) -> str:
     payload = {
         "schema_version": 1,
+        "code_commit": code_commit,
         "candidate_identity": candidate_identity,
         "candidate_rules_sha256": candidate_rules_sha256,
+        "configuration": {
+            "candidate_parameters": dict(candidate_parameters),
+            "position_risk": str(position_risk),
+            "notional_fraction": str(MAX_NOTIONAL_FRACTION),
+            "daily_loss_limit": str(MAX_DAILY_LOSS),
+            "drawdown_limit": str(MAX_DRAWDOWN),
+            "risk_controls": list(DEFAULT_RISK_CONTROLS),
+        },
+        "commission_snapshot": {
+            "symbol": cost_model.commission.symbol,
+            "maker": str(cost_model.commission.maker),
+            "taker": str(cost_model.commission.taker),
+            "captured_ms": cost_model.commission.captured_ms,
+            "account_context": cost_model.commission.account_context,
+        },
+        "execution_cost_model": {
+            "identity": cost_model_identity,
+            "half_spread_rate": str(cost_model.as_engine_costs().half_spread_rate),
+            "slippage_rate": str(cost_model.as_engine_costs().slippage_rate),
+        },
+        "period": [
+            f"{EvidenceProtocol.PRIMARY_START[0]:04d}-{EvidenceProtocol.PRIMARY_START[1]:02d}",
+            f"{EvidenceProtocol.PRIMARY_END[0]:04d}-{EvidenceProtocol.PRIMARY_END[1]:02d}",
+        ],
+        "random_seed": 7,
         "position_risk": str(position_risk),
         "notional_fraction": str(MAX_NOTIONAL_FRACTION),
         "daily_loss_limit": str(MAX_DAILY_LOSS),
@@ -381,7 +438,6 @@ def _persist_experiment_manifest(
         "risk_controls": list(DEFAULT_RISK_CONTROLS),
         "dataset_checksums": list(dataset_checksums),
         "execution_cost_model_sha256": cost_model_identity,
-        "code_commit": code_commit,
         "historical_stress_artifact_key": historical_stress.artifact_key,
         "testnet_stress_artifact_key": testnet_stress.artifact_key,
     }

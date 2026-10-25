@@ -14,10 +14,10 @@ from scalping_bot.operations.safety import OperationalMode
 class HealthSignals:
     market_data_freshness_ms: int | None = None
     clock_drift_ms: int = 0
-    persistence_ok: bool = True
-    storage_ok: bool = True
-    notification_ok: bool = True
-    reconciliation_ok: bool = True
+    persistence_ok: bool = False
+    storage_ok: bool = False
+    notification_ok: bool = False
+    reconciliation_ok: bool = False
     rate_limit_blocked: bool = False
     dependency_status: Mapping[str, bool] = field(default_factory=dict)
     stale_after_ms: int = 5_000

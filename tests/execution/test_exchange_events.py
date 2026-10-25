@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from scalping_bot.execution.events import (
@@ -134,3 +135,46 @@ def test_streamed_sell_fill_closes_the_durable_position(tmp_path: Path) -> None:
 
         assert state.position() is None
         assert state.order_intent("entry-1")["status"] == "CLOSED"
+
+
+def test_oco_list_status_is_durable_and_duplicate_events_are_idempotent(tmp_path: Path) -> None:
+    with SQLiteState(tmp_path / "state.db") as state:
+        state.persist_order_intent(
+            client_order_id="entry-1",
+            side="BUY",
+            quantity="0.01",
+            status="FILLED",
+            created_ms=1,
+            candidate_version="candidate-v1",
+            source_event_id="signal-1",
+            invalidation_price="89000",
+        )
+        state.record_protection(
+            client_order_id="entry-1-protect",
+            entry_client_order_id="entry-1",
+            exchange_order_id="77",
+            quantity="0.01",
+            stop_price="89000",
+            take_profit_price="91000",
+            created_ms=2,
+        )
+        event = parse_user_data_message(
+            {
+                "e": "listStatus",
+                "E": 3,
+                "g": 77,
+                "l": "ALL_DONE",
+                "C": "entry-1-protect",
+                "O": [{"i": 101, "c": "entry-1-protect", "s": "SELL", "X": "FILLED"}],
+            }
+        )
+        applier = ExchangeEventApplier(state)
+        applier.apply(event)
+        applier.apply(event)
+
+        assert state.protection("entry-1") is None
+        history = state.protection_history("entry-1")
+        assert history[0]["status"] == "TRIGGERED"
+        lifecycle = state.protection_lifecycle("entry-1")
+        assert len(lifecycle) == 1
+        assert json.loads(str(lifecycle[0]["details_json"]))["order_reports"][0]["i"] == "101"

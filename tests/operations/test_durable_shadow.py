@@ -177,3 +177,26 @@ def test_live_shadow_persists_missing_dependency_as_degraded_evidence(tmp_path: 
     assert not result.approved
     assert "missing dependency: live-stream" in result.report
     resumed.close()
+
+
+def test_live_shadow_health_fails_closed_after_a_continuity_break(tmp_path: Path) -> None:
+    candidate_path = tmp_path / "candidate.json"
+    cost_path = tmp_path / "cost.json"
+    _candidate_manifest(candidate_path)
+    _cost_snapshot(cost_path)
+    process = DurableLiveShadow(
+        tmp_path / "shadow.db",
+        candidate_manifest=candidate_path,
+        cost_model=cost_path,
+        store=LocalObjectStore(tmp_path / "objects"),
+        started_ms=0,
+    )
+    process.record_comparison(_comparison(100))
+    assert process.health_status(now_ms=110)["healthy"] is True
+
+    process.mark_continuity_broken("stream reconnect")
+
+    status = process.health_status(now_ms=110)
+    assert status["continuity_broken"] is True
+    assert status["healthy"] is False
+    process.close()

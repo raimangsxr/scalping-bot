@@ -29,6 +29,14 @@ spec:
           image: ghcr.io/raimangsxr/scalping-bot:git-080dd1e71de026002e966fb959a10293101aa183
           imagePullPolicy: IfNotPresent
           args: ["collect-live", "--storage", "/var/lib/market-data"]
+          readinessProbe:
+            exec:
+              command: ["python", "-m", "scalping_bot.health", "/var/lib/market-data", "--collector"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["python", "-m", "scalping_bot.health", "/var/lib/market-data", "--collector"]
+            periodSeconds: 30
           volumeMounts:
             - name: market-evidence
               mountPath: /var/lib/market-data

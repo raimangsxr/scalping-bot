@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
@@ -431,9 +432,9 @@ class StressEvaluation:
             net_expectancy=Decimal(str(value["net_expectancy"])),
             max_daily_loss=Decimal(str(value["max_daily_loss"])),
             max_drawdown=Decimal(str(value["max_drawdown"])),
-            cost_stress_passed=bool(value["cost_stress_passed"]),
-            operational_controls_passed=bool(value["operational_controls_passed"]),
-            concentration_passed=bool(value["concentration_passed"]),
+            cost_stress_passed=_required_bool(value, "cost_stress_passed"),
+            operational_controls_passed=_required_bool(value, "operational_controls_passed"),
+            concentration_passed=_required_bool(value, "concentration_passed"),
             artifact_key=str(value.get("artifact_key", "")),
             artifact_sha256=str(value.get("artifact_sha256", "")),
         )
@@ -476,9 +477,9 @@ class RiskEvaluation:
             max_daily_loss=Decimal(str(value["max_daily_loss"])),
             max_drawdown=Decimal(str(value["max_drawdown"])),
             notional_fraction=Decimal(str(value["notional_fraction"])),
-            cost_stress_passed=bool(value["cost_stress_passed"]),
-            operational_controls_passed=bool(value["operational_controls_passed"]),
-            concentration_passed=bool(value["concentration_passed"]),
+            cost_stress_passed=_required_bool(value, "cost_stress_passed"),
+            operational_controls_passed=_required_bool(value, "operational_controls_passed"),
+            concentration_passed=_required_bool(value, "concentration_passed"),
             daily_loss_limit=Decimal(str(value.get("daily_loss_limit", MAX_DAILY_LOSS))),
             drawdown_limit=Decimal(str(value.get("drawdown_limit", MAX_DRAWDOWN))),
             risk_controls=tuple(str(item) for item in risk_controls_value),
@@ -553,21 +554,20 @@ class PromotedRiskGate:
             promotion_artifact_key, candidate_identity, baseline.candidate_rules_sha256, reasons
         )
         self._check_soak_reference(soak_report_key, candidate_identity, reasons)
-        if baseline.experiment_manifest_key or promoted.experiment_manifest_key:
-            self._check_experiment_manifest(
-                baseline.experiment_manifest_key,
-                "baseline",
-                candidate_identity,
-                baseline,
-                reasons,
-            )
-            self._check_experiment_manifest(
-                promoted.experiment_manifest_key,
-                "promoted",
-                candidate_identity,
-                promoted,
-                reasons,
-            )
+        self._check_experiment_manifest(
+            baseline.experiment_manifest_key,
+            "baseline",
+            candidate_identity,
+            baseline,
+            reasons,
+        )
+        self._check_experiment_manifest(
+            promoted.experiment_manifest_key,
+            "promoted",
+            candidate_identity,
+            promoted,
+            reasons,
+        )
         self._check_limits(baseline, "baseline", reasons)
         self._check_limits(promoted, "promoted", reasons)
         if baseline.notional_fraction != promoted.notional_fraction:
@@ -802,6 +802,28 @@ class PromotedRiskGate:
             if payload.get(field) != expected_flag:
                 reasons.append(f"{label} {risk_label} stress artifact disagrees on {field}")
                 return
+        if label == "Testnet":
+            source_evidence = payload.get("source_evidence")
+            if (
+                not isinstance(source_evidence, list)
+                or not source_evidence
+                or any(not isinstance(item, str) or "#" not in item for item in source_evidence)
+            ):
+                reasons.append(f"{label} {risk_label} stress artifact has no resolved sources")
+                return
+            for reference in source_evidence:
+                source_key, declared_sha256 = reference.rsplit("#", 1)
+                if len(declared_sha256) != 64:
+                    reasons.append(f"{label} {risk_label} stress source checksum is malformed")
+                    return
+                try:
+                    source_content = self.store.read(source_key)
+                except (KeyError, OSError):
+                    reasons.append(f"{label} {risk_label} stress source is unavailable")
+                    return
+                if hashlib.sha256(source_content).hexdigest() != declared_sha256.lower():
+                    reasons.append(f"{label} {risk_label} stress source checksum does not match")
+                    return
 
     def _check_promotion_reference(
         self,
@@ -896,6 +918,39 @@ class PromotedRiskGate:
             reasons.append(f"{label} experiment manifest targets another candidate")
         if payload.get("candidate_rules_sha256") != evaluation.candidate_rules_sha256:
             reasons.append(f"{label} experiment manifest rules are malformed")
+        code_commit = payload.get("code_commit")
+        if not isinstance(code_commit, str) or not code_commit:
+            reasons.append(f"{label} experiment manifest omits code commit")
+        configuration = payload.get("configuration")
+        if not isinstance(configuration, dict) or not configuration:
+            reasons.append(f"{label} experiment manifest has incomplete configuration")
+        commission_snapshot = payload.get("commission_snapshot")
+        if not isinstance(commission_snapshot, dict) or not {
+            "symbol",
+            "maker",
+            "taker",
+            "captured_ms",
+        }.issubset(commission_snapshot):
+            reasons.append(f"{label} experiment manifest omits commission snapshot")
+        execution_cost_model = payload.get("execution_cost_model")
+        if not isinstance(execution_cost_model, dict) or not {
+            "identity",
+            "half_spread_rate",
+            "slippage_rate",
+        }.issubset(execution_cost_model):
+            reasons.append(f"{label} experiment manifest omits execution cost model")
+        elif execution_cost_model.get("identity") != evaluation.execution_cost_model_sha256:
+            reasons.append(f"{label} experiment manifest cost model identity is not bound")
+        period = payload.get("period")
+        if (
+            not isinstance(period, list)
+            or len(period) != 2
+            or any(not isinstance(item, str) or not item for item in period)
+        ):
+            reasons.append(f"{label} experiment manifest omits evaluation period")
+        random_seed = payload.get("random_seed")
+        if not isinstance(random_seed, int) or isinstance(random_seed, bool) or random_seed < 0:
+            reasons.append(f"{label} experiment manifest omits random seed")
         try:
             manifest_risk = Decimal(str(payload["position_risk"]))
         except (InvalidOperation, KeyError, TypeError, ValueError):
@@ -951,6 +1006,13 @@ class PromotedRiskGate:
             "Reasons:\n"
             f"{reason_lines}\n"
         )
+
+
+def _required_bool(value: Mapping[str, object], key: str) -> bool:
+    item = value.get(key)
+    if not isinstance(item, bool):
+        raise ValueError(f"risk evaluation field {key} must be a boolean")
+    return item
 
 
 def _comparison_divergences(comparison: LiveReplayComparison) -> tuple[str, ...]:

@@ -18,6 +18,29 @@ from scalping_bot.operations.promotion import (
     LiveShadowGate,
 )
 
+_MIGRATIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS comparisons (
+        event_time_ms INTEGER PRIMARY KEY, payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS resolutions (
+        divergence TEXT PRIMARY KEY, resolution TEXT NOT NULL, regression TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS continuity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, reason TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS order_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, event_time_ms INTEGER NOT NULL,
+        client_order_id TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS hypothetical_decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, event_time_ms INTEGER NOT NULL,
+        kind TEXT NOT NULL
+    );
+    """,
+)
+
 
 class DurableLiveShadow:
     """Persist every observation before allowing a final shadow decision."""
@@ -33,32 +56,12 @@ class DurableLiveShadow:
     ) -> None:
         self.store = store
         self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
-        self.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS comparisons (
-                event_time_ms INTEGER PRIMARY KEY, payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS resolutions (
-                divergence TEXT PRIMARY KEY, resolution TEXT NOT NULL, regression TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS continuity (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, reason TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS order_attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, event_time_ms INTEGER NOT NULL,
-                client_order_id TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS hypothetical_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, event_time_ms INTEGER NOT NULL,
-                kind TEXT NOT NULL
-            );
-            """
-        )
+        self._migrate()
         candidate = PromotedCandidateManifest.load(candidate_manifest)
         # Loading both artifacts is part of construction: a process cannot run on
         # an unverified candidate or an unreadable cost model.
@@ -110,6 +113,14 @@ class DurableLiveShadow:
             "INSERT INTO comparisons(event_time_ms, payload) VALUES (?, ?)",
             (comparison.event_time_ms, payload.decode()),
         )
+        self._put_metadata(
+            {
+                "last_event_time_ms": str(comparison.event_time_ms),
+                "last_receipt_time_ms": str(
+                    comparison.event_time_ms + max(0, comparison.latency_ms)
+                ),
+            }
+        )
         self.connection.commit()
 
     def record_missing_dependency(self, *, event_time_ms: int, dependency: str) -> None:
@@ -117,7 +128,33 @@ class DurableLiveShadow:
         if self.gate.comparisons:
             event_time_ms = max(event_time_ms, self.gate.comparisons[-1].event_time_ms + 1)
         self.gate.missing_dependency(event_time_ms=event_time_ms, dependency=dependency)
+        self._put_metadata(
+            {
+                "last_dependency_failure_ms": str(event_time_ms),
+                "last_dependency": dependency,
+            }
+        )
         self._persist_last_comparison()
+
+    def health_status(self, *, now_ms: int, stale_after_ms: int = 5_000) -> dict[str, object]:
+        metadata = self._metadata()
+        last_receipt = metadata.get("last_receipt_time_ms")
+        freshness = (
+            now_ms - int(last_receipt) if last_receipt is not None else None
+        )
+        dependency_failure = metadata.get("last_dependency_failure_ms")
+        dependency_degraded = dependency_failure is not None and (
+            last_receipt is None or int(dependency_failure) > int(last_receipt)
+        )
+        return {
+            "freshness_ms": freshness,
+            "continuity_broken": bool(self.gate.continuity_broken),
+            "dependency_degraded": dependency_degraded,
+            "healthy": freshness is not None
+            and 0 <= freshness <= stale_after_ms
+            and not self.gate.continuity_broken
+            and not dependency_degraded,
+        }
 
     def record_order_submission(self, *, event_time_ms: int, client_order_id: str) -> None:
         self.gate.record_order_submission(
@@ -164,6 +201,23 @@ class DurableLiveShadow:
     def close(self) -> None:
         self.connection.commit()
         self.connection.close()
+
+    def _migrate(self) -> None:
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        applied = {
+            int(row[0])
+            for row in self.connection.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        for version, migration in enumerate(_MIGRATIONS, start=1):
+            if version in applied:
+                continue
+            self.connection.executescript(
+                f"BEGIN IMMEDIATE;\n{migration}\n"
+                f"INSERT INTO schema_migrations(version) VALUES ({version});\nCOMMIT;"
+            )
 
     def _restore(self) -> None:
         rows = self.connection.execute(

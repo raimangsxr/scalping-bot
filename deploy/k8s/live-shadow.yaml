@@ -29,11 +29,24 @@ spec:
           image: ghcr.io/raimangsxr/scalping-bot:git-080dd1e71de026002e966fb959a10293101aa183
           imagePullPolicy: IfNotPresent
           args: ["run-live-shadow"]
+          readinessProbe:
+            exec:
+              command: ["python", "-m", "scalping_bot.health", "/app/state/live-shadow.db", "--live-shadow"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["python", "-m", "scalping_bot.health", "/app/state/live-shadow.db", "--live-shadow"]
+            periodSeconds: 30
           env:
             - name: SCALPING_CANDIDATE_MANIFEST
               value: /run/scalping-candidate/manifest.json
             - name: SCALPING_COST_MODEL_SNAPSHOT
               value: /run/scalping-cost/snapshot.json
+            - name: SCALPING_BACKUP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scalping-bot-secrets
+                  key: backup-encryption-key
           volumeMounts:
             - name: shadow-state
               mountPath: /app/state

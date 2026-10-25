@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -68,6 +69,9 @@ class ExecutionCosts:
     half_spread_rate: Decimal = Decimal(0)
     slippage_rate: Decimal = Decimal(0)
     calibrated_buckets: tuple[EngineCostBucket, ...] = ()
+    commission_snapshot: Mapping[str, str] = field(default_factory=dict)
+    execution_cost_model_identity: str | None = None
+    calibration_method: str = ""
 
     def __post_init__(self) -> None:
         if any(

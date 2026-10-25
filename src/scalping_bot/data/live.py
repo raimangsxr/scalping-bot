@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import Callable
@@ -39,6 +40,7 @@ class BinancePublicCollector:
         self._writers: dict[str, RawSegmentWriter] = {}
         self._counts: dict[str, int] = {}
         self._gap_pending: dict[str, int] = {}
+        self._last_health_publish_ms: int | None = None
 
     async def run_forever(self) -> None:
         delay = 1.0
@@ -80,6 +82,7 @@ class BinancePublicCollector:
                 }
             )
             self._counts["btcusdt@depth@100ms"] += 1
+            self._publish_health(now)
             async for message in socket:
                 await self.handle_message(json.loads(message), receipt_time_ms=self.clock_ms())
             self._close_all(valid=False, invalid_reason="market-data connection closed")
@@ -97,6 +100,7 @@ class BinancePublicCollector:
         data = dict(envelope["data"])
         event_time = int(data.get("E", receipt_time_ms))
         self.health.record_event(exchange_time_ms=event_time, receipt_time_ms=receipt_time_ms)
+        self._publish_health(receipt_time_ms)
         raw = {
             "event_type": stream.split("@", 1)[1],
             "exchange_time_ms": event_time,
@@ -142,6 +146,24 @@ class BinancePublicCollector:
             )
             self._counts[stream] = 0
         return self._writers[stream]
+
+    def _publish_health(self, now_ms: int) -> None:
+        if (
+            self._last_health_publish_ms is not None
+            and now_ms - self._last_health_publish_ms < 5_000
+        ):
+            return
+        status = self.health.status(now_ms=now_ms)
+        payload = {
+            "schema_version": 1,
+            "recorded_ms": now_ms,
+            "status": status,
+            "stream_counts": dict(sorted(self._counts.items())),
+        }
+        content = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        identity = hashlib.sha256(content).hexdigest()
+        self.store.put_immutable(f"health/collector/{now_ms}-{identity}.json", content)
+        self._last_health_publish_ms = now_ms
 
     def _rotate(self, stream: str, *, valid: bool, invalid_reason: str | None) -> None:
         writer = self._writers.pop(stream, None)

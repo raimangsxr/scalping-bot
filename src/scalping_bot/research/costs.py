@@ -157,6 +157,11 @@ class ExecutionCostModel:
     buckets: dict[tuple[int, str, str], CostBucket]
     scenarios: tuple[Decimal, ...] = (Decimal("1"), Decimal("1.5"), Decimal("2"))
     source_evidence: tuple[str, ...] = ()
+    calibration_method: str = "causal-bookticker-v1"
+
+    def __post_init__(self) -> None:
+        if not self.calibration_method.strip():
+            raise ValueError("execution cost calibration method is required")
 
     @property
     def identity(self) -> str:
@@ -185,6 +190,7 @@ class ExecutionCostModel:
             ],
             "scenarios": [str(item) for item in self.scenarios],
             "source_evidence": list(self.source_evidence),
+            "calibration_method": self.calibration_method,
         }
         return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
@@ -229,6 +235,15 @@ class ExecutionCostModel:
             commission_rate=self.commission.taker,
             half_spread_rate=half_spread,
             slippage_rate=slippage,
+            commission_snapshot={
+                "symbol": self.commission.symbol,
+                "maker": str(self.commission.maker),
+                "taker": str(self.commission.taker),
+                "captured_ms": str(self.commission.captured_ms),
+                "account_context": self.commission.account_context,
+            },
+            execution_cost_model_identity=self.identity,
+            calibration_method=self.calibration_method,
             calibrated_buckets=tuple(
                 EngineCostBucket(
                     hour_utc=hour,
@@ -284,11 +299,41 @@ class ExecutionCostModel:
                 observations=int(item["observations"]),
             )
         scenarios = tuple(Decimal(str(item)) for item in raw.get("scenarios", ["1", "1.5", "2"]))
+        calibration_method = str(raw.get("calibration_method", ""))
+        if not calibration_method.strip():
+            raise ValueError("execution cost model has no calibration method")
+        raw_evidence = raw.get("source_evidence")
+        if not isinstance(raw_evidence, list):
+            raise ValueError("execution cost model has malformed source evidence")
+        source_evidence = tuple(str(item) for item in raw_evidence)
+        if not source_evidence or any(not item.strip() for item in source_evidence):
+            raise ValueError("execution cost model has no immutable source evidence")
+        for reference in source_evidence:
+            if "#" not in reference:
+                raise ValueError("execution cost model source evidence is unresolved")
+            source_key, declared_checksum = reference.rsplit("#", 1)
+            if (
+                not source_key
+                or len(declared_checksum) != 64
+                or any(item not in "0123456789abcdef" for item in declared_checksum.lower())
+            ):
+                raise ValueError("execution cost model source evidence checksum is malformed")
+            try:
+                source_content = store.read(source_key)
+            except (KeyError, OSError) as error:
+                raise ValueError(
+                    f"execution cost model source evidence is unavailable: {source_key}"
+                ) from error
+            if hashlib.sha256(source_content).hexdigest() != declared_checksum.lower():
+                raise ValueError(
+                    f"execution cost model source evidence checksum does not match: {source_key}"
+                )
         return cls(
             commission=commission,
             buckets=buckets,
             scenarios=scenarios,
-            source_evidence=tuple(str(item) for item in raw.get("source_evidence", [])),
+            source_evidence=source_evidence,
+            calibration_method=calibration_method,
         )
 
 
@@ -341,11 +386,32 @@ class ExecutionCostModelPublisher:
         self.store = store
 
     def publish(self, model: ExecutionCostModel, *, source_evidence: tuple[str, ...] = ()) -> str:
+        references = tuple(source_evidence) or model.source_evidence
+        if not references or any(
+            not isinstance(item, str) or not item.strip() for item in references
+        ):
+            raise ValueError("execution cost publication requires immutable source evidence")
+        evidence: list[str] = []
+        for reference in references:
+            source_key, declared_checksum = (
+                reference.rsplit("#", 1) if "#" in reference else (reference, None)
+            )
+            try:
+                source_content = self.store.read(source_key)
+            except (KeyError, OSError) as error:
+                raise ValueError(
+                    f"execution cost source evidence is unavailable: {source_key}"
+                ) from error
+            checksum = hashlib.sha256(source_content).hexdigest()
+            if declared_checksum is not None and declared_checksum.lower() != checksum:
+                raise ValueError(f"execution cost source checksum does not match: {source_key}")
+            evidence.append(f"{source_key}#{checksum}")
         published = ExecutionCostModel(
             commission=model.commission,
             buckets=dict(model.buckets),
             scenarios=model.scenarios,
-            source_evidence=tuple(source_evidence),
+            source_evidence=tuple(sorted(set(evidence))),
+            calibration_method=model.calibration_method,
         )
         canonical = published.canonical_bytes()
         key = f"cost-models/{published.identity}.json"

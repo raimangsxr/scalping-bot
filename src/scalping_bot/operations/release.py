@@ -122,7 +122,14 @@ class ReleaseVerifier:
             container = _container(document)
             env = container.get("env", [])
             env_secret_names = tuple(
-                str(item["name"]) for item in env if isinstance(item, dict) and "valueFrom" in item
+                str(item["valueFrom"]["secretKeyRef"]["name"])
+                for item in env
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("valueFrom"), dict)
+                    and isinstance(item["valueFrom"].get("secretKeyRef"), dict)
+                    and item["valueFrom"]["secretKeyRef"].get("name") is not None
+                )
             )
             volume_secret_names = tuple(
                 str(volume.get("secret", {}).get("secretName"))
@@ -152,6 +159,7 @@ class ReleaseVerifier:
         if not shadow_secrets <= {
             "scalping-bot-candidate-manifest",
             "scalping-bot-evidence",
+            "scalping-bot-secrets",
         }:
             raise ReleaseVerificationError("Live Shadow must not receive executor credentials")
         if processes["live-shadow"].can_submit_orders:

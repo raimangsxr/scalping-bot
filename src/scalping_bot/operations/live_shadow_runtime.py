@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -24,6 +23,8 @@ from scalping_bot.domain.events import (
     OperatorConfirmedNewDay,
 )
 from scalping_bot.domain.market_context import MarketContext
+from scalping_bot.domain.market_context import size_bucket as notional_size_bucket
+from scalping_bot.domain.models import ExitMarket, SubmitEntry
 from scalping_bot.domain.state import InMemoryState
 from scalping_bot.execution.candidate import PromotedCandidateManifest
 from scalping_bot.execution.live import _parse_market_message
@@ -141,6 +142,7 @@ class SharedEngineLiveShadow:
         self._live_candles: dict[str, _LaneCandle] = {}
         self._replay_candles: dict[str, _LaneCandle] = {}
         self._lane_context: dict[str, tuple[str | None, str | None]] = {}
+        self._lane_notional: dict[str, Decimal | None] = {"live": None, "replay": None}
 
     def process_event(self, event: EngineEvent, *, receipt_time_ms: int) -> None:
         """Process one raw event through live and independently reconstructed lanes."""
@@ -182,6 +184,11 @@ class SharedEngineLiveShadow:
                     event_time_ms=event.event_time_ms,
                     kind=f"hypothetical:{type(command).__name__}",
                 )
+        for command in result.commands:
+            if isinstance(command, SubmitEntry):
+                self._lane_notional[lane] = command.price_reference * command.quantity
+            elif isinstance(command, ExitMarket) and isinstance(event, MarketTick):
+                self._lane_notional[lane] = event.price * command.quantity
         # SubmitEntry and all other commands are hypothetical. No exchange
         # adapter is constructed or called by either lane.
         engine.state.pending_entry = None
@@ -197,7 +204,7 @@ class SharedEngineLiveShadow:
                 engine,
                 event_time_ms=event.event_time_ms,
                 volatility_bucket=self._lane_context.get(lane, (None, None))[0],
-                size_bucket=self._lane_context.get(lane, (None, None))[1],
+                notional=self._lane_notional.get(lane),
             ),
         )
         self._record_if_aligned(event.event_id)
@@ -244,7 +251,7 @@ class SharedEngineLiveShadow:
 
 
 class ProductionLiveShadowStream:
-    """Two reconnectable public streams feeding separate no-order lanes."""
+    """One reconnectable public stream fanned out into two no-order lanes."""
 
     def __init__(self, runner: SharedEngineLiveShadow, *, endpoint: str = PRODUCTION_SHADOW_STREAM):
         if endpoint != PRODUCTION_SHADOW_STREAM:
@@ -254,79 +261,38 @@ class ProductionLiveShadowStream:
 
     def run_forever(self, stop: threading.Event) -> None:
         while not stop.is_set():
-            connection_stop = threading.Event()
-            messages: queue.Queue[tuple[str, str, object, int]] = queue.Queue()
-            workers = tuple(
-                threading.Thread(
-                    target=self._consume,
-                    args=(lane, messages, stop, connection_stop),
-                    name=f"live-shadow-{lane}",
-                    daemon=True,
-                )
-                for lane in ("live", "replay")
-            )
-            for worker in workers:
-                worker.start()
-            failure: tuple[str, object] | None = None
-            while not stop.is_set() and not connection_stop.is_set():
-                try:
-                    kind, lane, payload, receipt_time_ms = messages.get(timeout=1)
-                except queue.Empty:
-                    continue
-                if kind == "error":
-                    failure = (lane, payload)
-                    connection_stop.set()
-                    break
-                if not isinstance(payload, (CandleClosed, MarketTick)):
-                    continue
-                if lane == "live":
-                    self.runner.process_live_event(payload, receipt_time_ms=receipt_time_ms)
-                else:
-                    self.runner.process_replay_event(payload, receipt_time_ms=receipt_time_ms)
-            connection_stop.set()
-            for worker in workers:
-                worker.join(timeout=5)
-            if failure is not None and not stop.is_set():
-                lane, error = failure
+            try:
+                context = MarketContext()
+                with connect(self.endpoint, open_timeout=10, close_timeout=5) as websocket:
+                    while not stop.is_set():
+                        try:
+                            message = websocket.recv(timeout=1)
+                        except TimeoutError:
+                            continue
+                        if not isinstance(message, str):
+                            continue
+                        event = _parse_market_message(message, context=context)
+                        if event is not None:
+                            # SharedEngineLiveShadow reconstructs the replay event from
+                            # this exact immutable input, so both lanes observe the same
+                            # exchange event and receipt timestamp.
+                            self.runner.process_event(
+                                event, receipt_time_ms=time.time_ns() // 1_000_000
+                            )
+                if stop.is_set():
+                    return
+                raise RuntimeError("Live Shadow websocket closed cleanly")
+            except Exception as error:
+                if stop.is_set():
+                    return
                 self.record_missing_dependency(
-                    dependency=f"{lane}-stream",
+                    dependency="production-stream",
                     event_time_ms=time.time_ns() // 1_000_000,
                 )
-                self.runner.process.mark_continuity_broken(f"{lane}-stream:{type(error).__name__}")
-                stop.wait(1)
-
-    def _consume(
-        self,
-        lane: str,
-        messages: queue.Queue[tuple[str, str, object, int]],
-        stop: threading.Event,
-        connection_stop: threading.Event,
-    ) -> None:
-        context = MarketContext()
-        try:
-            with connect(self.endpoint, open_timeout=10, close_timeout=5) as websocket:
-                while not stop.is_set() and not connection_stop.is_set():
-                    try:
-                        message = websocket.recv(timeout=1)
-                    except TimeoutError:
-                        continue
-                    if not isinstance(message, str):
-                        continue
-                    event = _parse_market_message(message, context=context)
-                    if event is not None:
-                        messages.put(("event", lane, event, time.time_ns() // 1_000_000))
-            if not stop.is_set() and not connection_stop.is_set():
-                messages.put(
-                    (
-                        "error",
-                        lane,
-                        RuntimeError("Live Shadow websocket closed cleanly"),
-                        time.time_ns() // 1_000_000,
-                    )
+                self.runner.process.mark_continuity_broken(
+                    f"production-stream:{type(error).__name__}"
                 )
-        except Exception as error:
-            if not stop.is_set() and not connection_stop.is_set():
-                messages.put(("error", lane, error, time.time_ns() // 1_000_000))
+                stop.wait(1)
 
     def record_missing_dependency(self, *, dependency: str, event_time_ms: int) -> None:
         """Persist a degraded observation while keeping evidence chronological."""
@@ -352,15 +318,17 @@ def _hypothetical_cost(
     *,
     event_time_ms: int,
     volatility_bucket: str | None,
-    size_bucket: str | None,
+    notional: Decimal | None,
 ) -> str:
+    if notional is None or volatility_bucket is None:
+        return "non-evaluable"
     try:
         return str(
             engine.execution_costs.estimated_close_cost(
-                Decimal("1000"),
+                notional,
                 event_time_ms=event_time_ms,
                 volatility_bucket=volatility_bucket,
-                size_bucket=size_bucket,
+                size_bucket=notional_size_bucket(notional),
             )
         )
     except ValueError:

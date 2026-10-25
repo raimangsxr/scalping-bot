@@ -18,7 +18,7 @@ metadata:
   name: scalping-bot
   namespace: scalping-bot
   annotations:
-    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-c22954797b144330c93a1973dab37c92a013fe21.spdx.json
+    scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-22967503c849b168e65b5d5b06f8d07b15f4a205.spdx.json
 spec:
   serviceName: scalping-bot-metrics
   replicas: 1
@@ -41,7 +41,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: executor
-          image: ghcr.io/raimangsxr/scalping-bot:git-c22954797b144330c93a1973dab37c92a013fe21
+          image: ghcr.io/raimangsxr/scalping-bot:git-22967503c849b168e65b5d5b06f8d07b15f4a205
           imagePullPolicy: IfNotPresent
           args: ["run-testnet-executor"]
           env:
@@ -98,11 +98,11 @@ spec:
               readOnly: true
           readinessProbe:
             exec:
-              command: ["python", "-m", "scalping_bot.health", "/app/state/scalping-bot.db"]
+              command: ["python", "-m", "scalping_bot.health", "/app/state/scalping-bot.db", "--executor-ready"]
             periodSeconds: 10
           livenessProbe:
             exec:
-              command: ["python", "-m", "scalping_bot.health", "/app/state/scalping-bot.db"]
+              command: ["python", "-m", "scalping_bot.health", "/app/state/scalping-bot.db", "--executor-live"]
             periodSeconds: 30
           resources:
             requests:

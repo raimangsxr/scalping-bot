@@ -128,3 +128,32 @@ class S3ObjectStore:
                         key = key.removeprefix(f"{self.prefix}/")
                     keys.append(key)
         return tuple(sorted(keys))
+
+
+def object_store(
+    *,
+    local_root: Path,
+    bucket: str | None = None,
+    prefix: str = "",
+    endpoint_url: str | None = None,
+    region_name: str | None = None,
+) -> ObjectStore:
+    """Build the configured immutable store without ever handling credentials.
+
+    A bucket selects the S3-compatible implementation; otherwise the local
+    filesystem implementation is used.  Credentials remain in the standard
+    boto3 environment/role chain and are deliberately not accepted as
+    arguments, so they cannot leak into CLI output or manifests.
+    """
+    if bucket is None:
+        if endpoint_url is not None or region_name is not None:
+            raise ValueError("S3 endpoint and region require --bucket")
+        return LocalObjectStore(local_root)
+    if not bucket.strip():
+        raise ValueError("S3 bucket cannot be empty")
+    return S3ObjectStore(
+        bucket=bucket.strip(),
+        prefix=prefix,
+        endpoint_url=endpoint_url,
+        region_name=region_name,
+    )

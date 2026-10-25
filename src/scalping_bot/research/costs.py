@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import html
 import json
 from collections import defaultdict
 from collections.abc import Mapping
@@ -11,7 +12,7 @@ from decimal import Decimal, InvalidOperation
 from statistics import median
 from typing import Protocol
 
-from scalping_bot.data.capture import CaptureLedger, RawSegment
+from scalping_bot.data.capture import CaptureCohort, CaptureLedger, RawSegment
 from scalping_bot.data.storage import ObjectStore
 from scalping_bot.domain.costs import EngineCostBucket, ExecutionCosts
 from scalping_bot.domain.events import MarketTick
@@ -208,12 +209,29 @@ def calibration_observations_from_capture(
     *,
     trade_stream: str = "btcusdt-aggTrade",
     quote_stream: str = "btcusdt-bookTicker",
+    cohort_key: str | None = None,
 ) -> tuple[tuple[CalibrationObservation, ...], tuple[str, ...]]:
     """Derive causal calibration observations from valid immutable capture segments."""
-    trade_catalog = CaptureLedger(store).catalog(trade_stream)
-    quote_catalog = CaptureLedger(store).catalog(quote_stream)
-    trade_events = _capture_events(store, trade_catalog.valid_trade_segments)
-    quote_events = _capture_events(store, quote_catalog.valid_quote_segments)
+    if cohort_key is None:
+        trade_segments = CaptureLedger(store).catalog(trade_stream).valid_trade_segments
+        quote_segments = CaptureLedger(store).catalog(quote_stream).valid_quote_segments
+        evidence = tuple(
+            sorted({segment.object_key for segment in (*trade_segments, *quote_segments)})
+        )
+    else:
+        cohort = CaptureCohort.load(store, cohort_key)
+        cohort.verify(store)
+        if trade_stream not in cohort.streams or quote_stream not in cohort.streams:
+            raise ValueError("calibration cohort must include trade and quote streams")
+        trade_segments = tuple(
+            segment for segment in cohort.segments if segment.stream == trade_stream
+        )
+        quote_segments = tuple(
+            segment for segment in cohort.segments if segment.stream == quote_stream
+        )
+        evidence = tuple(sorted({cohort_key, *cohort.segment_keys}))
+    trade_events = _capture_events(store, trade_segments)
+    quote_events = _capture_events(store, quote_segments)
     quotes: list[tuple[int, Decimal, Decimal]] = []
     for event in quote_events:
         payload = event.get("payload")
@@ -262,17 +280,6 @@ def calibration_observations_from_capture(
                 simulated_buy_price=simulated_buy_price,
             )
         )
-    evidence = tuple(
-        sorted(
-            {
-                segment.object_key
-                for segment in (
-                    *trade_catalog.valid_trade_segments,
-                    *quote_catalog.valid_quote_segments,
-                )
-            }
-        )
-    )
     return tuple(observations), evidence
 
 
@@ -491,6 +498,81 @@ class ExecutionCostModel:
         )
 
 
+def render_calibration_markdown(
+    model: ExecutionCostModel, *, bucket_plan: CalibrationBucketPlan | None = None
+) -> str:
+    """Render the immutable human-readable calibration evidence report."""
+    observed = sum(bucket.observations for bucket in model.buckets.values())
+    required = bucket_plan.required_buckets if bucket_plan is not None else ()
+    missing = tuple(
+        bucket
+        for bucket in required
+        if model.buckets.get(bucket) is None
+        or model.buckets[bucket].observations < bucket_plan.minimum_observations
+    ) if bucket_plan is not None else ()
+    plan_identity = bucket_plan.identity if bucket_plan is not None else model.bucket_plan_identity
+    lines = [
+        "# Execution Cost Model calibration report",
+        "",
+        f"Model identity: `{model.identity}`",
+        f"Calibration method: `{model.calibration_method}`",
+        f"Account commission: maker={model.commission.maker}; taker={model.commission.taker}",
+        f"Commission captured (ms): {model.commission.captured_ms}",
+        f"Account context: {model.commission.account_context or 'not supplied'}",
+        f"Frozen bucket plan: `{plan_identity or 'not bound'}`",
+        f"Observed samples: {observed}",
+        f"Stress scenarios: {', '.join(str(item) + 'x' for item in model.scenarios)}",
+        "",
+        "## Bucket coverage",
+        "",
+        "| UTC hour | Volatility | Size | Spread (bps) | Slippage (bps) | Observations |",
+        "| ---: | --- | --- | ---: | ---: | ---: |",
+    ]
+    for (hour, volatility, size), bucket in sorted(model.buckets.items()):
+        lines.append(
+            f"| {hour:02d} | {volatility} | {size} | {bucket.spread_bps} | "
+            f"{bucket.slippage_bps} | {bucket.observations} |"
+        )
+    if bucket_plan is not None:
+        lines.extend(("", "## Frozen protocol", ""))
+        lines.append(f"- Minimum observations per bucket: {bucket_plan.minimum_observations}")
+        lines.append(f"- Required buckets: {len(required)}")
+        lines.append(f"- Under-evidenced buckets: {len(missing)}")
+        if missing:
+            lines.extend(
+                f"- Missing: `{hour:02d}/{volatility}/{size}`"
+                for hour, volatility, size in missing
+            )
+    lines.extend(
+        (
+            "",
+            "## Evidence and limitations",
+            "",
+            *[f"- Source: `{item}`" for item in model.source_evidence],
+            "- Spread is estimated from the contemporaneous best quote.",
+            "- Slippage is estimated from the observed simulated buy price.",
+            "- Missing or under-evidenced buckets fail closed; no undocumented "
+            "constant is substituted.",
+            "- The same content-addressed model is adapted by replay, Live Shadow, "
+            "and Testnet consumers.",
+            "",
+        )
+    )
+    return "\n".join(lines)
+
+
+def render_calibration_html(
+    model: ExecutionCostModel, *, bucket_plan: CalibrationBucketPlan | None = None
+) -> str:
+    markdown = render_calibration_markdown(model, bucket_plan=bucket_plan)
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        "<title>Execution Cost Model calibration report</title></head><body><pre>"
+        + html.escape(markdown)
+        + "</pre></body></html>\n"
+    )
+
+
 class ExecutionCostCalibrator:
     def fit(
         self,
@@ -578,6 +660,19 @@ class ExecutionCostModelPublisher:
             calibration_method=model.calibration_method,
             bucket_plan_identity=model.bucket_plan_identity,
         )
+        plan: CalibrationBucketPlan | None = None
+        for reference in evidence:
+            source_key = reference.rsplit("#", 1)[0]
+            if source_key.startswith("calibration-plans/"):
+                candidate_plan = CalibrationBucketPlan.load(self.store, source_key)
+                if plan is not None and plan.identity != candidate_plan.identity:
+                    raise ValueError("execution cost publication references multiple bucket plans")
+                plan = candidate_plan
+        if published.bucket_plan_identity is not None:
+            if plan is None:
+                raise ValueError("bound execution cost model requires its calibration bucket plan")
+            if plan.identity != published.bucket_plan_identity:
+                raise ValueError("execution cost model and bucket plan identities do not match")
         canonical = published.canonical_bytes()
         key = f"cost-models/{published.identity}.json"
         payload = json.loads(canonical)
@@ -586,4 +681,12 @@ class ExecutionCostModelPublisher:
         payload["sha256"] = published.identity
         content = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
         self.store.put_immutable(key, content)
+        self.store.put_immutable(
+            f"cost-models/{published.identity}.md",
+            render_calibration_markdown(published, bucket_plan=plan).encode(),
+        )
+        self.store.put_immutable(
+            f"cost-models/{published.identity}.html",
+            render_calibration_html(published, bucket_plan=plan).encode(),
+        )
         return key

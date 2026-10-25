@@ -68,6 +68,9 @@ def test_cost_model_requires_evidence_for_declared_buckets_and_is_content_addres
     assert loaded.source_evidence == (
         "catalogs/live/segment.json#" + hashlib.sha256(b"immutable capture segment\n").hexdigest(),
     )
+    model_identity = key.rsplit("/", 1)[-1].removesuffix(".json")
+    assert (tmp_path / "objects" / f"cost-models/{model_identity}.md").is_file()
+    assert (tmp_path / "objects" / f"cost-models/{model_identity}.html").is_file()
     assert loaded.estimate(
         notional=Decimal("1000"), hour_utc=10, volatility_bucket="low", size_bucket="small"
     ) == model.estimate(

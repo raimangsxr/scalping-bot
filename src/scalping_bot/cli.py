@@ -14,11 +14,16 @@ import typer
 from scalping_bot import __version__
 from scalping_bot.config import Settings
 from scalping_bot.data.acquisition import (
+    ResearchArchiveCatalog,
     ResearchArchiveMaterializer,
+    latest_research_catalog,
     research_archive_requests,
+    select_archive_kinds,
+    select_research_periods,
 )
+from scalping_bot.data.capture import freeze_capture_cohort as build_capture_cohort
 from scalping_bot.data.live import BinancePublicCollector
-from scalping_bot.data.storage import LocalObjectStore
+from scalping_bot.data.storage import LocalObjectStore, object_store
 from scalping_bot.domain.market_context import MarketContext
 from scalping_bot.execution.binance import BinanceSpotTestnetAdapter, OfficialSpotTransport
 from scalping_bot.execution.executor import ExecutionLimits
@@ -82,9 +87,21 @@ def check_config() -> None:
 @app.command()
 def collect_live(
     storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
+    s3_bucket: Annotated[str | None, typer.Option("--s3-bucket")] = None,
+    s3_prefix: Annotated[str, typer.Option("--s3-prefix")] = "",
+    s3_endpoint: Annotated[str | None, typer.Option("--s3-endpoint")] = None,
+    s3_region: Annotated[str | None, typer.Option("--s3-region")] = None,
 ) -> None:
     """Continuously capture public production Trade Flow and Book Flow."""
-    collector = BinancePublicCollector(LocalObjectStore(storage))
+    collector = BinancePublicCollector(
+        object_store(
+            local_root=storage,
+            bucket=s3_bucket,
+            prefix=s3_prefix,
+            endpoint_url=s3_endpoint,
+            region_name=s3_region,
+        )
+    )
     asyncio.run(collector.run_forever())
 
 
@@ -94,14 +111,88 @@ def materialize_research_archive(
     allow_incomplete: bool = typer.Option(
         False, help="Persist a resumable partial catalog instead of failing on gaps"
     ),
+    periods: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--period",
+            help="Period name; repeat for historical-stress, primary-research, or final-holdout",
+        ),
+    ] = None,
+    kinds: Annotated[
+        list[str] | None,
+        typer.Option("--kind", help="Archive kind: klines or aggTrades"),
+    ] = None,
+    catalog_key: Annotated[
+        str | None,
+        typer.Option("--catalog", help="Existing immutable catalog key to resume"),
+    ] = None,
+    s3_bucket: Annotated[str | None, typer.Option("--s3-bucket")] = None,
+    s3_prefix: Annotated[str, typer.Option("--s3-prefix")] = "",
+    s3_endpoint: Annotated[str | None, typer.Option("--s3-endpoint")] = None,
+    s3_region: Annotated[str | None, typer.Option("--s3-region")] = None,
 ) -> None:
     """Acquire official klines and aggregate trades into an immutable catalog."""
-    requests = research_archive_requests()
-    catalog = ResearchArchiveMaterializer(LocalObjectStore(output)).materialize(
-        requests, require_complete=not allow_incomplete
+    try:
+        selected_periods = select_research_periods(periods)
+        selected_kinds = select_archive_kinds(kinds)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    store = object_store(
+        local_root=output,
+        bucket=s3_bucket,
+        prefix=s3_prefix,
+        endpoint_url=s3_endpoint,
+        region_name=s3_region,
+    )
+    existing: ResearchArchiveCatalog | None = None
+    if catalog_key is not None:
+        existing = ResearchArchiveCatalog.load(store, catalog_key)
+    else:
+        existing = latest_research_catalog(store)
+    requests = research_archive_requests(selected_periods, kinds=selected_kinds)
+    catalog = ResearchArchiveMaterializer(store).materialize(
+        requests, existing=existing, require_complete=not allow_incomplete
     )
     typer.echo(
         f"catalog={catalog.catalog_key} missing={len(catalog.missing)} gaps={len(catalog.gaps)}"
+    )
+
+
+@app.command()
+def freeze_capture_cohort(
+    purpose: Annotated[str, typer.Argument()],
+    streams: Annotated[list[str], typer.Option("--stream")],
+    start_ms: Annotated[int, typer.Option("--start-ms")],
+    end_ms: Annotated[int, typer.Option("--end-ms")],
+    storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
+    s3_bucket: Annotated[str | None, typer.Option("--s3-bucket")] = None,
+    s3_prefix: Annotated[str, typer.Option("--s3-prefix")] = "",
+    s3_endpoint: Annotated[str | None, typer.Option("--s3-endpoint")] = None,
+    s3_region: Annotated[str | None, typer.Option("--s3-region")] = None,
+) -> None:
+    """Freeze valid capture segments for calibration or Book Flow analysis."""
+    if not streams:
+        raise typer.BadParameter("at least one --stream is required")
+    try:
+        store = object_store(
+            local_root=storage,
+            bucket=s3_bucket,
+            prefix=s3_prefix,
+            endpoint_url=s3_endpoint,
+            region_name=s3_region,
+        )
+        cohort = build_capture_cohort(
+            store,
+            purpose=purpose,
+            streams=tuple(streams),
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        key = cohort.persist(store)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        f"capture-cohort={key} segments={len(cohort.segments)} excluded={len(cohort.excluded)}"
     )
 
 
@@ -219,6 +310,7 @@ def publish_cost_model_from_capture(
     output: Path = Path("data/cost-model"),
     captured_ms: int = typer.Option(..., help="Capture time for the Account Commission Snapshot"),
     bucket_plan_key: str | None = typer.Option(None, "--bucket-plan"),
+    cohort_key: str | None = typer.Option(None, "--cohort"),
 ) -> None:
     """Calibrate costs from valid immutable production capture and account commission."""
     raw_commission = json.loads(commission.read_text(encoding="utf-8"))
@@ -228,7 +320,9 @@ def publish_cost_model_from_capture(
     if bucket_plan_key is None:
         raise typer.BadParameter("--bucket-plan is required to publish production cost evidence")
     bucket_plan = CalibrationBucketPlan.load(source_store, bucket_plan_key)
-    observations, evidence = calibration_observations_from_capture(source_store)
+    observations, evidence = calibration_observations_from_capture(
+        source_store, cohort_key=cohort_key
+    )
     if not observations:
         raise RuntimeError("capture contains no quote-matched aggregate-trade observations")
     snapshot = AccountCommissionSnapshot.from_binance_response(

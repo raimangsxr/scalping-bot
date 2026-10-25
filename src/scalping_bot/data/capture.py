@@ -74,6 +74,151 @@ class CaptureCatalog:
         return tuple(item.segment for item in self.entries if not item.segment.valid)
 
 
+@dataclass(frozen=True)
+class CaptureCohort:
+    """Content-addressed selection of immutable capture segments.
+
+    Cohorts are the seam between continuously arriving capture and prospective
+    analysis.  Invalid, gapped, or out-of-window segments stay visible in the
+    exclusion inventory and can never be silently interpolated into a study.
+    """
+
+    purpose: str
+    streams: tuple[str, ...]
+    start_ms: int
+    end_ms: int
+    segments: tuple[RawSegment, ...]
+    excluded: tuple[str, ...] = ()
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.purpose.strip() or not self.streams:
+            raise ValueError("capture cohort requires a purpose and streams")
+        if tuple(sorted(set(self.streams))) != self.streams:
+            raise ValueError("capture cohort streams must be sorted and unique")
+        if self.start_ms < 0 or self.end_ms < self.start_ms:
+            raise ValueError("capture cohort window must be ordered")
+        if any(
+            not segment.valid
+            or segment.stream not in self.streams
+            or segment.started_ms < self.start_ms
+            or segment.ended_ms > self.end_ms
+            for segment in self.segments
+        ):
+            raise ValueError("capture cohort contains an invalid or out-of-window segment")
+        if tuple(
+            sorted(self.segments, key=lambda segment: (segment.stream, segment.started_ms))
+        ) != self.segments:
+            raise ValueError("capture cohort segments must be sorted")
+
+    @property
+    def segment_keys(self) -> tuple[str, ...]:
+        return tuple(segment.manifest_key for segment in self.segments)
+
+    @property
+    def coverage_ms(self) -> int:
+        return sum(max(0, segment.ended_ms - segment.started_ms) for segment in self.segments)
+
+    def canonical_bytes(self) -> bytes:
+        value = {
+            "schema_version": self.schema_version,
+            "purpose": self.purpose,
+            "streams": list(self.streams),
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "segments": [asdict(segment) for segment in self.segments],
+            "excluded": list(self.excluded),
+        }
+        return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    @property
+    def identity(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def persist(self, store: ObjectStore) -> str:
+        key = f"capture-cohorts/{self.purpose}/{self.identity}.json"
+        store.put_immutable(key, self.canonical_bytes())
+        return key
+
+    def verify(self, store: ObjectStore) -> None:
+        for segment in self.segments:
+            try:
+                manifest = json.loads(store.read(segment.manifest_key))
+                raw = store.read(segment.object_key)
+            except (KeyError, OSError) as error:
+                raise ValueError(
+                    f"capture cohort segment is unavailable: {segment.manifest_key}"
+                ) from error
+            if not isinstance(manifest, dict) or manifest.get("sha256") != segment.sha256:
+                raise ValueError(f"capture cohort manifest differs: {segment.manifest_key}")
+            if hashlib.sha256(raw).hexdigest() != segment.sha256:
+                raise ValueError(f"capture cohort segment checksum differs: {segment.object_key}")
+
+    @classmethod
+    def load(cls, store: ObjectStore, key: str) -> CaptureCohort:
+        raw = store.read(key)
+        expected = key.rsplit("/", 1)[-1].removesuffix(".json")
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise ValueError("capture cohort checksum does not match its key")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or not isinstance(value.get("segments"), list):
+            raise ValueError("capture cohort is malformed")
+        segments = tuple(_segment(item) for item in value["segments"] if isinstance(item, dict))
+        if len(segments) != len(value["segments"]):
+            raise ValueError("capture cohort segment metadata is malformed")
+        cohort = cls(
+            purpose=str(value["purpose"]),
+            streams=tuple(str(item) for item in value["streams"]),
+            start_ms=int(str(value["start_ms"])),
+            end_ms=int(str(value["end_ms"])),
+            segments=segments,
+            excluded=tuple(str(item) for item in value.get("excluded", [])),
+            schema_version=int(str(value.get("schema_version", 1))),
+        )
+        if cohort.identity != expected:
+            raise ValueError("capture cohort identity is invalid")
+        return cohort
+
+
+def freeze_capture_cohort(
+    store: ObjectStore,
+    *,
+    purpose: str,
+    streams: tuple[str, ...],
+    start_ms: int,
+    end_ms: int,
+) -> CaptureCohort:
+    """Freeze a reproducible valid-segment cohort from the append-only ledgers."""
+    normalized_streams = tuple(sorted(set(streams)))
+    if not normalized_streams:
+        raise ValueError("capture cohort requires at least one stream")
+    ledger = CaptureLedger(store)
+    selected: list[RawSegment] = []
+    excluded: list[str] = []
+    for stream in normalized_streams:
+        catalog = ledger.catalog(stream)
+        for entry in catalog.entries:
+            segment = entry.segment
+            if not segment.valid:
+                excluded.append(
+                    f"{segment.manifest_key}:invalid:{segment.invalid_reason or 'unspecified'}"
+                )
+            elif segment.started_ms < start_ms or segment.ended_ms > end_ms:
+                excluded.append(f"{segment.manifest_key}:outside-window")
+            else:
+                selected.append(segment)
+    cohort = CaptureCohort(
+        purpose=purpose,
+        streams=normalized_streams,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        segments=tuple(sorted(selected, key=lambda segment: (segment.stream, segment.started_ms))),
+        excluded=tuple(sorted(excluded)),
+    )
+    cohort.verify(store)
+    return cohort
+
+
 class RawSegmentWriter:
     def __init__(
         self,
@@ -148,7 +293,11 @@ class CaptureLedger:
     def record(self, segment: RawSegment, *, health: Mapping[str, object]) -> CaptureCatalogEntry:
         value = {"segment": asdict(segment), "health": health}
         content = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
-        key = f"catalog/live/{segment.stream}/{segment.sha256}.json"
+        # The payload checksum alone is not a segment identity: two reconnect
+        # boundaries can legitimately contain identical bytes at different
+        # times.  Include the immutable start boundary to avoid catalog key
+        # collisions while retaining the payload checksum for integrity.
+        key = f"catalog/live/{segment.stream}/{segment.started_ms}-{segment.sha256}.json"
         self.store.put_immutable(key, content)
         return CaptureCatalogEntry(segment=segment, health=dict(health), catalog_key=key)
 

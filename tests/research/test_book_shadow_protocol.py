@@ -73,5 +73,8 @@ def test_book_shadow_evidence_binds_protocol_and_rejects_out_of_window_observati
     payload = (tmp_path / key).read_text(encoding="utf-8")
 
     assert protocol.identity in payload
+    identity = key.rsplit("/", 1)[-1].removesuffix(".json")
+    assert (tmp_path / f"shadow/book-flow/{identity}.md").is_file()
+    assert (tmp_path / f"shadow/book-flow/{identity}.html").is_file()
     with pytest.raises(ValueError, match="protocol window"):
         evaluator.record(replace(observation, event_time_ms=201))

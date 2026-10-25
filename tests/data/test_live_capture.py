@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from scalping_bot.data.book import BookGap, LocalOrderBook
-from scalping_bot.data.capture import CaptureHealth, CaptureLedger, RawSegmentWriter
+from scalping_bot.data.capture import (
+    CaptureCohort,
+    CaptureHealth,
+    CaptureLedger,
+    RawSegmentWriter,
+    freeze_capture_cohort,
+)
 from scalping_bot.data.live import BinancePublicCollector
 from scalping_bot.data.storage import LocalObjectStore
 
@@ -159,3 +165,37 @@ def test_invalid_stream_payload_isolated_without_poisoning_other_streams(tmp_pat
     assert len(trade_catalog.invalid_segments) == 1
     assert len(quote_catalog.completed) == 1
     assert quote_catalog.completed[0].valid is True
+
+
+def test_capture_cohort_freezes_valid_segments_and_records_exclusions(tmp_path: Path) -> None:
+    store = LocalObjectStore(tmp_path / "objects")
+    ledger = CaptureLedger(store)
+    for stream, valid in (("btcusdt-aggTrade", True), ("btcusdt-aggTrade", False)):
+        writer = RawSegmentWriter(
+            store, stream=stream, segment_started_ms=1_000 if valid else 2_000
+        )
+        writer.append(
+            {
+                "event_type": "aggTrade",
+                "exchange_time_ms": 1_001,
+                "receipt_time_ms": 1_002,
+                "payload": {"a": 1},
+            }
+        )
+        segment = writer.close(valid=valid, invalid_reason=None if valid else "sequence gap")
+        ledger.record(segment, health={})
+
+    cohort = freeze_capture_cohort(
+        store,
+        purpose="calibration",
+        streams=("btcusdt-aggTrade",),
+        start_ms=1_000,
+        end_ms=1_500,
+    )
+    key = cohort.persist(store)
+    loaded = CaptureCohort.load(store, key)
+
+    assert loaded == cohort
+    assert len(cohort.segments) == 1
+    assert len(cohort.excluded) == 1
+    cohort.verify(store)

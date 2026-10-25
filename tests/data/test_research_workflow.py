@@ -7,10 +7,17 @@ from pathlib import Path
 import pytest
 
 from scalping_bot.data.acquisition import (
+    HISTORICAL_STRESS,
+    PRIMARY_RESEARCH,
+    RESEARCH_PERIODS,
     ArchiveIncompleteError,
     ArchiveKind,
     ArchiveRequest,
+    ResearchArchiveCatalog,
     ResearchArchiveMaterializer,
+    research_archive_requests,
+    select_archive_kinds,
+    select_research_periods,
 )
 from scalping_bot.data.storage import LocalObjectStore
 
@@ -70,3 +77,23 @@ def test_incomplete_catalog_cannot_be_finalized(tmp_path: Path) -> None:
     assert catalog.missing == (request,)
     with pytest.raises(ArchiveIncompleteError, match="continuous"):
         catalog.require_complete()
+
+
+def test_archive_selection_is_canonical_and_supports_resumable_catalogs(tmp_path: Path) -> None:
+    selected = select_research_periods(("primary-research", "historical-stress"))
+    assert selected == (HISTORICAL_STRESS, PRIMARY_RESEARCH)
+    assert select_research_periods() == RESEARCH_PERIODS
+    assert select_archive_kinds(("aggTrades",)) == (ArchiveKind.AGG_TRADES,)
+    requests = research_archive_requests(selected, kinds=select_archive_kinds(("klines",)))
+    assert requests[0].period == "historical-stress"
+    assert requests[-1].month == "2025-09"
+    assert all(item.kind is ArchiveKind.KLINES for item in requests)
+
+    with pytest.raises(ValueError, match="unknown archive period"):
+        select_research_periods(("not-a-period",))
+    with pytest.raises(ValueError, match="unknown archive kind"):
+        select_archive_kinds(("depth",))
+
+    store = LocalObjectStore(tmp_path / "objects")
+    catalog = ResearchArchiveCatalog().persist(store)
+    assert ResearchArchiveCatalog.load(store, catalog.catalog_key or "") == catalog

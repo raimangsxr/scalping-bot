@@ -1,5 +1,6 @@
 import gzip
 import hashlib
+import html
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -385,6 +386,11 @@ class BookShadowEvaluator:
 
     def persist_report(self, store: ObjectStore) -> str:
         report = self.report()
+        markdown = (
+            f"Protocol identity: `{self.protocol.identity}`\n"
+            f"Protocol window: {self.protocol.start_ms}-{self.protocol.end_ms}\n\n"
+            + report.markdown
+        )
         payload = {
             "schema_version": 1,
             "protocol_identity": self.protocol.identity,
@@ -421,11 +427,22 @@ class BookShadowEvaluator:
                 for item in self._observations
             ],
             "classification": "Shadow Evaluation",
-            "markdown": report.markdown,
+            "markdown": markdown,
         }
         content = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
-        key = f"shadow/book-flow/{hashlib.sha256(content).hexdigest()}.json"
+        identity = hashlib.sha256(content).hexdigest()
+        key = f"shadow/book-flow/{identity}.json"
         store.put_immutable(key, content)
+        store.put_immutable(f"shadow/book-flow/{identity}.md", markdown.encode())
+        store.put_immutable(
+            f"shadow/book-flow/{identity}.html",
+            (
+                '<!doctype html><html><head><meta charset="utf-8">'
+                "<title>Book Flow Shadow report</title></head><body><pre>"
+                + html.escape(markdown)
+                + "</pre></body></html>\n"
+            ).encode(),
+        )
         return key
 
 

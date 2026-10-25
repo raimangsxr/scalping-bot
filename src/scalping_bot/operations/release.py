@@ -97,8 +97,21 @@ class ReleaseVerifier:
         target_revision = str(
             self.application.get("spec", {}).get("source", {}).get("targetRevision", "")
         )
-        if target_revision.lower() != image_revision:
-            raise ReleaseVerificationError("ArgoCD revision and image commit must match")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", target_revision):
+            raise ReleaseVerificationError("ArgoCD release-manifest revision must be a full commit")
+        application_annotations = self.application.get("metadata", {}).get("annotations", {})
+        declared_image_revision = (
+            application_annotations.get("scalping-bot.io/release-image-commit")
+            if isinstance(application_annotations, dict)
+            else None
+        )
+        if (
+            declared_image_revision is not None
+            and str(declared_image_revision).lower() != image_revision
+        ):
+            raise ReleaseVerificationError(
+                "ArgoCD release image annotation and image commit must match"
+            )
         processes: dict[str, ProcessRelease] = {}
         for component, document in workloads.items():
             container = _container(document)

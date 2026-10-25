@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import itertools
+import json
 from collections import defaultdict, deque
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from itertools import pairwise
@@ -74,6 +75,7 @@ class ResearchBatchRunner:
         evidence: dict[str, EvidenceResult] = {}
         evidence_trades: dict[str, tuple[ScalpResult, ...]] = {}
         for candidate in selected_batch.candidates:
+            selected_parameters: list[Mapping[str, object]] = []
             scenario_results: dict[Decimal, list[ScalpResult]] = {
                 Decimal("1"): [],
                 Decimal("1.5"): [],
@@ -141,6 +143,7 @@ class ResearchBatchRunner:
                     )
                     ranked.append((expectancy, parameters))
                 selected = max(ranked, key=lambda item: item[0])[1]
+                selected_parameters.append(selected)
                 for multiplier in baseline_scenario_results:
                     baseline_scenario_results[multiplier].extend(
                         self._evaluate_period(
@@ -167,7 +170,7 @@ class ResearchBatchRunner:
             }
             worst_results = scenarios[Decimal("2")]
             evidence_trades[candidate.identity] = worst_results
-            evidence[candidate.identity] = self.protocol.evaluate(
+            evaluated = self.protocol.evaluate(
                 worst_results,
                 initial_equity=self.initial_equity,
                 attempts=max(1, sum(not attempt.is_baseline for attempt in ledger.attempts)),
@@ -179,6 +182,12 @@ class ResearchBatchRunner:
                     multiplier: tuple(results)
                     for multiplier, results in baseline_scenario_results.items()
                 },
+            )
+            evidence[candidate.identity] = replace(
+                evaluated,
+                frozen_parameters=_select_frozen_parameters(
+                    selected_parameters, candidate.parameters
+                ),
             )
         records = {
             candidate.identity: _evaluated_record(candidate, evidence[candidate.identity])
@@ -252,7 +261,12 @@ class ResearchBatchRunner:
         return evidence, results
 
     def evaluate_frozen_candidate(
-        self, candidate: CandidateRecord, trades: tuple[AggTrade, ...]
+        self,
+        candidate: CandidateRecord,
+        trades: tuple[AggTrade, ...],
+        *,
+        dataset_checksum: str | None = None,
+        execution_cost_model_identity: str | None = None,
     ) -> tuple[EvidenceResult, tuple[ScalpResult, ...]]:
         """Evaluate one frozen parameter choice on an unseen holdout period."""
         scenarios = {
@@ -273,6 +287,8 @@ class ResearchBatchRunner:
             cost_stress_multipliers=tuple(scenarios),
             cost_scenario_trades=scenarios,
             fold_count_override=1,
+            dataset_checksum=dataset_checksum,
+            execution_cost_model_identity=execution_cost_model_identity,
         )
         return evidence, worst
 
@@ -708,7 +724,11 @@ def _expectancy(trades: tuple[ScalpResult, ...]) -> Decimal:
 
 
 def _evaluated_record(candidate: CandidateRecord, evidence: EvidenceResult) -> CandidateRecord:
-    specified = candidate.transition(CandidateLifecycle.SPECIFIED, evidence="preregistered")
+    frozen_parameters = evidence.frozen_parameters or _first_parameter_values(candidate.parameters)
+    evaluated_candidate = replace(candidate, parameters=dict(frozen_parameters))
+    specified = evaluated_candidate.transition(
+        CandidateLifecycle.SPECIFIED, evidence="preregistered"
+    )
     screened = specified.transition(
         CandidateLifecycle.SCREENED, evidence="baseline and variants run"
     )
@@ -718,6 +738,21 @@ def _evaluated_record(candidate: CandidateRecord, evidence: EvidenceResult) -> C
         CandidateLifecycle.WALK_FORWARD_VALIDATED,
         evidence="aggregate-trade walk-forward gates passed",
     )
+
+
+def _select_frozen_parameters(
+    selections: list[Mapping[str, object]], preregistered: Mapping[str, object]
+) -> dict[str, object]:
+    if not selections:
+        return _first_parameter_values(preregistered)
+    unique: dict[str, Mapping[str, object]] = {}
+    counts: defaultdict[str, int] = defaultdict(int)
+    for selection in selections:
+        identity = json.dumps(dict(selection), sort_keys=True, default=str)
+        unique[identity] = selection
+        counts[identity] += 1
+    winner = min(unique, key=lambda identity: (-counts[identity], identity))
+    return dict(unique[winner])
 
 
 def _comparators(

@@ -352,20 +352,26 @@ def test_critical_soak_incident_requires_regression_and_restarts_stability() -> 
 
 def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: Path) -> None:
     store = LocalObjectStore(tmp_path)
+    promotion_content = json.dumps(
+        {
+            "candidate_identity": "momentum-001-v1",
+            "candidate_rules_sha256": "rules-immutable",
+            "decision": "PROMOTED",
+        },
+        sort_keys=True,
+    ).encode()
+    promotion_key = f"promotion/{hashlib.sha256(promotion_content).hexdigest()}.json"
     store.put_immutable(
-        "promotion/baseline.json",
-        json.dumps(
-            {
-                "candidate_identity": "momentum-001-v1",
-                "candidate_rules_sha256": "rules-immutable",
-                "decision": "PROMOTED",
-            },
-            sort_keys=True,
-        ).encode(),
+        promotion_key,
+        promotion_content,
     )
+    soak_content = (
+        "# Testnet Soak — momentum-001-v1\nDecision: COMPLETE\nExecuted scalps: 300/300\n"
+    ).encode()
+    soak_key = f"testnet-soak/{hashlib.sha256(soak_content).hexdigest()}.md"
     store.put_immutable(
-        "testnet-soak/report.md",
-        "# Testnet Soak — momentum-001-v1\nDecision: COMPLETE\nExecuted scalps: 300/300\n".encode(),
+        soak_key,
+        soak_content,
     )
     gate = PromotedRiskGate(store)
     baseline = RiskEvaluation(
@@ -441,8 +447,8 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
         promoted=promoted,
         baseline_promoted=True,
         soak_complete=True,
-        promotion_artifact_key="promotion/baseline.json",
-        soak_report_key="testnet-soak/report.md",
+        promotion_artifact_key=promotion_key,
+        soak_report_key=soak_key,
     )
 
     assert result.accepted

@@ -170,7 +170,7 @@ class ResearchRunManifest:
             hashlib.sha256(store.read(key)).hexdigest() for key in self.dataset_derived_keys
         )
         actual = sorted(hashlib.sha256(path.read_bytes()).hexdigest() for path in paths)
-        return actual == expected
+        return len(actual) == len(set(actual)) and all(item in expected for item in actual)
 
 
 class PersistentAttemptLedger:
@@ -443,6 +443,9 @@ def _evidence_json(result: EvidenceResult) -> dict[str, object]:
         "regime_metrics": {str(key): asdict(value) for key, value in result.regime_metrics.items()},
         "market_fidelity_verified": result.market_fidelity_verified,
         "baseline_cost_scenario_metrics": _metric_map(result.baseline_cost_scenario_metrics),
+        "frozen_parameters": result.frozen_parameters,
+        "dataset_checksum": result.dataset_checksum,
+        "execution_cost_model_identity": result.execution_cost_model_identity,
     }
 
 

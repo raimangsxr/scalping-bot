@@ -53,11 +53,15 @@ class FinalHoldoutGate:
             or candidate.lifecycle is not CandidateLifecycle.WALK_FORWARD_VALIDATED
         ):
             raise HoldoutAccessError("candidate must be a frozen walk-forward finalist")
+        if any(isinstance(value, list) for value in candidate.parameters.values()):
+            raise HoldoutAccessError("Final Holdout requires concrete frozen parameters")
         registered = next(
             (item for item in first_batch().candidates if item.identity == candidate.identity),
             None,
         )
-        if registered is None or candidate.parameters != registered.parameters:
+        if registered is None or not _parameters_are_preregistered(
+            candidate.parameters, registered.parameters
+        ):
             raise HoldoutAccessError("candidate is not the preregistered first-batch identity")
         if len(holdout_dataset_checksum) != 64 or any(
             item not in "0123456789abcdefABCDEF" for item in holdout_dataset_checksum
@@ -67,40 +71,26 @@ class FinalHoldoutGate:
             raise ValueError(
                 "Final Holdout requires immutable dataset and Execution Cost Model artifacts"
             )
-        if holdout_dataset_key is not None:
-            try:
-                dataset = self.store.read(holdout_dataset_key)
-            except (FileNotFoundError, KeyError) as error:
-                raise ValueError("Final Holdout dataset artifact is unavailable") from error
-            if hashlib.sha256(dataset).hexdigest() != holdout_dataset_checksum.lower():
-                raise ValueError("Final Holdout dataset checksum does not match its artifact")
-        if execution_cost_model_key is not None:
-            try:
-                cost_model = self.store.read(execution_cost_model_key)
-            except (FileNotFoundError, KeyError) as error:
-                raise ValueError("Final Holdout cost artifact is unavailable") from error
-            cost_key_identity = execution_cost_model_key.rsplit("/", 1)[-1].removesuffix(".json")
-            if len(cost_key_identity) == 64:
-                canonical = hashlib.sha256(cost_model).hexdigest()
-                try:
-                    parsed = json.loads(cost_model)
-                except (UnicodeDecodeError, ValueError):
-                    parsed = None
-                if isinstance(parsed, dict) and parsed.get("sha256"):
-                    canonical = hashlib.sha256(
-                        (
-                            json.dumps(
-                                {key: value for key, value in parsed.items() if key != "sha256"},
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            )
-                            + "\n"
-                        ).encode()
-                    ).hexdigest()
-                if canonical != cost_key_identity:
-                    raise ValueError("Final Holdout cost checksum does not match its artifact")
-            if execution_cost_model_key.startswith("cost-models/"):
-                ExecutionCostModel.load(self.store, execution_cost_model_key)
+        try:
+            dataset = self.store.read(holdout_dataset_key)
+        except (FileNotFoundError, KeyError) as error:
+            raise ValueError("Final Holdout dataset artifact is unavailable") from error
+        if hashlib.sha256(dataset).hexdigest() != holdout_dataset_checksum.lower():
+            raise ValueError("Final Holdout dataset checksum does not match its artifact")
+        dataset_identity = _require_content_addressed_key(holdout_dataset_key, dataset)
+        if dataset_identity != holdout_dataset_checksum.lower():
+            raise ValueError("Final Holdout dataset key is not its checksum")
+        try:
+            cost_model = self.store.read(execution_cost_model_key)
+        except (FileNotFoundError, KeyError) as error:
+            raise ValueError("Final Holdout cost artifact is unavailable") from error
+        cost_identity = _require_content_addressed_key(execution_cost_model_key, cost_model)
+        if evidence.dataset_checksum != holdout_dataset_checksum.lower():
+            raise ValueError("Final Holdout evidence is bound to another dataset")
+        if evidence.execution_cost_model_identity != cost_identity:
+            raise ValueError("Final Holdout evidence is bound to another cost model")
+        if execution_cost_model_key.startswith("cost-models/"):
+            ExecutionCostModel.load(self.store, execution_cost_model_key)
         try:
             reveal_key = self.registry.reveal(
                 candidate, command="reveal-final-holdout", actor=actor
@@ -180,7 +170,12 @@ class FinalHoldoutGate:
             execution_costs=model.as_engine_costs(),
             code_commit="final-holdout",
             dataset_checksums=(holdout_dataset_checksum, model.identity),
-        ).evaluate_frozen_candidate(candidate, aggregate_trades)
+        ).evaluate_frozen_candidate(
+            candidate,
+            aggregate_trades,
+            dataset_checksum=holdout_dataset_checksum,
+            execution_cost_model_identity=model.identity,
+        )
         return self.evaluate(
             candidate,
             evidence=evidence,
@@ -200,6 +195,48 @@ def _concrete_parameters(parameters: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _parameters_are_preregistered(
+    parameters: Mapping[str, object], preregistered: Mapping[str, object]
+) -> bool:
+    if set(parameters) != set(preregistered):
+        return False
+    for name, value in parameters.items():
+        allowed = preregistered[name]
+        if not isinstance(allowed, list):
+            if value != allowed:
+                return False
+        elif isinstance(value, list):
+            if any(item not in allowed for item in value):
+                return False
+        elif value not in allowed:
+            return False
+    return True
+
+
+def _require_content_addressed_key(key: str, content: bytes) -> str:
+    identity = key.rsplit("/", 1)[-1].removesuffix(".json").removesuffix(".parquet")
+    if len(identity) != 64 or any(item not in "0123456789abcdef" for item in identity.lower()):
+        raise ValueError("Final Holdout artifacts must be content addressed")
+    actual = hashlib.sha256(content).hexdigest()
+    try:
+        parsed = json.loads(content)
+    except (UnicodeDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and parsed.get("sha256"):
+        canonical = (
+            json.dumps(
+                {item_key: item for item_key, item in parsed.items() if item_key != "sha256"},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        actual = hashlib.sha256(canonical).hexdigest()
+    if actual != identity.lower():
+        raise ValueError("Final Holdout artifact checksum does not match its key")
+    return identity.lower()
+
+
 def _render_report(
     candidate: CandidateRecord,
     *,
@@ -216,6 +253,14 @@ def _render_report(
     target_note = (
         "reported separately" if decision == "Testnet Ready" else "not used to rescue the decision"
     )
+    fold_net_returns = json.dumps(
+        {str(key): str(value.net_return) for key, value in evidence.fold_metrics.items()},
+        sort_keys=True,
+    )
+    cost_net_returns = json.dumps(
+        {str(key): str(value.net_return) for key, value in evidence.cost_scenario_metrics.items()},
+        sort_keys=True,
+    )
     return (
         f"# Final Holdout — {candidate.identity}\n\n"
         f"Decision: {decision}\n"
@@ -225,9 +270,19 @@ def _render_report(
         f"Audited reveal: {reveal_key}\n"
         f"Candidate manifest: {candidate_manifest_key or 'none'}\n"
         f"Net return: {evidence.metrics.net_return}\n"
+        f"Expectancy: {evidence.metrics.expectancy or 'non-evaluable'}\n"
+        f"Profit factor: {evidence.metrics.profit_factor or 'non-evaluable'}\n"
+        f"Daily Sharpe: {evidence.metrics.daily_sharpe or 'non-evaluable'}\n"
+        f"Daily Sortino: {evidence.metrics.daily_sortino or 'non-evaluable'}\n"
+        f"Win rate: {evidence.metrics.win_rate or 'non-evaluable'}\n"
         f"Maximum drawdown: {evidence.metrics.max_drawdown}\n"
         f"Maximum daily loss: {evidence.metrics.maximum_daily_loss}\n"
         f"Trade count: {evidence.metrics.trade_count}\n"
+        f"Bootstrap lower 95%: {evidence.bootstrap_lower_95 or 'non-evaluable'}\n"
+        f"Positive fold fraction: {evidence.positive_fold_fraction}\n"
+        f"Concentration failed: {evidence.concentration_failed}\n"
+        f"Fold net returns: {fold_net_returns}\n"
+        f"Cost stress net returns: {cost_net_returns}\n"
         "Research Target: aspirational interpretation only; "
         f"{target_note}\n\n"
         "Reasons:\n"

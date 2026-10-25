@@ -127,8 +127,14 @@ class BinanceTestnetUserDataStream:
 
 
 class ExchangeEventApplier:
-    def __init__(self, state: SQLiteState) -> None:
+    def __init__(
+        self,
+        state: SQLiteState,
+        *,
+        reprotect_position: Callable[[int], None] | None = None,
+    ) -> None:
         self.state = state
+        self.reprotect_position = reprotect_position
 
     def apply(self, event: ExchangeEvent) -> None:
         if isinstance(event, ExecutionReportEvent):
@@ -229,7 +235,27 @@ class ExchangeEventApplier:
         if intent["side"] == "BUY":
             self.state.rebuild_position_from_order(event.client_order_id)
         elif intent["side"] == "SELL":
-            self.state.apply_exit_fills(event.client_order_id, event_time_ms=event.event_time_ms)
+            changed = self.state.apply_exit_fills(
+                event.client_order_id, event_time_ms=event.event_time_ms
+            )
+            position = self.state.position()
+            if changed and position is not None and not bool(position["protected"]):
+                if self.reprotect_position is None:
+                    self.state.append_audit(
+                        kind="streamed-partial-exit-unprotected",
+                        event_time_ms=event.event_time_ms,
+                        details={"client_order_id": event.client_order_id},
+                    )
+                else:
+                    try:
+                        self.reprotect_position(event.event_time_ms)
+                    except Exception as error:
+                        self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
+                        self.state.append_audit(
+                            kind="streamed-partial-exit-reprotection-failed",
+                            event_time_ms=event.event_time_ms,
+                            details={"error_type": type(error).__name__},
+                        )
         self.state.append_audit(
             kind="exchange-order-updated",
             event_time_ms=event.event_time_ms,

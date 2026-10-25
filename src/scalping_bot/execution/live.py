@@ -32,7 +32,7 @@ class BinanceTestnetMarketStream:
         if parsed.scheme != "wss" or parsed.hostname != "stream.testnet.binance.vision":
             raise ValueError("only the Binance Spot Testnet market stream is allowed")
         self.url = (
-            "wss://stream.testnet.binance.vision/stream?streams=btcusdt@trade/btcusdt@kline_1m"
+            "wss://stream.testnet.binance.vision/stream?streams=btcusdt@aggTrade/btcusdt@kline_1m"
         )
 
     def events(
@@ -181,11 +181,11 @@ def _parse_market_message(message: str) -> EngineEvent | None:
     if not isinstance(payload, dict):
         raise ValueError("Binance market payload is malformed")
     event_type = payload.get("e")
-    if event_type == "trade":
+    if event_type in {"trade", "aggTrade"}:
         event_time = int(payload["T"])
-        trade_id = int(payload["t"])
+        trade_id = int(payload["t"] if event_type == "trade" else payload["a"])
         return MarketTick(
-            event_id=f"trade-{trade_id}",
+            event_id=f"{event_type}-{trade_id}",
             event_time_ms=event_time,
             price=Decimal(str(payload["p"])),
         )

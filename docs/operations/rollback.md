@@ -1,8 +1,9 @@
 # Executor deployment and rollback
 
-ArgoCD deploys exactly one executor from the immutable release manifests. Those manifests reference
-an image tagged with the verified source commit, and the image must have a matching SPDX SBOM. The
-release-manifest revision and image source commit are advanced together only after CI passes.
+ArgoCD deploys exactly one executor from the immutable release manifests. `targetRevision` is the
+full commit containing the manifests; those manifests reference an image tagged with its verified
+source commit, and the image must have a matching SPDX SBOM. The two immutable commits are
+recorded together and advanced only after CI passes.
 
 Before sync, the `PreSync` deployment gate reads SQLite without becoming a writer and requires:
 

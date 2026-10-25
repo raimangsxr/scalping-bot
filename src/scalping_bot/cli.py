@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import json
 import time
-from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
@@ -17,7 +16,6 @@ from scalping_bot.data.acquisition import (
 )
 from scalping_bot.data.live import BinancePublicCollector
 from scalping_bot.data.storage import LocalObjectStore
-from scalping_bot.domain.models import ExecutionCosts
 from scalping_bot.execution.binance import BinanceSpotTestnetAdapter, OfficialSpotTransport
 from scalping_bot.execution.executor import ExecutionLimits, ExecutionService
 from scalping_bot.execution.reconcile import Reconciler
@@ -44,10 +42,13 @@ from scalping_bot.research.costs import (
 )
 from scalping_bot.research.evidence import CandidateLifecycle, CandidateRecord
 from scalping_bot.research.holdout import FinalHoldoutGate
-from scalping_bot.research.reporting import render_evidence_markdown
 from scalping_bot.research.runner import ResearchBatchRunner, load_aggtrades
 from scalping_bot.research.workflow import ResearchArtifactWriter, ResearchRunManifest
-from scalping_bot.strategies.book_shadow import BookShadowEvaluator
+from scalping_bot.strategies.book_shadow import (
+    DEFAULT_BOOK_CONFIRMATION_IMBALANCE,
+    BookShadowEvaluator,
+    ShadowBookConfirmation,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -167,7 +168,8 @@ def run_research(
     manifest = ResearchRunManifest.load(store, manifest_key)
     if not manifest.verify(store):
         raise RuntimeError("research manifest inputs are no longer verifiable")
-    if not manifest.verify_dataset_paths(tuple(parquet), store):
+    bound_paths = (*parquet, *(historical_parquet or ()))
+    if not manifest.verify_dataset_paths(bound_paths, store):
         raise RuntimeError(
             "research Parquet inputs are not the immutable files bound by the manifest"
         )
@@ -324,10 +326,13 @@ def run_live_shadow(
 @app.command()
 def evaluate_book_shadow(
     storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
+    min_imbalance: Annotated[Decimal, typer.Option()] = DEFAULT_BOOK_CONFIRMATION_IMBALANCE,
 ) -> None:
     """Build non-promotable Book Flow Shadow evidence from captured segments."""
     store = LocalObjectStore(storage)
-    evaluator = BookShadowEvaluator.from_capture(store)
+    evaluator = BookShadowEvaluator.from_capture(
+        store, confirmation=ShadowBookConfirmation(min_imbalance=min_imbalance)
+    )
     typer.echo(f"book-shadow-report={evaluator.persist_report(store)}")
 
 
@@ -463,68 +468,16 @@ def initialize_state(database: Path = Path("state/scalping-bot.db")) -> None:
 
 @app.command()
 def evaluate_first_batch(
+    manifest_key: Annotated[str, typer.Argument()],
     parquet: Annotated[list[Path], typer.Argument(exists=True, readable=True)],
-    commission_rate: Annotated[str, typer.Option(help="Captured account taker commission rate")],
-    half_spread_rate: Annotated[str, typer.Option(help="Calibrated half-spread rate")],
-    slippage_rate: Annotated[str, typer.Option(help="Calibrated slippage rate")],
-    output: Path = Path("reports/first-batch"),
-    code_commit: str = typer.Option("working-tree"),
+    artifacts: Path = Path("data/research-artifacts"),
     historical_parquet: Annotated[
         list[Path] | None,
         typer.Option(exists=True, readable=True, help="Historical Stress parquet inputs"),
     ] = None,
 ) -> None:
-    """Evaluate all preregistered variants with aggregate trades and shared engine."""
-    trades = load_aggtrades(tuple(parquet))
-    output.mkdir(parents=True, exist_ok=True)
-    evaluation = ResearchBatchRunner(
-        execution_costs=ExecutionCosts(
-            commission_rate=Decimal(commission_rate),
-            half_spread_rate=Decimal(half_spread_rate),
-            slippage_rate=Decimal(slippage_rate),
-        ),
-        manifest_store=LocalObjectStore(output / "artifacts"),
-        code_commit=code_commit,
-        dataset_checksums=tuple(hashlib.sha256(path.read_bytes()).hexdigest() for path in parquet),
-    ).run(trades, historical_trades=load_aggtrades(tuple(historical_parquet or ())))
-    for identity, evidence in evaluation.evidence.items():
-        (output / f"{identity}.md").write_text(
-            render_evidence_markdown(identity, evidence, evaluation.trades[identity]),
-            encoding="utf-8",
-        )
-    attempts = [
-        {
-            **asdict(attempt),
-            "parameters": dict(attempt.parameters),
-            "net_expectancy": str(attempt.net_expectancy),
-            "baseline_expectancy": str(attempt.baseline_expectancy),
-            "incremental_expectancy": str(attempt.incremental_expectancy),
-        }
-        for attempt in evaluation.ledger.all_attempts
-    ]
-    (output / "attempts.json").write_text(
-        json.dumps(attempts, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-    )
-    (output / "manifests.json").write_text(
-        json.dumps(dict(evaluation.manifest_keys), sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    bundle_keys = ResearchArtifactWriter(
-        LocalObjectStore(output / "artifacts"), run_identity=code_commit
-    ).publish_batch_evaluation(
-        first_batch(),
-        evidence=evaluation.evidence,
-        attempts=evaluation.ledger.all_attempts,
-        trades=evaluation.trades,
-        historical_evidence=evaluation.historical_evidence,
-        historical_trades=evaluation.historical_trades,
-        candidate_records=evaluation.candidate_records,
-        manifest_keys=evaluation.manifest_keys,
-    )
-    (output / "bundle.json").write_text(
-        json.dumps(bundle_keys, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-    )
-    typer.echo(f"evaluated {len(evaluation.evidence)} candidates into {output}")
+    """Strict alias for research evaluation from a verified immutable manifest."""
+    run_research(manifest_key, parquet, artifacts, historical_parquet)
 
 
 @app.command()

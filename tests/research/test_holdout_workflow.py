@@ -25,14 +25,14 @@ def _finalist() -> CandidateRecord:
         thesis="completed returns may persist",
         original_rules={"window": 3},
         modifications={},
-        parameters={"window_bars": [3, 5], "threshold": ["0.005", "0.01"]},
+        parameters={"window_bars": 3, "threshold": "0.005"},
         rejection_criteria=("negative expectancy",),
         lifecycle=CandidateLifecycle.WALK_FORWARD_VALIDATED,
         frozen=True,
     )
 
 
-def _evidence(promoted: bool) -> EvidenceResult:
+def _evidence(promoted: bool, *, dataset_checksum: str, cost_model_identity: str) -> EvidenceResult:
     metrics = EvidenceMetrics(
         net_return=Decimal("0.1"),
         max_drawdown=Decimal("0.03"),
@@ -55,6 +55,8 @@ def _evidence(promoted: bool) -> EvidenceResult:
         selection_adjusted_alpha=Decimal("0.00625"),
         cost_stress_multipliers=(Decimal("1"), Decimal("1.5"), Decimal("2")),
         market_fidelity_verified=True,
+        dataset_checksum=dataset_checksum,
+        execution_cost_model_identity=cost_model_identity,
     )
 
 
@@ -70,7 +72,9 @@ def test_final_holdout_reveal_creates_one_decision_and_ready_manifest(tmp_path: 
     store.put_immutable(cost_key, cost_model)
     decision = FinalHoldoutGate(store, HoldoutRegistry(store)).evaluate(
         _finalist(),
-        evidence=_evidence(True),
+        evidence=_evidence(
+            True, dataset_checksum=dataset_checksum, cost_model_identity=cost_checksum
+        ),
         holdout_dataset_checksum=dataset_checksum,
         actor="operator",
         holdout_dataset_key=dataset_key,

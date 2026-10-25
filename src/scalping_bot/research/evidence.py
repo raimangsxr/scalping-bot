@@ -181,6 +181,9 @@ class EvidenceResult:
     regime_metrics: Mapping[str, EvidenceMetrics] = field(default_factory=dict)
     market_fidelity_verified: bool = False
     baseline_cost_scenario_metrics: Mapping[Decimal, EvidenceMetrics] = field(default_factory=dict)
+    frozen_parameters: Mapping[str, object] | None = None
+    dataset_checksum: str | None = None
+    execution_cost_model_identity: str | None = None
 
 
 class EvidenceProtocol:
@@ -214,6 +217,8 @@ class EvidenceProtocol:
         baseline_trades: tuple[ScalpResult, ...] | None = None,
         baseline_cost_scenario_trades: Mapping[Decimal, tuple[ScalpResult, ...]] | None = None,
         fold_count_override: int | None = None,
+        dataset_checksum: str | None = None,
+        execution_cost_model_identity: str | None = None,
     ) -> EvidenceResult:
         if attempts < 1:
             raise ValueError("selection attempt count must be positive")
@@ -285,6 +290,8 @@ class EvidenceProtocol:
                 multiplier: _metrics(scenario, initial_equity)
                 for multiplier, scenario in (baseline_cost_scenario_trades or {}).items()
             },
+            dataset_checksum=dataset_checksum,
+            execution_cost_model_identity=execution_cost_model_identity,
         )
 
 

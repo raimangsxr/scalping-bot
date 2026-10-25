@@ -87,13 +87,7 @@ class ExecutionCosts:
             raise ValueError("execution-cost notional cannot be negative")
         if self.calibrated_buckets:
             if event_time_ms is None or volatility_bucket is None:
-                # The engine can receive a bare MarketTick from a legacy/live
-                # adapter that has not yet attached a volatility classifier.
-                # Keep the evidenced aggregate as a safe compatibility value;
-                # callers that have context use the exact bucket below.
-                return notional * (
-                    self.commission_rate + self.half_spread_rate + self.slippage_rate
-                )
+                raise ValueError("execution-cost context is required for calibrated buckets")
             hour = datetime.fromtimestamp(event_time_ms / 1000, tz=UTC).hour
             matches = tuple(
                 item
@@ -106,9 +100,7 @@ class ExecutionCosts:
                 )
             )
             if len(matches) != 1:
-                return notional * (
-                    self.commission_rate + self.half_spread_rate + self.slippage_rate
-                )
+                raise ValueError("no unique calibrated execution-cost bucket matches this order")
             bucket = matches[0]
             return notional * (
                 self.commission_rate + bucket.half_spread_rate + bucket.slippage_rate

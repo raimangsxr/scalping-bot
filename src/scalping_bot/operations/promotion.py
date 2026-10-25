@@ -800,7 +800,10 @@ class PromotedRiskGate:
             reasons.append("promotion evidence artifact is not an object")
             return
         expected = key.rsplit("/", 1)[-1].removesuffix(".json")
-        if len(expected) == 64 and hashlib.sha256(content).hexdigest() != expected:
+        if len(expected) != 64 or any(item not in "0123456789abcdef" for item in expected.lower()):
+            reasons.append("promotion evidence artifact key is not content addressed")
+            return
+        if hashlib.sha256(content).hexdigest() != expected.lower():
             reasons.append("promotion evidence artifact checksum does not match its key")
             return
         if (
@@ -828,7 +831,11 @@ class PromotedRiskGate:
             reasons.append("Testnet Soak report artifact is not complete")
         else:
             expected = key.rsplit("/", 1)[-1].removesuffix(".md")
-            if len(expected) == 64 and hashlib.sha256(raw_content).hexdigest() != expected:
+            if len(expected) != 64 or any(
+                item not in "0123456789abcdef" for item in expected.lower()
+            ):
+                reasons.append("Testnet Soak report key is not content addressed")
+            elif hashlib.sha256(raw_content).hexdigest() != expected.lower():
                 reasons.append("Testnet Soak report checksum does not match its key")
 
     @staticmethod

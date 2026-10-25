@@ -14,6 +14,7 @@ from scalping_bot.config import Settings
 from scalping_bot.data.storage import LocalObjectStore
 from scalping_bot.domain.costs import ExecutionCostSnapshot
 from scalping_bot.domain.engine import Engine
+from scalping_bot.domain.events import CandleClosed, MarketTick
 from scalping_bot.execution.binance import (
     BinanceSpotTestnetAdapter,
     OfficialSpotTransport,
@@ -76,7 +77,6 @@ def run_executor(settings: Settings) -> None:
             reason="startup", event_time_ms=time.time_ns() // 1_000_000
         )
         health = OperationalHealthController(state, metrics)
-        event_applier = ExchangeEventApplier(state)
         metrics.reconciliation_divergences.set(len(reconciliation.divergences))
         metrics.sqlite_health.set(1)
         metrics.entries_allowed.set(int(state.entries_allowed))
@@ -93,22 +93,25 @@ def run_executor(settings: Settings) -> None:
             candidate.policy(),
             execution_costs=cost_snapshot.as_engine_costs(),
         )
-        runner = LiveEngineRunner(
-            engine=engine,
-            execution=ExecutionService(
-                state,
-                exchange,
-                ExecutionLimits(
-                    step_size=Decimal(capabilities.step_size),
-                    min_notional=Decimal(capabilities.min_notional),
-                    tick_size=Decimal(capabilities.tick_size),
-                    max_quantity=Decimal(capabilities.max_quantity),
-                    max_notional=Decimal(capabilities.max_notional),
-                ),
-                metrics=metrics,
+        execution = ExecutionService(
+            state,
+            exchange,
+            ExecutionLimits(
+                step_size=Decimal(capabilities.step_size),
+                min_notional=Decimal(capabilities.min_notional),
+                tick_size=Decimal(capabilities.tick_size),
+                max_quantity=Decimal(capabilities.max_quantity),
+                max_notional=Decimal(capabilities.max_notional),
             ),
-            durable_state=state,
+            metrics=metrics,
         )
+        event_applier = ExchangeEventApplier(
+            state,
+            reprotect_position=lambda event_time_ms: execution.reprotect_position(
+                event_time_ms=event_time_ms
+            ),
+        )
+        runner = LiveEngineRunner(engine=engine, execution=execution, durable_state=state)
         soak = DurableTestnetSoak(
             settings.state_path.with_name("testnet-soak.db"),
             candidate_identity=candidate.candidate_identity,
@@ -179,9 +182,15 @@ def run_executor(settings: Settings) -> None:
 
         storage_ok = True
         notification_ok = True
+        dependency_status = {dependency: False for dependency in candidate.market_data_dependencies}
+
+        def mark_dependencies_unavailable() -> None:
+            for dependency in dependency_status:
+                dependency_status[dependency] = False
 
         def reconcile_after_reconnect() -> None:
             nonlocal reconciliation
+            mark_dependencies_unavailable()
             event_applier.stream_lost(
                 event_time_ms=time.time_ns() // 1_000_000,
                 reason="market-data-stream reconnect",
@@ -196,6 +205,7 @@ def run_executor(settings: Settings) -> None:
             )
 
         def market_stream_disconnected(reason: str) -> None:
+            mark_dependencies_unavailable()
             event_applier.stream_lost(event_time_ms=time.time_ns() // 1_000_000, reason=reason)
 
         try:
@@ -205,6 +215,17 @@ def run_executor(settings: Settings) -> None:
                 on_reconnect=reconcile_after_reconnect,
             ):
                 now_ms = time.time_ns() // 1_000_000
+                if isinstance(event, CandleClosed):
+                    if "closed-1m-klines" in dependency_status:
+                        dependency_status["closed-1m-klines"] = True
+                elif isinstance(event, MarketTick):
+                    for dependency in ("aggTrades", "tradeTicks"):
+                        if dependency in dependency_status:
+                            dependency_status[dependency] = True
+                prior_entry_id: str | None = None
+                prior_position = state.position()
+                if prior_position is not None:
+                    prior_entry_id = state.position_entry_client_order_id()
                 drain_user_events(now_ms)
                 health.apply(
                     HealthSignals(
@@ -212,16 +233,10 @@ def run_executor(settings: Settings) -> None:
                         reconciliation_ok=reconciliation.consistent,
                         storage_ok=storage_ok,
                         notification_ok=notification_ok,
-                        dependency_status={
-                            dependency: True for dependency in candidate.market_data_dependencies
-                        },
+                        dependency_status=dependency_status,
                     ),
                     event_time_ms=now_ms,
                 )
-                prior_entry_id: str | None = None
-                prior_position = state.position()
-                if prior_position is not None:
-                    prior_entry_id = state.position_entry_client_order_id()
                 runner.process(event)
                 if prior_entry_id is not None and state.position() is None:
                     try:

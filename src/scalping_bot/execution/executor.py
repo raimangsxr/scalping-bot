@@ -715,6 +715,32 @@ class ExecutionService:
             },
         )
 
+    def reprotect_position(self, *, event_time_ms: int) -> None:
+        """Replace protection after an asynchronous partial exit fill."""
+        position = self.state.position()
+        if position is None:
+            return
+        entry_identity = self.state.position_entry_client_order_id()
+        protection = self.state.protection(entry_identity)
+        if protection is None:
+            self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
+            raise RuntimeError("partial streamed exit has no protection to replace")
+        try:
+            self.exchange.cancel_protection(client_order_id=str(protection["client_order_id"]))
+        except Exception as error:
+            self.state.set_operating_mode(OperationalMode.FLATTEN_AND_LOCK)
+            raise RuntimeError("partial streamed exit protection could not be canceled") from error
+        self.place_protection(
+            PlaceProtection(
+                client_order_id=str(protection["client_order_id"]),
+                parent_client_order_id=entry_identity,
+                quantity=Decimal(str(position["quantity"])),
+                stop_price=Decimal(str(protection["stop_price"])),
+                take_profit_price=Decimal(str(protection["take_profit_price"])),
+            ),
+            event_time_ms=event_time_ms,
+        )
+
     def _flatten_and_lock(
         self,
         parent_client_order_id: str,

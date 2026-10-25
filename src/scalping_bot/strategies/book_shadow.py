@@ -40,6 +40,9 @@ class ShadowBookConfirmation:
         return ShadowDecision(hypothetical_allow=allow)
 
 
+DEFAULT_BOOK_CONFIRMATION_IMBALANCE = Decimal("0.10")
+
+
 @dataclass(frozen=True)
 class BookShadowObservation:
     event_time_ms: int
@@ -103,7 +106,10 @@ class BookShadowEvaluator:
         confirmation: ShadowBookConfirmation | None = None,
     ) -> "BookShadowEvaluator":
         """Derive prospective observations directly from immutable capture segments."""
-        evaluator = cls(confirmation)
+        evaluator = cls(
+            confirmation
+            or ShadowBookConfirmation(min_imbalance=DEFAULT_BOOK_CONFIRMATION_IMBALANCE)
+        )
         ledger = CaptureLedger(store)
         depth_catalog = ledger.catalog(depth_stream)
         trade_catalog = ledger.catalog(trade_stream)
@@ -117,8 +123,14 @@ class BookShadowEvaluator:
             segment = entry.segment
             if segment.gap_before_ms is not None:
                 evaluator.record_gap()
+                book = LocalOrderBook("BTCUSDT")
+                previous_bid_depth = Decimal(0)
+                previous_ask_depth = Decimal(0)
             if not segment.valid:
                 evaluator.record_gap()
+                book = LocalOrderBook("BTCUSDT")
+                previous_bid_depth = Decimal(0)
+                previous_ask_depth = Decimal(0)
                 continue
             for item in _segment_events(store, segment.object_key):
                 event_type = str(item.get("event_type", ""))

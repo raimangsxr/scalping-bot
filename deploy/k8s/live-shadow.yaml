@@ -14,7 +14,7 @@ spec:
   template:
     metadata:
       annotations:
-        scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-080dd1e71de026002e966fb959a10293101aa183.spdx.json
+        scalping-bot.io/sbom: ghcr.io/raimangsxr/scalping-bot:git-c22954797b144330c93a1973dab37c92a013fe21.spdx.json
       labels:
         app.kubernetes.io/name: scalping-bot
         app.kubernetes.io/component: live-shadow
@@ -26,7 +26,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: live-shadow
-          image: ghcr.io/raimangsxr/scalping-bot:git-080dd1e71de026002e966fb959a10293101aa183
+          image: ghcr.io/raimangsxr/scalping-bot:git-c22954797b144330c93a1973dab37c92a013fe21
           imagePullPolicy: IfNotPresent
           args: ["run-live-shadow"]
           readinessProbe:

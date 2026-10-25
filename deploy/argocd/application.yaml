@@ -4,7 +4,7 @@ metadata:
   name: scalping-bot
   namespace: argocd
   annotations:
-    scalping-bot.io/release-image-commit: 080dd1e71de026002e966fb959a10293101aa183
+    scalping-bot.io/release-image-commit: c22954797b144330c93a1973dab37c92a013fe21
 spec:
   project: default
   source:

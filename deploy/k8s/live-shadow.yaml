@@ -1,3 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: scalping-bot-live-shadow-metrics
+  namespace: scalping-bot
+spec:
+  selector:
+    app.kubernetes.io/name: scalping-bot
+    app.kubernetes.io/component: live-shadow
+  ports:
+    - name: metrics
+      port: 8002
+      targetPort: metrics
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,6 +43,9 @@ spec:
           image: ghcr.io/raimangsxr/scalping-bot:git-22967503c849b168e65b5d5b06f8d07b15f4a205
           imagePullPolicy: IfNotPresent
           args: ["run-live-shadow"]
+          ports:
+            - name: metrics
+              containerPort: 8002
           readinessProbe:
             exec:
               command: ["python", "-m", "scalping_bot.health", "/app/state/live-shadow.db", "--live-shadow"]

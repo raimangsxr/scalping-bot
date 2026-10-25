@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -146,6 +147,35 @@ class FinalHoldoutGate:
             f"final-holdout/{candidate.identity}/{hashlib.sha256(report.encode()).hexdigest()}.md"
         )
         self.store.put_immutable(report_key, report.encode())
+        digest = report_key.rsplit("/", 1)[-1].removesuffix(".md")
+        machine = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_identity": candidate.identity,
+                    "decision": decision,
+                    "reasons": list(reasons),
+                    "holdout_dataset_checksum": holdout_dataset_checksum,
+                    "reveal_key": reveal_key,
+                    "candidate_manifest_key": manifest_key,
+                    "report_sha256": digest,
+                    "report": report,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        self.store.put_immutable(report_key.removesuffix(".md") + ".json", machine)
+        self.store.put_immutable(
+            report_key.removesuffix(".md") + ".html",
+            (
+                '<!doctype html><html><head><meta charset="utf-8">'
+                "<title>Final Holdout decision</title></head><body><pre>"
+                + html.escape(report)
+                + "</pre></body></html>\n"
+            ).encode(),
+        )
         return FinalHoldoutDecision(
             candidate_identity=candidate.identity,
             decision=decision,

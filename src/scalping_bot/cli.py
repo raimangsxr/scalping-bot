@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from prometheus_client import start_http_server
 
 from scalping_bot import __version__
 from scalping_bot.config import Settings
@@ -42,6 +43,7 @@ from scalping_bot.operations.live_shadow_runtime import (
     SharedEngineLiveShadow,
     parse_shadow_event,
 )
+from scalping_bot.operations.observability import OperationalMetrics
 from scalping_bot.operations.operator_channel import OperatorCommandStore
 from scalping_bot.operations.promoted_risk_trial import run_promoted_risk_trial
 from scalping_bot.operations.promotion import PromotedRiskGate, RiskEvaluation
@@ -91,8 +93,11 @@ def collect_live(
     s3_prefix: Annotated[str, typer.Option("--s3-prefix")] = "",
     s3_endpoint: Annotated[str | None, typer.Option("--s3-endpoint")] = None,
     s3_region: Annotated[str | None, typer.Option("--s3-region")] = None,
+    metrics_port: Annotated[int, typer.Option("--metrics-port")] = 8001,
 ) -> None:
     """Continuously capture public production Trade Flow and Book Flow."""
+    metrics = OperationalMetrics()
+    start_http_server(metrics_port, registry=metrics.registry)
     collector = BinancePublicCollector(
         object_store(
             local_root=storage,
@@ -100,7 +105,8 @@ def collect_live(
             prefix=s3_prefix,
             endpoint_url=s3_endpoint,
             region_name=s3_region,
-        )
+        ),
+        metrics=metrics,
     )
     asyncio.run(collector.run_forever())
 
@@ -498,12 +504,15 @@ def run_live_shadow(
     state: Path = Path("state/live-shadow.db"),
     event_file: Annotated[Path | None, typer.Option(exists=True, readable=True)] = None,
     finalize_at_ms: Annotated[int | None, typer.Option()] = None,
+    metrics_port: Annotated[int, typer.Option("--metrics-port")] = 8002,
 ) -> None:
     """Run restartable no-order Live Shadow from production or raw event observations."""
     settings = Settings()
     if settings.candidate_manifest is None or settings.cost_model_snapshot is None:
         raise RuntimeError("Live Shadow requires a Testnet Ready candidate and cost snapshot")
     store = LocalObjectStore(state.parent / "live-shadow-artifacts")
+    metrics = OperationalMetrics()
+    start_http_server(metrics_port, registry=metrics.registry)
     process = DurableLiveShadow(
         state,
         candidate_manifest=settings.candidate_manifest,
@@ -515,6 +524,7 @@ def run_live_shadow(
         process,
         candidate_manifest=settings.candidate_manifest,
         cost_model=Path(settings.cost_model_snapshot),
+        metrics=metrics,
     )
     try:
         if event_file is not None:
@@ -685,8 +695,7 @@ def evaluate_promoted_risk(
         promotion_artifact_key=promotion_artifact_key,
         soak_report_key=soak_report_key,
     )
-    report_key = f"{result.manifest_key.removesuffix('.json')}.md"
-    store.put_immutable(report_key, result.report.encode())
+    report_key = gate.persist_report(result)
     typer.echo(f"promoted-risk={report_key} accepted={result.accepted}")
 
 
@@ -718,8 +727,7 @@ def run_promoted_risk_trial_command(
         testnet_promoted_path=testnet_promoted,
         code_commit=code_commit,
     )
-    report_key = f"{trial.result.manifest_key.removesuffix('.json')}.md"
-    LocalObjectStore(artifacts).put_immutable(report_key, trial.result.report.encode())
+    report_key = PromotedRiskGate(LocalObjectStore(artifacts)).persist_report(trial.result)
     typer.echo(
         f"promoted-risk={report_key} accepted={trial.result.accepted} "
         f"baseline-risk={trial.result.proven_baseline_risk}"

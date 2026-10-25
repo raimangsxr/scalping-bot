@@ -85,3 +85,8 @@ def test_final_holdout_reveal_creates_one_decision_and_ready_manifest(tmp_path: 
     assert decision.decision == "Testnet Ready"
     assert decision.candidate_manifest_key is not None
     assert store.read(decision.report_key).decode().find("Research Target") >= 0
+    identity = decision.report_key.rsplit("/", 1)[-1].removesuffix(".md")
+    assert store.read(f"final-holdout/{_finalist().identity}/{identity}.html")
+    assert '"decision":"Testnet Ready"' in store.read(
+        f"final-holdout/{_finalist().identity}/{identity}.json"
+    ).decode()

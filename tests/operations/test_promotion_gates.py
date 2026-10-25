@@ -264,6 +264,10 @@ def test_live_shadow_report_can_be_saved_as_an_immutable_artifact(tmp_path: Path
     key = gate.persist_report(result, LocalObjectStore(tmp_path))
 
     assert (tmp_path / key).read_text(encoding="utf-8") == result.report
+    identity = key.rsplit("/", 1)[-1].removesuffix(".md")
+    machine = json.loads((tmp_path / f"live-shadow/momentum-001-v1/{identity}.json").read_text())
+    assert machine["report_sha256"] == identity
+    assert (tmp_path / f"live-shadow/momentum-001-v1/{identity}.html").is_file()
 
 
 def test_live_shadow_runner_emits_hypothetical_commands_without_an_exchange() -> None:
@@ -401,6 +405,20 @@ def test_critical_soak_incident_requires_regression_and_restarts_stability() -> 
     gate.begin_continuous(now_ms=13 * DAY, alerts_verified=True)
 
 
+def test_testnet_soak_report_has_machine_and_html_sidecars(tmp_path: Path) -> None:
+    gate = SoakGate(candidate_identity="momentum-001-v1", started_ms=0)
+    result = gate.evaluate(now_ms=1)
+    key = gate.persist_report(result, LocalObjectStore(tmp_path))
+
+    identity = key.rsplit("/", 1)[-1].removesuffix(".md")
+    machine = json.loads(
+        (tmp_path / f"testnet-soak/momentum-001-v1/{identity}.json").read_text()
+    )
+    assert machine["complete"] is False
+    assert machine["report_sha256"] == identity
+    assert (tmp_path / f"testnet-soak/momentum-001-v1/{identity}.html").is_file()
+
+
 def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: Path) -> None:
     store = LocalObjectStore(tmp_path)
     promotion_content = json.dumps(
@@ -509,6 +527,9 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
     assert (tmp_path / result.manifest_key).exists()
     assert result.baseline_preserved
     assert "0.25%" in result.report
+    report_key = gate.persist_report(result)
+    assert (tmp_path / report_key).read_text(encoding="utf-8") == result.report
+    assert (tmp_path / report_key.replace(".md", ".html")).is_file()
 
 
 def test_promoted_risk_rejects_changed_rules_or_deteriorated_limits(tmp_path: Path) -> None:

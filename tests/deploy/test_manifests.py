@@ -89,3 +89,21 @@ def test_executor_and_gate_use_the_same_immutable_image_reference() -> None:
     )
     assert len(revision) == 40
     int(revision, 16)
+
+
+def test_collector_and_live_shadow_publish_distinct_metrics_ports() -> None:
+    collector = _documents("deploy/k8s/collector.yaml")
+    shadow = _documents("deploy/k8s/live-shadow.yaml")
+    collector_service = next(item for item in collector if item["kind"] == "Service")
+    collector_deployment = next(item for item in collector if item["kind"] == "Deployment")
+    shadow_service = next(item for item in shadow if item["kind"] == "Service")
+    shadow_deployment = next(item for item in shadow if item["kind"] == "Deployment")
+
+    assert collector_service["spec"]["ports"][0]["port"] == 8001
+    assert collector_deployment["spec"]["template"]["spec"]["containers"][0]["ports"][0][
+        "containerPort"
+    ] == 8001
+    assert shadow_service["spec"]["ports"][0]["port"] == 8002
+    assert shadow_deployment["spec"]["template"]["spec"]["containers"][0]["ports"][0][
+        "containerPort"
+    ] == 8002

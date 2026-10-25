@@ -14,6 +14,7 @@ import websockets
 from scalping_bot.data.book import BookGap, LocalOrderBook
 from scalping_bot.data.capture import CaptureHealth, CaptureLedger, RawSegmentWriter
 from scalping_bot.data.storage import ObjectStore
+from scalping_bot.operations.observability import OperationalMetrics
 
 PRODUCTION_PUBLIC_REST = "https://api.binance.com"
 PRODUCTION_PUBLIC_STREAM = (
@@ -97,10 +98,12 @@ class BinancePublicCollector:
         *,
         clock_ms: Callable[[], int] | None = None,
         segment_event_limit: int = 100_000,
+        metrics: OperationalMetrics | None = None,
     ) -> None:
         self.store = store
         self.clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self.segment_event_limit = segment_event_limit
+        self.metrics = metrics
         self.health = CaptureHealth()
         self.ledger = CaptureLedger(store)
         self.book = LocalOrderBook("BTCUSDT")
@@ -253,6 +256,18 @@ class BinancePublicCollector:
         ):
             return
         status = self.health.status(now_ms=now_ms)
+        if self.metrics is not None:
+            freshness = status.get("freshness_ms")
+            if isinstance(freshness, int):
+                self.metrics.market_data_freshness_ms.set(freshness)
+            gaps = status.get("gaps", 0)
+            storage_failures = status.get("storage_failures", 0)
+            self.metrics.market_data_gaps_total.set(
+                float(gaps) if isinstance(gaps, (int, float)) else 0
+            )
+            self.metrics.storage_health.set(
+                float(not bool(storage_failures))
+            )
         payload = {
             "schema_version": 1,
             "recorded_ms": now_ms,

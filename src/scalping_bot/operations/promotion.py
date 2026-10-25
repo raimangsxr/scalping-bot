@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -181,6 +182,33 @@ class LiveShadowGate:
     def persist_report(self, result: LiveShadowResult, store: ObjectStore) -> str:
         key = _report_key("live-shadow", self.candidate_identity, result.report)
         store.put_immutable(key, result.report.encode())
+        digest = key.rsplit("/", 1)[-1].removesuffix(".md")
+        machine = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_identity": self.candidate_identity,
+                    "candidate_manifest_sha256": self.candidate_manifest_sha256,
+                    "approved": result.approved,
+                    "reasons": list(result.reasons),
+                    "report_sha256": digest,
+                    "report": result.report,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        store.put_immutable(key.removesuffix(".md") + ".json", machine)
+        store.put_immutable(
+            key.removesuffix(".md") + ".html",
+            (
+                '<!doctype html><html><head><meta charset="utf-8">'
+                "<title>Live Shadow report</title></head><body><pre>"
+                + html.escape(result.report)
+                + "</pre></body></html>\n"
+            ).encode(),
+        )
         return key
 
     def _unresolved_divergences(self) -> set[str]:
@@ -369,6 +397,32 @@ class SoakGate:
     def persist_report(self, result: SoakResult, store: ObjectStore) -> str:
         key = _report_key("testnet-soak", self.candidate_identity, result.report)
         store.put_immutable(key, result.report.encode())
+        digest = key.rsplit("/", 1)[-1].removesuffix(".md")
+        machine = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_identity": self.candidate_identity,
+                    "complete": result.complete,
+                    "reasons": list(result.reasons),
+                    "report_sha256": digest,
+                    "report": result.report,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        store.put_immutable(key.removesuffix(".md") + ".json", machine)
+        store.put_immutable(
+            key.removesuffix(".md") + ".html",
+            (
+                '<!doctype html><html><head><meta charset="utf-8">'
+                "<title>Testnet Soak report</title></head><body><pre>"
+                + html.escape(result.report)
+                + "</pre></body></html>\n"
+            ).encode(),
+        )
         return key
 
     def _supervision_covers(self, start_ms: int, end_ms: int) -> bool:
@@ -526,6 +580,22 @@ class PromotedRiskGate:
         reasons: list[str] = []
         self._check_soak_reference(key, candidate_identity, reasons)
         return not reasons
+
+    def persist_report(self, result: PromotedRiskResult) -> str:
+        """Publish human-readable sidecars for the already immutable decision."""
+        base = result.manifest_key.removesuffix(".json")
+        markdown_key = base + ".md"
+        self.store.put_immutable(markdown_key, result.report.encode())
+        self.store.put_immutable(
+            base + ".html",
+            (
+                '<!doctype html><html><head><meta charset="utf-8">'
+                "<title>Promoted Position Risk decision</title></head><body><pre>"
+                + html.escape(result.report)
+                + "</pre></body></html>\n"
+            ).encode(),
+        )
+        return markdown_key
 
     def evaluate(
         self,

@@ -29,6 +29,7 @@ from scalping_bot.domain.state import InMemoryState
 from scalping_bot.execution.candidate import PromotedCandidateManifest
 from scalping_bot.execution.live import _parse_market_message
 from scalping_bot.operations.durable_shadow import DurableLiveShadow
+from scalping_bot.operations.observability import OperationalMetrics
 from scalping_bot.operations.promotion import LiveReplayComparison
 
 PRODUCTION_SHADOW_STREAM = (
@@ -127,6 +128,7 @@ class SharedEngineLiveShadow:
         candidate_manifest: Path,
         cost_model: Path,
         initial_equity: Decimal = Decimal("10000"),
+        metrics: OperationalMetrics | None = None,
     ) -> None:
         candidate = PromotedCandidateManifest.load(candidate_manifest)
         snapshot = ExecutionCostSnapshot.load(cost_model)
@@ -134,6 +136,7 @@ class SharedEngineLiveShadow:
             raise ValueError("Live Shadow candidate and cost model identities do not match")
         costs = snapshot.as_engine_costs()
         self.process = process
+        self.metrics = metrics
         self.live = Engine(
             InMemoryState(initial_equity=initial_equity), candidate.policy(), execution_costs=costs
         )
@@ -152,6 +155,7 @@ class SharedEngineLiveShadow:
         self.process_replay_event(
             self._replay_adapter.adapt(event), receipt_time_ms=receipt_time_ms
         )
+        self._publish_metrics(receipt_time_ms)
 
     def process_live_event(self, event: EngineEvent, *, receipt_time_ms: int) -> None:
         self._process_lane(
@@ -251,6 +255,19 @@ class SharedEngineLiveShadow:
             )
         )
 
+    def _publish_metrics(self, now_ms: int) -> None:
+        if self.metrics is None:
+            return
+        status = self.process.health_status(now_ms=now_ms)
+        freshness = status.get("freshness_ms")
+        if isinstance(freshness, int):
+            self.metrics.market_data_freshness_ms.set(freshness)
+        self.metrics.market_data_gaps_total.set(
+            float(bool(status.get("continuity_broken")))
+        )
+        self.metrics.entries_allowed.set(0)
+        self.metrics.operating_mode.set(1 if bool(status.get("healthy")) else 2)
+
 
 class ProductionLiveShadowStream:
     """One reconnectable public stream fanned out into two no-order lanes."""
@@ -302,6 +319,7 @@ class ProductionLiveShadowStream:
             event_time_ms=event_time_ms,
             dependency=dependency,
         )
+        self.runner._publish_metrics(event_time_ms)
 
 
 def parse_shadow_event(

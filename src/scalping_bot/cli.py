@@ -326,12 +326,12 @@ def run_live_shadow(
 @app.command()
 def evaluate_book_shadow(
     storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
-    min_imbalance: Annotated[Decimal, typer.Option()] = DEFAULT_BOOK_CONFIRMATION_IMBALANCE,
+    min_imbalance: Annotated[str, typer.Option()] = str(DEFAULT_BOOK_CONFIRMATION_IMBALANCE),
 ) -> None:
     """Build non-promotable Book Flow Shadow evidence from captured segments."""
     store = LocalObjectStore(storage)
     evaluator = BookShadowEvaluator.from_capture(
-        store, confirmation=ShadowBookConfirmation(min_imbalance=min_imbalance)
+        store, confirmation=ShadowBookConfirmation(min_imbalance=Decimal(min_imbalance))
     )
     typer.echo(f"book-shadow-report={evaluator.persist_report(store)}")
 

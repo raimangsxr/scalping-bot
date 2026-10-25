@@ -43,6 +43,7 @@ class ResearchRunManifest:
     random_seed: int
     schema_version: int = 1
     dataset_derived_keys: tuple[str, ...] = ()
+    dataset_bindings: tuple[tuple[str, str, str], ...] = ()
 
     @classmethod
     def create(
@@ -67,6 +68,7 @@ class ResearchRunManifest:
         _verify_content_addressed_key(execution_cost_model_key, cost_model, "cost model")
         dataset_checksums = [hashlib.sha256(dataset).hexdigest()]
         dataset_derived_keys: tuple[str, ...] = ()
+        dataset_bindings: tuple[tuple[str, str, str], ...] = ()
         dataset_is_json = dataset.lstrip().startswith(b"{")
         cost_model_is_json = cost_model.lstrip().startswith(b"{")
         if dataset_catalog_key.startswith("catalogs/research-market/") and dataset_is_json:
@@ -76,9 +78,14 @@ class ResearchRunManifest:
             _require_research_months(selected)
             _verify_archive_provenance(store, selected)
             dataset_checksums.extend(sorted({entry.source_sha256 for entry in selected}))
-            dataset_derived_keys = tuple(
-                sorted(derived_key for entry in selected for derived_key in entry.derived_keys)
+            dataset_bindings = tuple(
+                sorted(
+                    (derived_key, entry.period, entry.month)
+                    for entry in selected
+                    for derived_key in entry.derived_keys
+                )
             )
+            dataset_derived_keys = tuple(item[0] for item in dataset_bindings)
             for derived_key in dataset_derived_keys:
                 dataset_checksums.append(hashlib.sha256(store.read(derived_key)).hexdigest())
         if execution_cost_model_key.startswith("cost-models/") and cost_model_is_json:
@@ -93,6 +100,7 @@ class ResearchRunManifest:
             period=period,
             random_seed=random_seed,
             dataset_derived_keys=dataset_derived_keys,
+            dataset_bindings=dataset_bindings,
         )
 
     def canonical_bytes(self) -> bytes:
@@ -128,6 +136,14 @@ class ResearchRunManifest:
             or not all(isinstance(item, str) for item in period)
         ):
             raise ValueError("research run manifest contains malformed inputs")
+        raw_bindings = value.get("dataset_bindings", [])
+        if not isinstance(raw_bindings, list) or any(
+            not isinstance(item, list)
+            or len(item) != 3
+            or not all(isinstance(part, str) and part for part in item)
+            for item in raw_bindings
+        ):
+            raise ValueError("research run manifest contains malformed dataset role bindings")
         manifest = cls(
             code_commit=str(value["code_commit"]),
             dataset_catalog_key=str(value["dataset_catalog_key"]),
@@ -139,6 +155,9 @@ class ResearchRunManifest:
             random_seed=int(str(value["random_seed"])),
             schema_version=int(str(value.get("schema_version", 1))),
             dataset_derived_keys=tuple(str(item) for item in value.get("dataset_derived_keys", [])),
+            dataset_bindings=tuple(
+                (str(item[0]), str(item[1]), str(item[2])) for item in raw_bindings
+            ),
         )
         if manifest.identity != expected:
             raise ValueError("research run manifest canonical identity is invalid")
@@ -161,7 +180,16 @@ class ResearchRunManifest:
             expected_derived_keys = tuple(
                 sorted(derived_key for entry in selected for derived_key in entry.derived_keys)
             )
-            if expected_derived_keys != tuple(sorted(self.dataset_derived_keys)):
+            expected_bindings = tuple(
+                sorted(
+                    (derived_key, entry.period, entry.month)
+                    for entry in selected
+                    for derived_key in entry.derived_keys
+                )
+            )
+            if expected_derived_keys != tuple(
+                sorted(self.dataset_derived_keys)
+            ) or expected_bindings != tuple(sorted(self.dataset_bindings)):
                 return False
             checksums.extend(sorted({entry.source_sha256 for entry in selected}))
             for derived_key in self.dataset_derived_keys:
@@ -174,10 +202,36 @@ class ResearchRunManifest:
     def verify_candidate_batch(self, candidate_batch: CandidateBatch) -> bool:
         return _candidate_batch_sha256(candidate_batch) == self.candidate_batch_sha256
 
-    def verify_dataset_paths(self, paths: tuple[Path, ...], store: ObjectStore) -> bool:
+    def verify_dataset_paths(
+        self,
+        paths: tuple[Path, ...],
+        store: ObjectStore,
+        *,
+        historical_paths: tuple[Path, ...] = (),
+    ) -> bool:
         """Allow only Parquet files whose bytes are bound by the catalog."""
         if not self.dataset_derived_keys or not paths:
             return False
+        if self.dataset_bindings:
+            expected_by_period: dict[str, list[str]] = {}
+            for derived_key, period, _month in self.dataset_bindings:
+                expected_by_period.setdefault(period, []).append(
+                    hashlib.sha256(store.read(derived_key)).hexdigest()
+                )
+            actual_by_period = {
+                PRIMARY_RESEARCH.name: [
+                    hashlib.sha256(path.read_bytes()).hexdigest() for path in paths
+                ],
+                HISTORICAL_STRESS.name: [
+                    hashlib.sha256(path.read_bytes()).hexdigest() for path in historical_paths
+                ],
+            }
+            return all(
+                sorted(actual_by_period.get(period, ())) == sorted(expected)
+                and len(actual_by_period.get(period, ()))
+                == len(set(actual_by_period.get(period, ())))
+                for period, expected in expected_by_period.items()
+            )
         expected = sorted(
             hashlib.sha256(store.read(key)).hexdigest() for key in self.dataset_derived_keys
         )
@@ -587,8 +641,7 @@ def _verify_archive_provenance(
         except (KeyError, OSError) as error:
             raise ValueError("research catalog raw archive is unavailable") from error
         if tuple(entry.derived_keys) != tuple(
-            str(raw_manifest.get("parquet_key"))
-            for _ in entry.derived_keys
+            str(raw_manifest.get("parquet_key")) for _ in entry.derived_keys
         ):
             raise ValueError("research catalog derived artifact is not bound to its manifest")
         try:

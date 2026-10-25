@@ -130,6 +130,8 @@ class SharedEngineLiveShadow:
     ) -> None:
         candidate = PromotedCandidateManifest.load(candidate_manifest)
         snapshot = ExecutionCostSnapshot.load(cost_model)
+        if candidate.execution_cost_model_identity != snapshot.snapshot_id:
+            raise ValueError("Live Shadow candidate and cost model identities do not match")
         costs = snapshot.as_engine_costs()
         self.process = process
         self.live = Engine(

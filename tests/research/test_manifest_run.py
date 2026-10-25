@@ -218,7 +218,10 @@ def test_book_shadow_can_derive_valid_observations_from_capture_segments(tmp_pat
     depth_segment = depth_writer.close(valid=True)
     ledger.record(depth_segment, health={})
 
-    evaluator = BookShadowEvaluator.from_capture(store)
+    evaluator = BookShadowEvaluator.from_capture(
+        store,
+        entry_proposal=lambda _event_time_ms, _features: True,
+    )
     report = evaluator.report()
 
     assert report.observations == 1

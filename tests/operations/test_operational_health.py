@@ -34,6 +34,26 @@ def test_operational_health_fails_closed_and_records_redacted_transition(tmp_pat
         assert "operational-health-degraded" in state.audit_kinds()
 
 
+def test_operational_health_blocks_entries_when_either_exchange_stream_is_down(
+    tmp_path: Path,
+) -> None:
+    with SQLiteState(tmp_path / "state.db") as state:
+        result = OperationalHealthController(state).apply(
+            HealthSignals(
+                market_data_freshness_ms=100,
+                persistence_ok=True,
+                storage_ok=True,
+                notification_ok=True,
+                reconciliation_ok=True,
+                exchange_streams_connected=False,
+            ),
+            event_time_ms=10,
+        )
+
+        assert not result.entries_allowed
+        assert "exchange event streams are not connected" in result.reasons
+
+
 def test_engine_blocks_a_proposal_when_its_declared_dependency_is_invalid() -> None:
     state = InMemoryState(initial_equity=Decimal("10000"))
     state.dependency_status["closed-1m-klines"] = False

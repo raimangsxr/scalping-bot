@@ -9,16 +9,50 @@ from pathlib import Path
 from scalping_bot.data.storage import LocalObjectStore
 
 
-def check(database: Path) -> None:
+def check(database: Path, *, require_running: bool = False) -> None:
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=1)
     try:
         if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise RuntimeError("SQLite quick check failed")
-        connection.execute(
-            "SELECT operating_mode FROM runtime_state WHERE singleton = 1"
+        runtime = connection.execute(
+            "SELECT operating_mode, entries_allowed FROM runtime_state WHERE singleton = 1"
         ).fetchone()
+        if runtime is None:
+            raise RuntimeError("executor runtime state is missing")
+        mode = str(runtime[0])
+        if require_running and mode != "RUNNING":
+            raise RuntimeError(f"executor operating mode is {mode}")
+        if require_running and not bool(runtime[1]):
+            raise RuntimeError("executor entries are not allowed")
+        reconciliation = connection.execute(
+            "SELECT consistent FROM reconciliations ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if reconciliation is None:
+            raise RuntimeError("executor has no reconciliation evidence")
+        if require_running and not bool(reconciliation[0]):
+            raise RuntimeError("executor reconciliation is divergent")
+        heartbeat = connection.execute(
+            "SELECT event_time_ms FROM audit_events WHERE kind = 'heartbeat' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        now_ms = time.time_ns() // 1_000_000
+        if heartbeat is None or not 0 <= now_ms - int(heartbeat[0]) <= 5_000:
+            raise RuntimeError("executor heartbeat is stale")
+        alert_failure = connection.execute(
+            "SELECT 1 FROM audit_events WHERE kind = 'critical-health-alert-failed' "
+            "AND id > COALESCE((SELECT id FROM audit_events WHERE kind = 'heartbeat' "
+            "ORDER BY id DESC LIMIT 1), 0) LIMIT 1"
+        ).fetchone()
+        if alert_failure is not None:
+            raise RuntimeError("executor critical notifications are unavailable")
     finally:
         connection.close()
+    backup = database.parent / "backups" / "latest.sqlite.fernet"
+    if not backup.exists():
+        raise RuntimeError("executor backup is missing")
+    age_seconds = time.time() - backup.stat().st_mtime
+    if not 0 <= age_seconds <= 2 * 300:
+        raise RuntimeError("executor backup is stale")
 
 
 def check_live_shadow(database: Path) -> None:
@@ -67,5 +101,7 @@ if __name__ == "__main__":
         check_live_shadow(database)
     elif len(sys.argv) > 2 and sys.argv[2] == "--collector":
         check_collector(database)
+    elif len(sys.argv) > 2 and sys.argv[2] == "--executor-ready":
+        check(database, require_running=True)
     else:
         check(database)

@@ -85,6 +85,7 @@ class BinanceTestnetUserDataStream:
         stop: threading.Event,
         *,
         on_disconnect: Callable[[str], None] | None = None,
+        on_connect: Callable[[], None] | None = None,
         on_reconnect: Callable[[], None] | None = None,
     ) -> Iterator[ExchangeEvent]:
         connected_once = False
@@ -97,6 +98,8 @@ class BinanceTestnetUserDataStream:
                     f"{self.endpoint}/ws/{key}", open_timeout=10, close_timeout=5
                 ) as websocket:
                     last_keepalive = time.monotonic()
+                    if on_connect is not None:
+                        on_connect()
                     if connected_once and on_reconnect is not None:
                         on_reconnect()
                     connected_once = True
@@ -133,9 +136,11 @@ class ExchangeEventApplier:
         state: SQLiteState,
         *,
         reprotect_position: Callable[[int], None] | None = None,
+        on_position_closed: Callable[[str, int, dict[str, object]], None] | None = None,
     ) -> None:
         self.state = state
         self.reprotect_position = reprotect_position
+        self.on_position_closed = on_position_closed
 
     def apply(self, event: ExchangeEvent) -> None:
         if isinstance(event, ExecutionReportEvent):
@@ -188,6 +193,7 @@ class ExchangeEventApplier:
         *,
         event_time_ms: int,
         reconcile: Callable[[], bool],
+        allow_entries: bool = True,
     ) -> bool:
         degraded = self.state.operating_mode is OperationalMode.DEGRADED
         consistent = reconcile()
@@ -196,8 +202,9 @@ class ExchangeEventApplier:
             event_time_ms=event_time_ms,
             details={"consistent": consistent},
         )
-        if not consistent:
+        if not consistent or not allow_entries:
             self.state.set_operating_mode(OperationalMode.DEGRADED)
+            self.state.set_entries_allowed(False)
         elif degraded:
             self.state.set_operating_mode(OperationalMode.RUNNING)
             self.state.set_entries_allowed(True)
@@ -244,9 +251,21 @@ class ExchangeEventApplier:
         if intent["side"] == "BUY":
             self.state.rebuild_position_from_order(event.client_order_id)
         elif intent["side"] == "SELL":
+            position_before = self.state.position()
+            entry_client_order_id = (
+                self.state.position_entry_client_order_id() if position_before is not None else None
+            )
             changed = self.state.apply_exit_fills(
                 event.client_order_id, event_time_ms=event.event_time_ms
             )
+            if (
+                changed
+                and entry_client_order_id is not None
+                and position_before is not None
+                and self.state.position() is None
+                and self.on_position_closed is not None
+            ):
+                self.on_position_closed(entry_client_order_id, event.event_time_ms, position_before)
             position = self.state.position()
             if changed and position is not None and not bool(position["protected"]):
                 if self.reprotect_position is None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Protocol
 
@@ -34,13 +37,28 @@ class LocalObjectStore:
 
     def put_immutable(self, key: str, content: bytes) -> Path:
         target = self.path(key)
-        if target.exists():
-            if target.read_bytes() != content:
-                raise ImmutableObjectError(f"immutable object differs: {key}")
-            return target
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        return target
+        # Publish through a hard link only after the complete temporary file has
+        # been flushed.  Unlike an exists-then-write sequence, link creation is
+        # atomic and two processes cannot overwrite an immutable object or make
+        # a reader observe a partially written object.
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", dir=target.parent
+        )
+        try:
+            with os.fdopen(file_descriptor, "wb") as temporary:
+                temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            try:
+                os.link(temporary_name, target)
+            except FileExistsError:
+                if target.read_bytes() != content:
+                    raise ImmutableObjectError(f"immutable object differs: {key}") from None
+            return target
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name)
 
     def read(self, key: str) -> bytes:
         return self.path(key).read_bytes()

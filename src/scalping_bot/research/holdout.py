@@ -127,7 +127,9 @@ class FinalHoldoutGate:
             )
             parameters = _concrete_parameters(ready.parameters)
             manifest_key = PromotedCandidateManifest.from_candidate(
-                ready, parameters=parameters
+                ready,
+                parameters=parameters,
+                execution_cost_model_identity=cost_identity,
             ).persist_store(self.store)
         report = _render_report(
             candidate,

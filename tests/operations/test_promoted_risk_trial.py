@@ -22,7 +22,9 @@ from scalping_bot.research.costs import (
 from scalping_bot.research.evidence import CandidateLifecycle
 
 
-def _ready_candidate_manifest(path: Path) -> PromotedCandidateManifest:
+def _ready_candidate_manifest(
+    path: Path, execution_cost_model_identity: str
+) -> PromotedCandidateManifest:
     candidate = first_batch().candidates[0]
     for lifecycle in (
         CandidateLifecycle.SPECIFIED,
@@ -35,6 +37,7 @@ def _ready_candidate_manifest(path: Path) -> PromotedCandidateManifest:
     manifest = PromotedCandidateManifest.from_candidate(
         candidate,
         parameters={"window_bars": 3, "threshold": "0.005"},
+        execution_cost_model_identity=execution_cost_model_identity,
     )
     manifest.persist(path)
     return manifest
@@ -118,8 +121,6 @@ def test_promoted_risk_trial_runs_both_risks_and_binds_immutable_manifests(
 ) -> None:
     store = LocalObjectStore(tmp_path / "objects")
     candidate_path = tmp_path / "candidate.json"
-    manifest = _ready_candidate_manifest(candidate_path)
-    promotion_key, soak_key = _promotion_and_soak(store, manifest)
     store.put_immutable("capture/immutable-segment", b"immutable capture segment\n")
     source_key = "testnet/source-evidence.json"
     store.put_immutable(source_key, b"immutable testnet source\n")
@@ -145,6 +146,9 @@ def test_promoted_risk_trial_runs_both_risks_and_binds_immutable_manifests(
     cost_key = ExecutionCostModelPublisher(store).publish(
         cost_model, source_evidence=("capture/immutable-segment",)
     )
+    cost_identity = json.loads(store.read(cost_key).decode())["sha256"]
+    manifest = _ready_candidate_manifest(candidate_path, cost_identity)
+    promotion_key, soak_key = _promotion_and_soak(store, manifest)
     historical_path = tmp_path / "historical.parquet"
     _historical_parquet(historical_path)
     baseline_path = tmp_path / "testnet-baseline.json"

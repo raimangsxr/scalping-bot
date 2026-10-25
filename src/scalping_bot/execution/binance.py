@@ -65,6 +65,8 @@ class SpotTransport(Protocol):
 
     def keepalive_listen_key(self, listen_key: str) -> None: ...
 
+    def close_listen_key(self, listen_key: str) -> None: ...
+
 
 class OfficialSpotTransport:
     """Contains every official Binance SDK type behind plain dictionaries."""
@@ -96,6 +98,15 @@ class OfficialSpotTransport:
     def keepalive_listen_key(self, listen_key: str) -> None:
         with httpx.Client(base_url=SPOT_REST_API_TESTNET_URL, timeout=10) as client:
             response = client.put(
+                "/api/v3/userDataStream",
+                params={"listenKey": listen_key},
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            response.raise_for_status()
+
+    def close_listen_key(self, listen_key: str) -> None:
+        with httpx.Client(base_url=SPOT_REST_API_TESTNET_URL, timeout=10) as client:
+            response = client.delete(
                 "/api/v3/userDataStream",
                 params={"listenKey": listen_key},
                 headers={"X-MBX-APIKEY": self._api_key},
@@ -311,6 +322,10 @@ class InMemorySpotTransport:
         return "in-memory-listen-key"
 
     def keepalive_listen_key(self, listen_key: str) -> None:
+        if listen_key != "in-memory-listen-key":
+            raise ValueError("unknown in-memory listen key")
+
+    def close_listen_key(self, listen_key: str) -> None:
         if listen_key != "in-memory-listen-key":
             raise ValueError("unknown in-memory listen key")
 

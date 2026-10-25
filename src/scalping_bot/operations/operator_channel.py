@@ -94,16 +94,22 @@ class OperatorCommandStore:
             raise ValueError("unsupported operator command")
         if kind in {"pause", "flatten-and-lock"} and not (reason or "").strip():
             raise ValueError("this operator command requires a reason")
-        cursor = self.connection.execute(
-            "INSERT INTO commands(kind, event_time_ms, reason, operator_confirmed) "
-            "VALUES (?, ?, ?, ?)",
-            (kind, event_time_ms, reason, operator_confirmed),
-        )
-        if cursor.lastrowid is None:
-            raise RuntimeError("SQLite did not return an operator command identifier")
-        command_id = int(cursor.lastrowid)
-        self._append_event(command_id, "ENQUEUED", event_time_ms, {})
-        return command_id
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.connection.execute(
+                "INSERT INTO commands(kind, event_time_ms, reason, operator_confirmed) "
+                "VALUES (?, ?, ?, ?)",
+                (kind, event_time_ms, reason, operator_confirmed),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite did not return an operator command identifier")
+            command_id = int(cursor.lastrowid)
+            self._append_event(command_id, "ENQUEUED", event_time_ms, {})
+            self.connection.execute("COMMIT")
+            return command_id
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def pending(self) -> tuple[OperatorCommand, ...]:
         return self._read("PENDING")
@@ -150,17 +156,34 @@ class OperatorCommandStore:
 
     def complete(self, command_id: int, *, error: str | None = None) -> None:
         status = "FAILED" if error else "APPLIED"
-        self.connection.execute(
-            "UPDATE commands SET status = ?, error = ?, claimed_ms = NULL "
-            "WHERE command_id = ? AND status IN ('PENDING', 'PROCESSING')",
-            (status, error, command_id),
-        )
-        self._append_event(
-            command_id,
-            status,
-            time.time_ns() // 1_000_000,
-            {"error": error} if error else {},
-        )
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT status, error FROM commands WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"unknown operator command: {command_id}")
+            current_status = str(row["status"])
+            if current_status in {"APPLIED", "FAILED"}:
+                if current_status == status and row["error"] == error:
+                    self.connection.execute("COMMIT")
+                    return
+                raise ValueError(f"operator command {command_id} is already terminal")
+            self.connection.execute(
+                "UPDATE commands SET status = ?, error = ?, claimed_ms = NULL "
+                "WHERE command_id = ? AND status IN ('PENDING', 'PROCESSING')",
+                (status, error, command_id),
+            )
+            self._append_event(
+                command_id,
+                status,
+                time.time_ns() // 1_000_000,
+                {"error": error} if error else {},
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def _append_event(
         self, command_id: int, event_type: str, event_time_ms: int, details: dict[str, object]

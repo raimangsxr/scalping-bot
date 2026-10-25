@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from statistics import pstdev
@@ -104,6 +105,7 @@ class BookShadowEvaluator:
         depth_stream: str = "btcusdt-depth-100ms",
         trade_stream: str = "btcusdt-aggTrade",
         confirmation: ShadowBookConfirmation | None = None,
+        entry_proposal: Callable[[int, BookFlowFeatures], bool] | None = None,
     ) -> "BookShadowEvaluator":
         """Derive prospective observations directly from immutable capture segments."""
         evaluator = cls(
@@ -189,12 +191,18 @@ class BookShadowEvaluator:
                         segment_id=book.segment_id,
                     )
                 )
+                proposal = (
+                    entry_proposal(event_time_ms, features) if entry_proposal is not None else False
+                )
                 evaluator.record(
+                    # Book Flow may only confirm or block a proposal supplied by
+                    # the frozen candidate evaluation.  It never invents the
+                    # baseline signal from trade-flow heuristics.
                     BookShadowObservation(
                         event_time_ms=event_time_ms,
                         features=features,
-                        baseline_entry=buy > sell and buy > 0,
-                        hypothetical_entry=buy > sell and buy > 0,
+                        baseline_entry=proposal,
+                        hypothetical_entry=proposal,
                     )
                 )
                 previous_bid_depth = current_bid_depth

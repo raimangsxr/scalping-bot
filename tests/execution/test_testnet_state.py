@@ -14,6 +14,7 @@ from scalping_bot.execution.binance import (
 )
 from scalping_bot.execution.reconcile import Reconciler
 from scalping_bot.execution.sqlite_state import SQLiteState, WriterAlreadyActive
+from scalping_bot.execution.testnet_contract import run_testnet_contract_scenarios
 
 
 class FakeTransport:
@@ -158,6 +159,56 @@ def test_in_memory_transport_covers_signed_adapter_order_and_protection_contract
     exit_result = adapter.flatten_market_sell(client_order_id="scalp-exit", quantity="0.01")
     assert exit_result.status == "FILLED"
     assert len(adapter.reconciliation_snapshot()["trades"]) == 2
+
+
+def test_testnet_contract_scenarios_are_explicit_and_cover_reconnect_and_round_trip() -> None:
+    transport = InMemorySpotTransport()
+    adapter = BinanceSpotTestnetAdapter(
+        endpoint="https://testnet.binance.vision", transport=transport
+    )
+    observed_listen_keys: list[str] = []
+
+    report = run_testnet_contract_scenarios(
+        adapter,
+        confirm_testnet=True,
+        execute_order_round_trip=True,
+        quantity="0.01",
+        reconnect_probe=observed_listen_keys.append,
+    )
+
+    assert report.order_round_trip_executed
+    assert report.reconnect_verified
+    assert observed_listen_keys == ["in-memory-listen-key"]
+    assert {
+        "exchange-info",
+        "account-commission",
+        "filters",
+        "rate-limits",
+        "account",
+        "open-orders",
+        "trades",
+        "user-data-listen-key",
+        "user-data-reconnect",
+        "order-submit",
+        "order-query",
+        "linked-protection",
+        "protection-cancel",
+        "order-flatten",
+        "flatten-query",
+    }.issubset(report.checks)
+
+
+def test_testnet_contract_scenarios_require_explicit_confirmation() -> None:
+    adapter = BinanceSpotTestnetAdapter(
+        endpoint="https://testnet.binance.vision", transport=InMemorySpotTransport()
+    )
+
+    with pytest.raises(PermissionError, match="explicit Testnet confirmation"):
+        run_testnet_contract_scenarios(
+            adapter,
+            confirm_testnet=False,
+            reconnect_probe=lambda _listen_key: None,
+        )
 
 
 def test_reconciliation_queries_unknown_order_and_rebuilds_exposure_after_restart(

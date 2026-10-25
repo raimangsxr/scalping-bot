@@ -51,9 +51,7 @@ def _stress_evidence(
             "cost_stress_passed": True,
             "operational_controls_passed": True,
             "concentration_passed": True,
-            "source_evidence": [
-                f"{source_key}#{hashlib.sha256(source_content).hexdigest()}"
-            ],
+            "source_evidence": [f"{source_key}#{hashlib.sha256(source_content).hexdigest()}"],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -464,8 +462,8 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
         position_risk=Decimal("0.005"),
         candidate_rules_sha256="rules-immutable",
         net_expectancy=Decimal("0.9"),
-        max_daily_loss=Decimal("0.019"),
-        max_drawdown=Decimal("0.09"),
+        max_daily_loss=Decimal("0.01"),
+        max_drawdown=Decimal("0.05"),
         notional_fraction=Decimal("0.5"),
         cost_stress_passed=True,
         operational_controls_passed=True,
@@ -477,9 +475,9 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
             candidate_rules_sha256="rules-immutable",
             sample="historical",
             position_risk="0.005",
-            net_expectancy="0.15",
-            max_daily_loss="0.019",
-            max_drawdown="0.09",
+            net_expectancy="0.25",
+            max_daily_loss="0.01",
+            max_drawdown="0.05",
         ),
         testnet_stress=_stress_evidence(
             tmp_path,
@@ -488,17 +486,13 @@ def test_promoted_risk_is_isolated_and_never_rescues_weak_expectancy(tmp_path: P
             candidate_rules_sha256="rules-immutable",
             sample="testnet",
             position_risk="0.005",
-            net_expectancy="0.2",
-            max_daily_loss="0.019",
-            max_drawdown="0.09",
+            net_expectancy="0.35",
+            max_daily_loss="0.01",
+            max_drawdown="0.05",
         ),
     )
-    baseline = _with_experiment_manifest(
-        store, baseline, candidate_identity="momentum-001-v1"
-    )
-    promoted = _with_experiment_manifest(
-        store, promoted, candidate_identity="momentum-001-v1"
-    )
+    baseline = _with_experiment_manifest(store, baseline, candidate_identity="momentum-001-v1")
+    promoted = _with_experiment_manifest(store, promoted, candidate_identity="momentum-001-v1")
 
     result = gate.evaluate(
         "momentum-001-v1",

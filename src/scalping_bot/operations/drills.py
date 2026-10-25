@@ -72,18 +72,38 @@ class OperationalDrillRunner:
         )
         return outcome
 
-    def release_verification(self, verification: ReleaseVerification) -> DrillOutcome:
+    def release_verification(
+        self,
+        verification: ReleaseVerification,
+        *,
+        measured_rpo_seconds: int | None = None,
+        measured_rto_seconds: int | None = None,
+    ) -> DrillOutcome:
+        if measured_rpo_seconds is not None and measured_rpo_seconds < 0:
+            raise ValueError("measured RPO cannot be negative")
+        if measured_rto_seconds is not None and measured_rto_seconds < 0:
+            raise ValueError("measured RTO cannot be negative")
+        if measured_rpo_seconds is None or measured_rto_seconds is None:
+            passed = False
+        else:
+            passed = (
+                measured_rpo_seconds <= EncryptedSQLiteBackup.RPO_SECONDS
+                and measured_rto_seconds <= EncryptedSQLiteBackup.RTO_SECONDS
+            )
         outcome = DrillOutcome(
             name="immutable-release-verification",
-            passed=True,
+            passed=passed,
             target_rpo_seconds=EncryptedSQLiteBackup.RPO_SECONDS,
             target_rto_seconds=EncryptedSQLiteBackup.RTO_SECONDS,
-            measured_rpo_seconds=None,
-            measured_rto_seconds=None,
+            measured_rpo_seconds=measured_rpo_seconds,
+            measured_rto_seconds=measured_rto_seconds,
             details={
                 "image_revision": verification.image_revision,
                 "target_revision": verification.target_revision,
                 "processes": sorted(verification.processes),
+                "environment_measurement_required": (
+                    measured_rpo_seconds is None or measured_rto_seconds is None
+                ),
             },
         )
         return outcome

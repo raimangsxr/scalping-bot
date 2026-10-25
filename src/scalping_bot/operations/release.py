@@ -105,6 +105,15 @@ class ReleaseVerifier:
         if not re.fullmatch(r"[0-9a-fA-F]{40}", target_revision):
             raise ReleaseVerificationError("ArgoCD release-manifest revision must be a full commit")
         application_annotations = self.application.get("metadata", {}).get("annotations", {})
+        declared_manifest_revision = (
+            application_annotations.get("scalping-bot.io/release-manifest-commit")
+            if isinstance(application_annotations, dict)
+            else None
+        )
+        if str(declared_manifest_revision).lower() != target_revision.lower():
+            raise ReleaseVerificationError(
+                "ArgoCD target revision and manifest commit annotation must match"
+            )
         declared_image_revision = (
             application_annotations.get("scalping-bot.io/release-image-commit")
             if isinstance(application_annotations, dict)

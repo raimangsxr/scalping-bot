@@ -17,7 +17,7 @@ from scalping_bot.research.evidence import CandidateLifecycle
 DAY = 86_400_000
 
 
-def _candidate_manifest(path: Path) -> None:
+def _candidate_manifest(path: Path, cost_identity: str) -> None:
     candidate = first_batch().candidates[0]
     for target in (
         CandidateLifecycle.SPECIFIED,
@@ -28,13 +28,20 @@ def _candidate_manifest(path: Path) -> None:
     ):
         candidate = candidate.transition(target, evidence="fixture")
     PromotedCandidateManifest.from_candidate(
-        candidate, parameters={"window_bars": 3, "threshold": "0.005"}
+        candidate,
+        parameters={"window_bars": 3, "threshold": "0.005"},
+        execution_cost_model_identity=cost_identity,
     ).persist(path)
 
 
-def _cost_snapshot(path: Path) -> None:
+def _cost_snapshot(path: Path) -> str:
+    source = b"shadow cost source\n"
+    source_hash = hashlib.sha256(source).hexdigest()
     value = {
         "captured_ms": 1,
+        "account_context": "testnet-shadow",
+        "calibration_method": "fixture-v1",
+        "source_evidence": [f"shadow-source#{source_hash}"],
         "commission_rate": "0.001",
         "buckets": [
             {
@@ -49,8 +56,10 @@ def _cost_snapshot(path: Path) -> None:
         ],
     }
     canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    value["sha256"] = hashlib.sha256(canonical).hexdigest()
+    identity = hashlib.sha256(canonical).hexdigest()
+    value["sha256"] = identity
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    return identity
 
 
 def _comparison(event_time_ms: int) -> LiveReplayComparison:
@@ -72,8 +81,8 @@ def test_live_shadow_state_survives_restart_and_only_finalizes_after_fourteen_da
 ) -> None:
     candidate_path = tmp_path / "candidate.json"
     cost_path = tmp_path / "cost.json"
-    _candidate_manifest(candidate_path)
-    _cost_snapshot(cost_path)
+    cost_identity = _cost_snapshot(cost_path)
+    _candidate_manifest(candidate_path, cost_identity)
     store = LocalObjectStore(tmp_path / "objects")
     process = DurableLiveShadow(
         tmp_path / "shadow.db",
@@ -102,8 +111,8 @@ def test_live_shadow_state_survives_restart_and_only_finalizes_after_fourteen_da
 def test_live_shadow_derives_comparisons_from_shared_engines_without_orders(tmp_path: Path) -> None:
     candidate_path = tmp_path / "candidate.json"
     cost_path = tmp_path / "cost.json"
-    _candidate_manifest(candidate_path)
-    _cost_snapshot(cost_path)
+    cost_identity = _cost_snapshot(cost_path)
+    _candidate_manifest(candidate_path, cost_identity)
     process = DurableLiveShadow(
         tmp_path / "shadow.db",
         candidate_manifest=candidate_path,
@@ -154,8 +163,8 @@ def test_live_shadow_derives_comparisons_from_shared_engines_without_orders(tmp_
 def test_live_shadow_persists_missing_dependency_as_degraded_evidence(tmp_path: Path) -> None:
     candidate_path = tmp_path / "candidate.json"
     cost_path = tmp_path / "cost.json"
-    _candidate_manifest(candidate_path)
-    _cost_snapshot(cost_path)
+    cost_identity = _cost_snapshot(cost_path)
+    _candidate_manifest(candidate_path, cost_identity)
     store = LocalObjectStore(tmp_path / "objects")
     process = DurableLiveShadow(
         tmp_path / "shadow.db",
@@ -182,8 +191,8 @@ def test_live_shadow_persists_missing_dependency_as_degraded_evidence(tmp_path: 
 def test_live_shadow_health_fails_closed_after_a_continuity_break(tmp_path: Path) -> None:
     candidate_path = tmp_path / "candidate.json"
     cost_path = tmp_path / "cost.json"
-    _candidate_manifest(candidate_path)
-    _cost_snapshot(cost_path)
+    cost_identity = _cost_snapshot(cost_path)
+    _candidate_manifest(candidate_path, cost_identity)
     process = DurableLiveShadow(
         tmp_path / "shadow.db",
         candidate_manifest=candidate_path,

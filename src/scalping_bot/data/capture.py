@@ -179,6 +179,7 @@ class CaptureHealth:
         self._gaps = 0
         self._reconnects = 0
         self._storage_failures = 0
+        self._invalid_events = 0
 
     def record_event(self, *, exchange_time_ms: int, receipt_time_ms: int) -> None:
         self._last_receipt_ms = receipt_time_ms
@@ -192,6 +193,9 @@ class CaptureHealth:
 
     def record_storage_failure(self) -> None:
         self._storage_failures += 1
+
+    def record_invalid_event(self) -> None:
+        self._invalid_events += 1
 
     def snapshot(self, *, now_ms: int) -> dict[str, int | None]:
         freshness = None if self._last_receipt_ms is None else now_ms - self._last_receipt_ms
@@ -221,8 +225,9 @@ class CaptureHealth:
             and abs(clock_drift) <= max_clock_drift_ms
             and snapshot["gaps"] == 0
             and snapshot["storage_failures"] == 0
+            and self._invalid_events == 0
         )
-        return {**snapshot, "healthy": healthy}
+        return {**snapshot, "invalid_events": self._invalid_events, "healthy": healthy}
 
 
 def _segment(value: dict[str, Any]) -> RawSegment:

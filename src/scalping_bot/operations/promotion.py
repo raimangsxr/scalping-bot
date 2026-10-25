@@ -594,6 +594,13 @@ class PromotedRiskGate:
         if baseline.execution_cost_model_sha256 != promoted.execution_cost_model_sha256:
             reasons.append("execution cost evidence changed between risk evaluations")
 
+        if promoted.net_expectancy < baseline.net_expectancy:
+            reasons.append("promoted net expectancy deteriorated against the 0.25% baseline")
+        if promoted.max_daily_loss > baseline.max_daily_loss:
+            reasons.append("promoted maximum daily loss deteriorated against the baseline")
+        if promoted.max_drawdown > baseline.max_drawdown:
+            reasons.append("promoted maximum drawdown deteriorated against the baseline")
+
         if baseline.net_expectancy <= 0:
             reasons.append("larger size cannot rescue weak baseline expectancy")
         self._check_criteria(baseline, "baseline", reasons)
@@ -727,6 +734,12 @@ class PromotedRiskGate:
                 result.concentration_passed,
                 reasons,
             )
+        if promoted.net_expectancy < baseline.net_expectancy:
+            reasons.append(f"{label} promoted expectancy deteriorated against baseline")
+        if promoted.max_daily_loss > baseline.max_daily_loss:
+            reasons.append(f"{label} promoted daily loss deteriorated against baseline")
+        if promoted.max_drawdown > baseline.max_drawdown:
+            reasons.append(f"{label} promoted drawdown deteriorated against baseline")
 
     def _check_stress_artifact(
         self,

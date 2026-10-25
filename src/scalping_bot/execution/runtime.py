@@ -53,6 +53,8 @@ def run_executor(settings: Settings) -> None:
         raise RuntimeError("a versioned calibrated execution cost snapshot is required")
     cost_snapshot = ExecutionCostSnapshot.load(Path(settings.cost_model_snapshot))
     candidate = PromotedCandidateManifest.load(settings.candidate_manifest)
+    if candidate.execution_cost_model_identity != cost_snapshot.snapshot_id:
+        raise RuntimeError("candidate and execution cost model identities do not match")
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_args: stop.set())
     signal.signal(signal.SIGINT, lambda *_args: stop.set())
@@ -108,30 +110,71 @@ def run_executor(settings: Settings) -> None:
             ),
             metrics=metrics,
         )
-        event_applier = ExchangeEventApplier(
-            state,
-            reprotect_position=lambda event_time_ms: execution.reprotect_position(
-                event_time_ms=event_time_ms
-            ),
-        )
-        operator_database_path = settings.state_path.with_suffix(
-            settings.state_path.suffix + ".operator.db"
-        )
-        operator_commands = OperatorCommandStore(operator_database_path)
-        runner = LiveEngineRunner(engine=engine, execution=execution, durable_state=state)
         soak = DurableTestnetSoak(
             settings.state_path.with_name("testnet-soak.db"),
             candidate_identity=candidate.candidate_identity,
             store=LocalObjectStore(settings.state_path.parent / "testnet-soak-artifacts"),
             started_ms=time.time_ns() // 1_000_000,
         )
+
+        def record_user_closed_scalp(
+            entry_client_order_id: str, event_time_ms: int, position: dict[str, object]
+        ) -> None:
+            try:
+                notional_fraction = (
+                    Decimal(str(position["entry_price"]))
+                    * Decimal(str(position["quantity"]))
+                    / Decimal(settings.initial_equity)
+                )
+                soak.record_authoritative_scalp(
+                    state,
+                    entry_client_order_id=entry_client_order_id,
+                    event_time_ms=event_time_ms,
+                    position_risk=Decimal(settings.position_risk),
+                    notional_fraction=notional_fraction,
+                )
+                state.append_audit(
+                    kind="testnet-soak-scalp-recorded",
+                    event_time_ms=event_time_ms,
+                    details={"entry_client_order_id": entry_client_order_id},
+                )
+            except (LookupError, RuntimeError, ValueError) as error:
+                state.set_operating_mode(OperationalMode.DEGRADED)
+                state.append_audit(
+                    kind="testnet-soak-evidence-failed",
+                    event_time_ms=event_time_ms,
+                    details={"error_type": type(error).__name__},
+                )
+
+        event_applier = ExchangeEventApplier(
+            state,
+            reprotect_position=lambda event_time_ms: execution.reprotect_position(
+                event_time_ms=event_time_ms
+            ),
+            on_position_closed=record_user_closed_scalp,
+        )
+        operator_database_path = settings.state_path.with_suffix(
+            settings.state_path.suffix + ".operator.db"
+        )
+        operator_commands = OperatorCommandStore(operator_database_path)
+        runner = LiveEngineRunner(engine=engine, execution=execution, durable_state=state)
         stream = BinanceTestnetMarketStream(settings.binance_ws_url)
         market_events: queue.Queue[object] = queue.Queue()
         market_notifications: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
         user_events: queue.SimpleQueue[tuple[str, object]] = queue.SimpleQueue()
+        market_stream_connected = False
+        user_stream_connected = False
+
+        # Both exchange streams must be live before the executor can reopen
+        # entries.  A restart therefore begins fail-closed even if the durable
+        # database was previously RUNNING.
+        state.set_operating_mode(OperationalMode.DEGRADED)
 
         def user_stream_disconnected(reason: str) -> None:
             user_events.put(("lost", reason))
+
+        def user_stream_connected_callback() -> None:
+            user_events.put(("connected", ""))
 
         def user_stream_reconnected() -> None:
             user_events.put(("reconnected", ""))
@@ -145,6 +188,7 @@ def run_executor(settings: Settings) -> None:
             for exchange_event in user_stream.events(
                 stop,
                 on_disconnect=user_stream_disconnected,
+                on_connect=user_stream_connected_callback,
                 on_reconnect=user_stream_reconnected,
             ):
                 user_events.put(("event", exchange_event))
@@ -155,7 +199,7 @@ def run_executor(settings: Settings) -> None:
         user_thread.start()
 
         def drain_user_events(event_time_ms: int) -> None:
-            nonlocal reconciliation
+            nonlocal reconciliation, user_stream_connected
             while True:
                 try:
                     kind, payload = user_events.get_nowait()
@@ -166,11 +210,17 @@ def run_executor(settings: Settings) -> None:
                         raise TypeError("User Data Stream emitted a non-exchange event")
                     event_applier.apply(payload)
                 elif kind == "lost":
+                    user_stream_connected = False
                     event_applier.stream_lost(event_time_ms=event_time_ms, reason=str(payload))
-                elif kind == "reconnected":
+                    send_critical_alert(
+                        event_time_ms,
+                        "CRITICAL scalping-bot User Data stream lost: " + str(payload),
+                    )
+                elif kind in {"connected", "reconnected"}:
+                    user_stream_connected = True
                     try:
                         reconciliation = Reconciler(state, exchange).run(
-                            reason="user-data-stream-reconnect", event_time_ms=event_time_ms
+                            reason="user-data-stream-connect", event_time_ms=event_time_ms
                         )
                         reconnected_consistent = reconciliation.consistent
 
@@ -182,24 +232,39 @@ def run_executor(settings: Settings) -> None:
                         event_applier.stream_reconciled(
                             event_time_ms=event_time_ms,
                             reconcile=reconciliation_ok,
+                            allow_entries=market_stream_connected and user_stream_connected,
                         )
                     except Exception:
                         event_applier.stream_reconciled(
                             event_time_ms=event_time_ms,
                             reconcile=lambda: False,
+                            allow_entries=False,
                         )
 
         storage_ok = True
         notification_ok = True
+        last_soak_incident_ms = (
+            soak.gate.critical_incidents[-1][0] if soak.gate.critical_incidents else None
+        )
+        last_soak_regression: str | None = (
+            soak.gate.critical_incidents[-1][1] if soak.gate.critical_incidents else None
+        )
         dependency_last_seen: dict[str, int | None] = {
             dependency: None for dependency in candidate.market_data_dependencies
         }
 
         def record_soak_incident(event_time_ms: int, regression: str) -> None:
+            nonlocal last_soak_incident_ms, last_soak_regression
+            if regression == last_soak_regression:
+                return
+            if last_soak_incident_ms is not None:
+                event_time_ms = max(event_time_ms, last_soak_incident_ms + 1)
             try:
                 soak.record_incident(
                     event_time_ms=event_time_ms, critical=True, regression=regression
                 )
+                last_soak_incident_ms = event_time_ms
+                last_soak_regression = regression
             except ValueError as error:
                 state.set_operating_mode(OperationalMode.DEGRADED)
                 state.append_audit(
@@ -209,9 +274,7 @@ def run_executor(settings: Settings) -> None:
                 )
 
         executor_started_ms = time.time_ns() // 1_000_000
-        supervision_cursor: int | None = (
-            soak.started_ms if not soak.supervised_windows else None
-        )
+        supervision_cursor: int | None = soak.started_ms if not soak.supervised_windows else None
         if soak.supervised_windows:
             # A restart is an operational incident.  Do not bridge the gap
             # between two processes with synthetic supervised coverage.
@@ -261,6 +324,122 @@ def run_executor(settings: Settings) -> None:
                 for dependency, last_seen in dependency_last_seen.items()
             }
 
+        last_market_receipt_ms: int | None = None
+        last_clock_drift_ms = 0
+
+        def send_critical_alert(event_time_ms: int, message: str) -> None:
+            nonlocal notification_ok
+            if notifier is None:
+                notification_ok = False
+                return
+            try:
+                asyncio.run(notifier.send(message, critical=True))
+            except CriticalAlertFailure as error:
+                notification_ok = False
+                metrics.alert_failures_total.inc()
+                state.append_audit(
+                    kind="critical-health-alert-failed",
+                    event_time_ms=event_time_ms,
+                    details={"error_type": type(error).__name__},
+                )
+
+        def apply_health(now_ms: int, event_time_ms: int | None = None) -> None:
+            nonlocal last_market_receipt_ms, last_clock_drift_ms
+            if event_time_ms is not None:
+                last_market_receipt_ms = now_ms
+                last_clock_drift_ms = now_ms - event_time_ms
+            freshness = None if last_market_receipt_ms is None else now_ms - last_market_receipt_ms
+            try:
+                persistence_ok = state.persistence_healthy()
+            except Exception:
+                persistence_ok = False
+            prior_mode = state.operating_mode
+            health_result = health.apply(
+                HealthSignals(
+                    market_data_freshness_ms=freshness,
+                    clock_drift_ms=last_clock_drift_ms,
+                    persistence_ok=persistence_ok,
+                    reconciliation_ok=reconciliation.consistent,
+                    storage_ok=storage_ok,
+                    notification_ok=notification_ok,
+                    rate_limit_blocked=state.rate_limit_blocked,
+                    exchange_streams_connected=(market_stream_connected and user_stream_connected),
+                    dependency_status=dependency_status(now_ms),
+                ),
+                event_time_ms=now_ms,
+            )
+            if (
+                health_result.mode is OperationalMode.DEGRADED
+                and prior_mode is not OperationalMode.DEGRADED
+            ):
+                send_critical_alert(
+                    now_ms,
+                    "CRITICAL scalping-bot health degraded: " + "; ".join(health_result.reasons),
+                )
+            if health_result.mode is OperationalMode.DEGRADED:
+                record_soak_incident(
+                    now_ms,
+                    "health-degraded:" + ";".join(health_result.reasons),
+                )
+
+        def perform_housekeeping(now_ms: int) -> None:
+            nonlocal last_backup_ms, last_heartbeat_ms, storage_ok, notification_ok
+            state.append_audit(
+                kind="heartbeat",
+                event_time_ms=now_ms,
+                details={
+                    "entries_allowed": state.entries_allowed,
+                    "operating_mode": state.operating_mode,
+                },
+            )
+            metrics.heartbeat_timestamp_seconds.set(now_ms / 1000)
+            if now_ms - last_backup_ms >= backup.RPO_SECONDS * 1000:
+                try:
+                    artifact = backup.create(
+                        settings.state_path,
+                        destination=settings.state_path.parent / "backups",
+                        created_ms=now_ms,
+                    )
+                    backup.publish_latest(artifact)
+                    for auxiliary_path, auxiliary_name in (
+                        (operator_database_path, "operator"),
+                        (soak.path, "testnet-soak"),
+                    ):
+                        auxiliary_artifact = backup.create(
+                            auxiliary_path,
+                            destination=settings.state_path.parent / "backups" / auxiliary_name,
+                            created_ms=now_ms,
+                        )
+                        backup.publish_latest(auxiliary_artifact)
+                    metrics.storage_health.set(1)
+                    last_backup_ms = now_ms
+                    storage_ok = True
+                except (OSError, ValueError) as error:
+                    metrics.storage_health.set(0)
+                    storage_ok = False
+                    state.set_operating_mode(OperationalMode.DEGRADED)
+                    send_critical_alert(now_ms, "CRITICAL scalping-bot encrypted backup failed")
+                    state.append_audit(
+                        kind="backup-failed",
+                        event_time_ms=now_ms,
+                        details={"error_type": type(error).__name__},
+                    )
+            if notifier is not None and now_ms - last_heartbeat_ms >= 24 * 60 * 60 * 1000:
+                try:
+                    asyncio.run(
+                        notifier.heartbeat(
+                            mode=state.operating_mode.value,
+                            reconciliation_ok=reconciliation.consistent,
+                        )
+                    )
+                except CriticalAlertFailure:
+                    notification_ok = False
+                    state.set_operating_mode(OperationalMode.DEGRADED)
+                    metrics.alert_failures_total.inc()
+                last_heartbeat_ms = now_ms
+            metrics.entries_allowed.set(int(state.entries_allowed))
+            metrics.operating_mode.set(float(list(OperationalMode).index(state.operating_mode)))
+
         def reconcile_after_reconnect() -> None:
             nonlocal reconciliation
             mark_dependencies_unavailable()
@@ -275,29 +454,43 @@ def run_executor(settings: Settings) -> None:
             event_applier.stream_reconciled(
                 event_time_ms=time.time_ns() // 1_000_000,
                 reconcile=lambda: reconciliation.consistent,
+                allow_entries=market_stream_connected and user_stream_connected,
             )
 
         def market_stream_disconnected(reason: str) -> None:
             market_notifications.put(("lost", reason))
 
+        def market_stream_connected_callback() -> None:
+            market_notifications.put(("connected", ""))
+
         def market_stream_reconnected() -> None:
             market_notifications.put(("reconnected", ""))
 
         def drain_market_notifications(event_time_ms: int) -> None:
+            nonlocal market_stream_connected
             while True:
                 try:
                     kind, reason = market_notifications.get_nowait()
                 except queue.Empty:
                     return
                 if kind == "lost":
+                    market_stream_connected = False
                     mark_dependencies_unavailable()
                     event_applier.stream_lost(event_time_ms=event_time_ms, reason=reason)
+                    send_critical_alert(
+                        event_time_ms, "CRITICAL scalping-bot market stream lost: " + reason
+                    )
                     record_soak_incident(event_time_ms, f"market-stream:{reason}")
-                elif kind == "reconnected":
+                elif kind in {"connected", "reconnected"}:
+                    market_stream_connected = True
                     try:
                         reconcile_after_reconnect()
                     except Exception as error:
                         state.set_operating_mode(OperationalMode.DEGRADED)
+                        send_critical_alert(
+                            event_time_ms,
+                            "CRITICAL scalping-bot market stream reconciliation failed",
+                        )
                         state.append_audit(
                             kind="market-stream-reconnect-reconciliation-failed",
                             event_time_ms=event_time_ms,
@@ -345,6 +538,7 @@ def run_executor(settings: Settings) -> None:
                 for market_event in stream.events(
                     stop,
                     on_disconnect=market_stream_disconnected,
+                    on_connect=market_stream_connected_callback,
                     on_reconnect=market_stream_reconnected,
                 ):
                     market_events.put(market_event)
@@ -365,10 +559,14 @@ def run_executor(settings: Settings) -> None:
                 try:
                     queued_event = market_events.get(timeout=1)
                 except queue.Empty:
+                    now_ms = time.time_ns() // 1_000_000
+                    apply_health(now_ms)
+                    perform_housekeeping(now_ms)
                     continue
                 if queued_event is None:
                     if not stop.is_set():
                         drain_market_notifications(now_ms)
+                        market_stream_connected = False
                         mark_dependencies_unavailable()
                         event_applier.stream_lost(
                             event_time_ms=now_ms, reason="market stream stopped"
@@ -388,50 +586,7 @@ def run_executor(settings: Settings) -> None:
                 prior_position = state.position()
                 if prior_position is not None:
                     prior_entry_id = state.position_entry_client_order_id()
-                try:
-                    persistence_ok = state.persistence_healthy()
-                except Exception:
-                    persistence_ok = False
-                prior_mode = state.operating_mode
-                health_result = health.apply(
-                    HealthSignals(
-                        market_data_freshness_ms=max(0, now_ms - event.event_time_ms),
-                        clock_drift_ms=now_ms - event.event_time_ms,
-                        persistence_ok=persistence_ok,
-                        reconciliation_ok=reconciliation.consistent,
-                        storage_ok=storage_ok,
-                        notification_ok=notification_ok,
-                        rate_limit_blocked=state.rate_limit_blocked,
-                        dependency_status=dependency_status(now_ms),
-                    ),
-                    event_time_ms=now_ms,
-                )
-                if (
-                    health_result.mode is OperationalMode.DEGRADED
-                    and prior_mode is not OperationalMode.DEGRADED
-                    and notifier is not None
-                ):
-                    try:
-                        asyncio.run(
-                            notifier.send(
-                                "CRITICAL scalping-bot health degraded: "
-                                + "; ".join(health_result.reasons),
-                                critical=True,
-                            )
-                        )
-                    except CriticalAlertFailure as error:
-                        notification_ok = False
-                        metrics.alert_failures_total.inc()
-                        state.append_audit(
-                            kind="critical-health-alert-failed",
-                            event_time_ms=now_ms,
-                            details={"error_type": type(error).__name__},
-                        )
-                if health_result.mode is OperationalMode.DEGRADED:
-                    record_soak_incident(
-                        now_ms,
-                        "health-degraded:" + ";".join(health_result.reasons),
-                    )
+                apply_health(now_ms, event.event_time_ms)
                 runner.process(event)
                 if prior_entry_id is not None and state.position() is None:
                     try:
@@ -461,60 +616,7 @@ def run_executor(settings: Settings) -> None:
                             event_time_ms=event.event_time_ms,
                             details={"error_type": type(error).__name__},
                         )
-                state.append_audit(
-                    kind="heartbeat",
-                    event_time_ms=now_ms,
-                    details={
-                        "entries_allowed": state.entries_allowed,
-                        "operating_mode": state.operating_mode,
-                    },
-                )
-                metrics.heartbeat_timestamp_seconds.set(now_ms / 1000)
-                if now_ms - last_backup_ms >= backup.RPO_SECONDS * 1000:
-                    try:
-                        artifact = backup.create(
-                            settings.state_path,
-                            destination=settings.state_path.parent / "backups",
-                            created_ms=now_ms,
-                        )
-                        backup.publish_latest(artifact)
-                        for auxiliary_path, auxiliary_name in (
-                            (operator_database_path, "operator"),
-                            (soak.path, "testnet-soak"),
-                        ):
-                            auxiliary_artifact = backup.create(
-                                auxiliary_path,
-                                destination=settings.state_path.parent / "backups" / auxiliary_name,
-                                created_ms=now_ms,
-                            )
-                            backup.publish_latest(auxiliary_artifact)
-                        metrics.storage_health.set(1)
-                        last_backup_ms = now_ms
-                        storage_ok = True
-                    except (OSError, ValueError) as error:
-                        metrics.storage_health.set(0)
-                        storage_ok = False
-                        state.set_operating_mode(OperationalMode.DEGRADED)
-                        state.append_audit(
-                            kind="backup-failed",
-                            event_time_ms=now_ms,
-                            details={"error_type": type(error).__name__},
-                        )
-                if notifier is not None and now_ms - last_heartbeat_ms >= 24 * 60 * 60 * 1000:
-                    try:
-                        asyncio.run(
-                            notifier.heartbeat(
-                                mode=state.operating_mode.value,
-                                reconciliation_ok=reconciliation.consistent,
-                            )
-                        )
-                    except CriticalAlertFailure:
-                        notification_ok = False
-                        state.set_operating_mode(OperationalMode.DEGRADED)
-                        metrics.alert_failures_total.inc()
-                    last_heartbeat_ms = now_ms
-                metrics.entries_allowed.set(int(state.entries_allowed))
-                metrics.operating_mode.set(float(list(OperationalMode).index(state.operating_mode)))
+                perform_housekeeping(now_ms)
         finally:
             stop.set()
             market_thread.join(timeout=5)

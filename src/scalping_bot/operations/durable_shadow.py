@@ -65,7 +65,9 @@ class DurableLiveShadow:
         candidate = PromotedCandidateManifest.load(candidate_manifest)
         # Loading both artifacts is part of construction: a process cannot run on
         # an unverified candidate or an unreadable cost model.
-        ExecutionCostSnapshot.load(cost_model)
+        cost_snapshot = ExecutionCostSnapshot.load(cost_model)
+        if candidate.execution_cost_model_identity != cost_snapshot.snapshot_id:
+            raise ValueError("Live Shadow candidate and cost model identities do not match")
         candidate_sha = _sha256(candidate_manifest.read_bytes())
         cost_sha = _sha256(cost_model.read_bytes())
         stored = self._metadata()
@@ -139,9 +141,7 @@ class DurableLiveShadow:
     def health_status(self, *, now_ms: int, stale_after_ms: int = 5_000) -> dict[str, object]:
         metadata = self._metadata()
         last_receipt = metadata.get("last_receipt_time_ms")
-        freshness = (
-            now_ms - int(last_receipt) if last_receipt is not None else None
-        )
+        freshness = now_ms - int(last_receipt) if last_receipt is not None else None
         dependency_failure = metadata.get("last_dependency_failure_ms")
         dependency_degraded = dependency_failure is not None and (
             last_receipt is None or int(dependency_failure) > int(last_receipt)

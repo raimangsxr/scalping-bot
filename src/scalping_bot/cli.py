@@ -4,6 +4,7 @@ import json
 import signal
 import threading
 import time
+from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
@@ -23,6 +24,10 @@ from scalping_bot.execution.binance import BinanceSpotTestnetAdapter, OfficialSp
 from scalping_bot.execution.executor import ExecutionLimits
 from scalping_bot.execution.runtime import run_executor
 from scalping_bot.execution.sqlite_state import SQLiteState
+from scalping_bot.execution.testnet_contract import (
+    probe_testnet_user_data_reconnect,
+    run_testnet_contract_scenarios,
+)
 from scalping_bot.operations.backup import EncryptedSQLiteBackup
 from scalping_bot.operations.deployment import DeploymentGate
 from scalping_bot.operations.durable_shadow import DurableLiveShadow
@@ -218,8 +223,11 @@ def run_research(
         raise RuntimeError("research manifest inputs are no longer verifiable")
     if not historical_parquet:
         raise RuntimeError("research requires the complete Historical Stress parquet input set")
-    bound_paths = (*parquet, *(historical_parquet or ()))
-    if not manifest.verify_dataset_paths(bound_paths, store):
+    if not manifest.verify_dataset_paths(
+        tuple(parquet),
+        store,
+        historical_paths=tuple(historical_parquet or ()),
+    ):
         raise RuntimeError(
             "research Parquet inputs are not the immutable files bound by the manifest"
         )
@@ -392,11 +400,28 @@ def run_live_shadow(
 def evaluate_book_shadow(
     storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
     min_imbalance: Annotated[str, typer.Option()] = str(DEFAULT_BOOK_CONFIRMATION_IMBALANCE),
+    entry_proposals: Annotated[
+        Path | None,
+        typer.Option(
+            "--entry-proposals",
+            help="JSON object mapping captured event times to frozen candidate proposals",
+        ),
+    ] = None,
 ) -> None:
     """Build non-promotable Book Flow Shadow evidence from captured segments."""
+    if entry_proposals is None:
+        raise typer.BadParameter("Book Shadow requires frozen candidate Entry Proposals")
+    raw_proposals = json.loads(entry_proposals.read_text(encoding="utf-8"))
+    if not isinstance(raw_proposals, dict) or any(
+        not isinstance(value, bool) for value in raw_proposals.values()
+    ):
+        raise typer.BadParameter("entry proposals must be a JSON object of boolean decisions")
+    proposals = {int(str(key)): value for key, value in raw_proposals.items()}
     store = LocalObjectStore(storage)
     evaluator = BookShadowEvaluator.from_capture(
-        store, confirmation=ShadowBookConfirmation(min_imbalance=Decimal(min_imbalance))
+        store,
+        confirmation=ShadowBookConfirmation(min_imbalance=Decimal(min_imbalance)),
+        entry_proposal=lambda event_time_ms, _features: proposals.get(event_time_ms, False),
     )
     typer.echo(f"book-shadow-report={evaluator.persist_report(store)}")
 
@@ -603,6 +628,44 @@ def evaluate_first_batch(
 def run_testnet_executor() -> None:
     """Run the single-writer reconciled Binance Testnet executor."""
     run_executor(Settings())
+
+
+@app.command("testnet-contract-scenarios")
+def testnet_contract_scenarios(
+    confirm_testnet: bool = typer.Option(
+        False,
+        "--confirm-testnet",
+        help="Confirm that this command may contact Binance Spot Testnet.",
+    ),
+    execute_order_round_trip: bool = typer.Option(
+        False,
+        "--execute-order-round-trip",
+        help="Submit, protect, cancel protection, and flatten a small Testnet order.",
+    ),
+    quantity: str = typer.Option("0.0001", "--quantity"),
+) -> None:
+    """Run explicit Binance Spot Testnet REST and User Data contract checks."""
+    if not confirm_testnet:
+        raise typer.BadParameter("--confirm-testnet is required; no network call was made")
+    settings = Settings()
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        raise RuntimeError("Binance Testnet credentials are required for contract scenarios")
+    transport = OfficialSpotTransport(
+        api_key=settings.binance_api_key, api_secret=settings.binance_api_secret
+    )
+    adapter = BinanceSpotTestnetAdapter(endpoint=settings.binance_rest_url, transport=transport)
+
+    def reconnect_probe(listen_key: str) -> None:
+        probe_testnet_user_data_reconnect(settings.binance_ws_url, listen_key)
+
+    report = run_testnet_contract_scenarios(
+        adapter,
+        confirm_testnet=True,
+        reconnect_probe=reconnect_probe,
+        execute_order_round_trip=execute_order_round_trip,
+        quantity=quantity,
+    )
+    typer.echo(json.dumps(asdict(report), sort_keys=True))
 
 
 def _candidate_record_from_json(value: dict[str, object]) -> CandidateRecord:

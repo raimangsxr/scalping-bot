@@ -181,6 +181,9 @@ class ExecutionCostSnapshot:
     commission_rate: Decimal
     buckets: tuple[ExecutionCostBucket, ...]
     stress_multiplier: Decimal = Decimal(1)
+    source_evidence: tuple[str, ...] = ()
+    calibration_method: str = ""
+    account_context: str = ""
 
     @classmethod
     def load(cls, path: Path) -> ExecutionCostSnapshot:
@@ -226,11 +229,17 @@ class ExecutionCostSnapshot:
             raise ValueError("execution cost snapshot has unevidenced buckets")
         if commission_rate < 0 or captured_ms < 0:
             raise ValueError("execution cost snapshot has invalid commission or timestamp")
+        source_evidence = _source_evidence(value.get("source_evidence"))
+        calibration_method = _required_text(value.get("calibration_method"), "calibration method")
+        account_context = _required_text(value.get("account_context"), "account context")
         return cls(
             snapshot_id=identity,
             captured_ms=captured_ms,
             commission_rate=commission_rate,
             buckets=buckets,
+            source_evidence=source_evidence,
+            calibration_method=calibration_method,
+            account_context=account_context,
         )
 
     @classmethod
@@ -262,6 +271,11 @@ class ExecutionCostSnapshot:
         raw_buckets = value.get("buckets")
         if not isinstance(commission_value, dict) or not isinstance(raw_buckets, list):
             raise ValueError("research cost model is malformed")
+        if commission_value.get("symbol") != "BTCUSDT":
+            raise ValueError("research cost model commission is not scoped to BTCUSDT")
+        account_context = _required_text(commission_value.get("account_context"), "account context")
+        calibration_method = _required_text(value.get("calibration_method"), "calibration method")
+        source_evidence = _source_evidence(value.get("source_evidence"))
         try:
             commission_rate = Decimal(str(commission_value["taker"]))
             captured_ms = int(str(commission_value["captured_ms"]))
@@ -310,6 +324,9 @@ class ExecutionCostSnapshot:
             captured_ms=captured_ms,
             commission_rate=commission_rate,
             buckets=buckets,
+            source_evidence=source_evidence,
+            calibration_method=calibration_method,
+            account_context=account_context,
         )
 
     def stressed(self, multiplier: Decimal) -> ExecutionCostSnapshot:
@@ -332,6 +349,13 @@ class ExecutionCostSnapshot:
             commission_rate=self.commission_rate,
             half_spread_rate=half_spread,
             slippage_rate=slippage,
+            commission_snapshot={
+                "captured_ms": str(self.captured_ms),
+                "account_context": self.account_context,
+                "source_evidence": ",".join(self.source_evidence),
+            },
+            execution_cost_model_identity=self.snapshot_id,
+            calibration_method=self.calibration_method,
             calibrated_buckets=tuple(
                 EngineCostBucket(
                     hour_utc=item.hour_utc,
@@ -382,3 +406,27 @@ def _weighted_median(values: tuple[tuple[Decimal, int], ...]) -> Decimal:
     if not expanded:
         raise ValueError("cannot calculate a cost median without observations")
     return median(expanded)
+
+
+def _required_text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"execution cost snapshot has no {label}")
+    return value
+
+
+def _source_evidence(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("execution cost snapshot has no immutable source evidence")
+    references: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or "#" not in item:
+            raise ValueError("execution cost snapshot source evidence is unresolved")
+        key, checksum = item.rsplit("#", 1)
+        if (
+            not key
+            or len(checksum) != 64
+            or any(character not in "0123456789abcdef" for character in checksum.lower())
+        ):
+            raise ValueError("execution cost snapshot source evidence checksum is malformed")
+        references.append(item)
+    return tuple(references)

@@ -79,6 +79,8 @@ def run_promoted_risk_trial(
         raise ValueError("Promoted Risk requires a checksum-verified completed Testnet Soak")
 
     cost_model = ExecutionCostModel.load(store, execution_cost_model_key)
+    if candidate_manifest.execution_cost_model_identity != cost_model.identity:
+        raise ValueError("candidate and execution cost model identities do not match")
     historical_trades = load_aggtrades(historical_parquet)
     _require_historical_stress_window(historical_trades)
     historical_dataset_checksum = hashlib.sha256(
@@ -332,9 +334,7 @@ def _persist_testnet_stress(
     resolved_sources: list[str] = []
     for source_reference in source_evidence:
         source_key, declared_checksum = (
-            source_reference.rsplit("#", 1)
-            if "#" in source_reference
-            else (source_reference, None)
+            source_reference.rsplit("#", 1) if "#" in source_reference else (source_reference, None)
         )
         try:
             source_content = store.read(source_key)

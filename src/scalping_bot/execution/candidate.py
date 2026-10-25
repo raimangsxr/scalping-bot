@@ -19,13 +19,25 @@ class PromotedCandidateManifest:
     rules_sha256: str
     lifecycle: str
     market_data_dependencies: tuple[str, ...] = ()
+    execution_cost_model_identity: str = ""
 
     @classmethod
     def from_candidate(
-        cls, candidate: CandidateRecord, *, parameters: dict[str, object]
+        cls,
+        candidate: CandidateRecord,
+        *,
+        parameters: dict[str, object],
+        execution_cost_model_identity: str = "",
     ) -> PromotedCandidateManifest:
         if candidate.lifecycle is not CandidateLifecycle.TESTNET_READY:
             raise ValueError("only a Testnet Ready candidate can be deployed")
+        if len(execution_cost_model_identity) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in execution_cost_model_identity.lower()
+        ):
+            raise ValueError(
+                "a candidate manifest requires a content-addressed execution cost model"
+            )
         canonical = _canonical_rules(candidate, parameters)
         return cls(
             candidate_identity=candidate.identity,
@@ -33,6 +45,7 @@ class PromotedCandidateManifest:
             rules_sha256=hashlib.sha256(canonical).hexdigest(),
             lifecycle=CandidateLifecycle.TESTNET_READY.value,
             market_data_dependencies=candidate.market_data_dependencies,
+            execution_cost_model_identity=execution_cost_model_identity,
         )
 
     def persist(self, path: Path) -> None:
@@ -53,6 +66,7 @@ class PromotedCandidateManifest:
                 "rules_sha256": self.rules_sha256,
                 "lifecycle": self.lifecycle,
                 "market_data_dependencies": list(self.market_data_dependencies),
+                "execution_cost_model_identity": self.execution_cost_model_identity,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -77,6 +91,7 @@ class PromotedCandidateManifest:
         rules_sha256 = value.get("rules_sha256")
         lifecycle = value.get("lifecycle")
         dependencies = value.get("market_data_dependencies", [])
+        execution_cost_model_identity = value.get("execution_cost_model_identity")
         if (
             not isinstance(candidate_identity, str)
             or not isinstance(rules_sha256, str)
@@ -84,14 +99,23 @@ class PromotedCandidateManifest:
             or any(character not in "0123456789abcdef" for character in rules_sha256.lower())
             or not isinstance(lifecycle, str)
             or not isinstance(dependencies, list)
+            or not isinstance(execution_cost_model_identity, str)
+            or len(execution_cost_model_identity) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in execution_cost_model_identity.lower()
+            )
         ):
-            raise ValueError("candidate deployment manifest has malformed identity or rule hash")
+            raise ValueError(
+                "candidate deployment manifest has malformed identity, rule, or cost hash"
+            )
         manifest = cls(
             candidate_identity=candidate_identity,
             parameters=parameters,
             rules_sha256=rules_sha256,
             lifecycle=lifecycle,
             market_data_dependencies=tuple(str(item) for item in dependencies),
+            execution_cost_model_identity=execution_cost_model_identity.lower(),
         )
         if manifest.lifecycle != "testnet-ready":
             raise ValueError("executor accepts only a Testnet Ready candidate manifest")

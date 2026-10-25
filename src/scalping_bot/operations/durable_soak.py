@@ -162,8 +162,34 @@ class DurableTestnetSoak:
         notional_fraction: Decimal,
     ) -> None:
         trace = state.reconstruct_scalp(entry_client_order_id)
-        protection_history = trace.get("protection_history", ())
+        protection_history_value = trace.get("protection_history", ())
+        protection_history = (
+            protection_history_value if isinstance(protection_history_value, (tuple, list)) else ()
+        )
         protection = trace["protection"]
+        protection_lifecycle_value = trace.get("protection_lifecycle", ())
+        protection_lifecycle = (
+            protection_lifecycle_value
+            if isinstance(protection_lifecycle_value, (tuple, list))
+            else ()
+        )
+        audit_value = trace.get("audit", ())
+        audit = audit_value if isinstance(audit_value, (tuple, list)) else ()
+        protected = any(
+            isinstance(item, dict) and str(item.get("status")) in {"ACTIVE", "TRIGGERED"}
+            for item in protection_history
+        )
+        # A protection that was later canceled for a deliberate market exit is
+        # safe only when durable evidence proves it was accepted first.  A lone
+        # CANCELED/REJECTED row is not protection evidence.
+        protected = protected or any(
+            isinstance(item, dict)
+            and str(item.get("status")) in {"EXEC_STARTED", "EXECUTING", "ALL_DONE"}
+            for item in protection_lifecycle
+        )
+        protected = protected or any(
+            isinstance(item, dict) and item.get("kind") == "position-protected" for item in audit
+        )
         pnl_value = trace.get("pnl")
         pnl = pnl_value.get("net_pnl") if isinstance(pnl_value, dict) else None
         testnet_pnl = (
@@ -173,7 +199,7 @@ class DurableTestnetSoak:
         exit_orders = trace.get("exit_orders")
         self.record_scalp(
             event_time_ms=event_time_ms,
-            protected=bool(protection_history) or protection is not None,
+            protected=protected or protection is not None,
             duplicate_order=isinstance(exit_orders, tuple) and len(exit_orders) > 1,
             reconciled=bool(reconciliation["consistent"]),
             testnet_pnl=testnet_pnl,

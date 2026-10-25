@@ -18,6 +18,7 @@ class HealthSignals:
     storage_ok: bool = False
     notification_ok: bool = False
     reconciliation_ok: bool = False
+    exchange_streams_connected: bool = True
     rate_limit_blocked: bool = False
     dependency_status: Mapping[str, bool] = field(default_factory=dict)
     stale_after_ms: int = 5_000
@@ -84,6 +85,8 @@ def _blocking_reasons(signals: HealthSignals) -> tuple[str, ...]:
         reasons.append("critical notifications are unavailable")
     if not signals.reconciliation_ok:
         reasons.append("exchange reconciliation diverges")
+    if not signals.exchange_streams_connected:
+        reasons.append("exchange event streams are not connected")
     if signals.rate_limit_blocked:
         reasons.append("exchange rate-limit pressure reserves capacity for exits")
     reasons.extend(

@@ -63,8 +63,7 @@ def test_cost_model_requires_evidence_for_declared_buckets_and_is_content_addres
     assert key.endswith(".json")
     assert loaded.identity == key.rsplit("/", 1)[-1].removesuffix(".json")
     assert loaded.source_evidence == (
-        "catalogs/live/segment.json#"
-        + hashlib.sha256(b"immutable capture segment\n").hexdigest(),
+        "catalogs/live/segment.json#" + hashlib.sha256(b"immutable capture segment\n").hexdigest(),
     )
     assert loaded.estimate(
         notional=Decimal("1000"), hour_utc=10, volatility_bucket="low", size_bucket="small"

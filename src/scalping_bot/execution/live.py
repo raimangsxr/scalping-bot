@@ -42,6 +42,7 @@ class BinanceTestnetMarketStream:
         stop: threading.Event,
         *,
         on_disconnect: Callable[[str], None] | None = None,
+        on_connect: Callable[[], None] | None = None,
         on_reconnect: Callable[[], None] | None = None,
     ) -> Iterator[EngineEvent]:
         connected_once = False
@@ -50,6 +51,8 @@ class BinanceTestnetMarketStream:
                 stale_notified = False
                 last_received_ms = time.time_ns() // 1_000_000
                 with connect(self.url, open_timeout=10, close_timeout=5) as websocket:
+                    if on_connect is not None:
+                        on_connect()
                     if connected_once and on_reconnect is not None:
                         on_reconnect()
                     connected_once = True

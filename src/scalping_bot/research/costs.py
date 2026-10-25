@@ -413,6 +413,37 @@ class ExecutionCostModel:
             ),
         )
 
+    def verify_engine_consistency(self, *, notional: Decimal = Decimal("1000")) -> int:
+        """Cross-check the research estimator against the shared engine adapter."""
+        if notional <= 0:
+            raise ValueError("consistency verification notional must be positive")
+        engine = self.as_engine_costs()
+        checked = 0
+        for hour, volatility, size in sorted(self.buckets):
+            event_time_ms = int(
+                datetime(2024, 1, 1, hour, tzinfo=UTC).timestamp() * 1000
+            )
+            expected = self.estimate(
+                notional=notional,
+                hour_utc=hour,
+                volatility_bucket=volatility,
+                size_bucket=size,
+            )
+            actual = engine.estimated_close_cost(
+                notional,
+                event_time_ms=event_time_ms,
+                volatility_bucket=volatility,
+                size_bucket=size,
+            )
+            if expected != actual:
+                raise ValueError(
+                    f"execution cost adapter disagrees for {hour}/{volatility}/{size}"
+                )
+            checked += 1
+        if checked == 0:
+            raise ValueError("execution cost model has no buckets to verify")
+        return checked
+
     @classmethod
     def load(cls, store: ObjectStore, key: str) -> ExecutionCostModel:
         raw = json.loads(store.read(key))

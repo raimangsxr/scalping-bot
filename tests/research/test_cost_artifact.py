@@ -76,6 +76,7 @@ def test_cost_model_requires_evidence_for_declared_buckets_and_is_content_addres
     ) == model.estimate(
         notional=Decimal("1000"), hour_utc=10, volatility_bucket="low", size_bucket="small"
     )
+    assert loaded.verify_engine_consistency() == 1
 
     runtime_path = tmp_path / f"{key.rsplit('/', 1)[-1]}"
     runtime_path.write_bytes(store.read(key))

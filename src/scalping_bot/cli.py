@@ -310,6 +310,21 @@ def capture_commission_snapshot(
 
 
 @app.command()
+def verify_cost_model(
+    model_key: Annotated[str, typer.Argument()],
+    storage: Annotated[Path, typer.Option("--storage")] = Path("data"),
+    notional: Annotated[str, typer.Option("--notional")] = "1000",
+) -> None:
+    """Verify that the published model and shared engine calculate identical costs."""
+    model = ExecutionCostModel.load(LocalObjectStore(storage), model_key)
+    try:
+        checked = model.verify_engine_consistency(notional=Decimal(notional))
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(f"execution-cost-model verified: {model.identity} buckets={checked}")
+
+
+@app.command()
 def freeze_calibration_plan(
     output: Annotated[Path, typer.Option("--output")] = Path("data/cost-model"),
     hours_utc: Annotated[list[int] | None, typer.Option("--hour")] = None,

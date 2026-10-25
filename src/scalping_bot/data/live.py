@@ -268,6 +268,8 @@ class BinancePublicCollector:
             self.metrics.storage_health.set(
                 float(not bool(storage_failures))
             )
+            self.metrics.heartbeat_timestamp_seconds.set(now_ms / 1000)
+            self.metrics.operating_mode.set(1 if bool(status.get("healthy")) else 2)
         payload = {
             "schema_version": 1,
             "recorded_ms": now_ms,

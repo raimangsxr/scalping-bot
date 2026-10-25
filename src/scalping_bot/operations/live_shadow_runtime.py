@@ -267,6 +267,7 @@ class SharedEngineLiveShadow:
         )
         self.metrics.entries_allowed.set(0)
         self.metrics.operating_mode.set(1 if bool(status.get("healthy")) else 2)
+        self.metrics.heartbeat_timestamp_seconds.set(now_ms / 1000)
 
 
 class ProductionLiveShadowStream:
